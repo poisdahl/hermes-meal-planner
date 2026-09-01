@@ -2915,6 +2915,26 @@ class FlowTests(unittest.TestCase):
         self.app.handle({"operation": "cart", "action": "change", "operations": [{"productId": 10, "quantity": 1}]})
         self.assertEqual([call[0] for call in self.oda.calls[-2:]], ["product_search", "manipulate_cart"])
 
+    def test_menu_clear_discards_only_an_expired_pre_dispatch_checkout(self):
+        current = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        with self.store.locked() as state:
+            state["menu"] = {"week": "2026-W36"}
+            state["pending_checkout"] = {
+                "status": "awaiting_confirmation",
+                "expires_at": (current - timedelta(seconds=1)).isoformat(),
+            }
+        with mock.patch("service.now", return_value=current):
+            self.assertEqual(self.app.handle({"operation": "menu", "action": "clear"}), {"menu": None})
+        state = self.store.read()
+        self.assertIsNone(state["menu"])
+        self.assertIsNone(state["pending_checkout"])
+
+        with self.store.locked() as state:
+            state["menu"] = {"week": "2026-W36"}
+            state["pending_checkout"] = {"status": "uncertain", "expires_at": "invalid"}
+        with self.assertRaisesRegex(HouseholdError, "checkout is pending"):
+            self.app.handle({"operation": "menu", "action": "clear"})
+
     def test_meny_transport_recovery_is_disabled_during_every_protected_state(self):
         with tempfile.TemporaryDirectory() as temp:
             store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})

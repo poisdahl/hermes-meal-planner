@@ -60,6 +60,16 @@ def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def expired_awaiting_confirmation(value: Any) -> bool:
+    if not isinstance(value, Mapping) or value.get("status") != "awaiting_confirmation":
+        return False
+    try:
+        expires_at = datetime.fromisoformat(str(value.get("expires_at") or ""))
+    except ValueError:
+        return False
+    return expires_at.tzinfo is not None and now() >= expires_at
+
+
 def scheduled_occurrence(schedule: Mapping[str, Any], current: datetime) -> str:
     weekday = SCHEDULE_WEEKDAYS.get(str(schedule.get("weekday") or "").casefold())
     clock = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", str(schedule.get("time") or ""))
@@ -580,7 +590,9 @@ class Application:
             if action == "get":
                 return {"menu": deepcopy(state.get("menu"))}
             if action == "clear":
-                if state.get("pending_checkout"):
+                if expired_awaiting_confirmation(state.get("pending_checkout")):
+                    state["pending_checkout"] = None
+                elif state.get("pending_checkout"):
                     raise HouseholdError("checkout is pending; the menu was not cleared")
                 state["menu"] = None
                 return {"menu": None}
