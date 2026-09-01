@@ -39,7 +39,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -181,6 +181,7 @@ class FakeMeny(FakeOda):
         self.cancellation_review_deadlines = []
         self.cancellation_submit_deadlines = []
         self.checkout_review_recovery = []
+        self.payment_not_dispatched = False
 
     def probe(self, **_kwargs):
         return {"protocol_version": "browser-v1", "server": {"name": "MENY website"}, "tool_count": 11}
@@ -235,6 +236,9 @@ class FakeMeny(FakeOda):
 
     def checkout_confirmation_order_id(self, *, deadline=None):
         return self.confirmation_order_id
+
+    def checkout_payment_not_dispatched(self, review, *, deadline=None):
+        return self.payment_not_dispatched
 
     def call(self, tool, arguments, **kwargs):
         if tool == "get_order":
@@ -3088,14 +3092,14 @@ class MenyClientTests(unittest.TestCase):
         client._eval = evaluate
         client._invoke = invoke
         client._require_time = lambda value: events.append(("require_time", value))
-        client._wait_for_vipps_dispatch = lambda: events.append(("wait_for_vipps_dispatch",))
+        client._wait_for_vipps_dispatch = lambda *_args: events.append(("wait_for_vipps_dispatch",))
         client._click_checkout_submit(review, lambda: events.append(("dispatch_fence",)))
 
         kinds = [event[0] for event in events]
-        self.assertEqual(kinds, ["eval", "scrollintoview", "get", "eval", "mouse", "eval", "require_time", "network", "dispatch_fence", "click", "wait_for_vipps_dispatch"])
+        self.assertEqual(kinds, ["eval", "scrollintoview", "get", "eval", "mouse", "eval", "require_time", "network", "dispatch_fence", "mouse", "mouse", "wait_for_vipps_dispatch"])
         self.assertEqual(events[4], ("mouse", "move", "26", "41"))
         self.assertEqual(events[7], ("network", "requests", "--clear"))
-        self.assertEqual(events[9], ("click", '[data-hermes-meal-planner-action="checkout-submit"]'))
+        self.assertEqual(events[9:11], [("mouse", "down"), ("mouse", "up")])
         second_gate = events[5][1]
         self.assertIn("elementFromPoint(26, 41)", second_gate)
         self.assertIn("location.href ===", second_gate)
@@ -3129,6 +3133,16 @@ class MenyClientTests(unittest.TestCase):
                 self.assertFalse(vipps_dispatch_acknowledged({"requests": [request]}))
         with self.assertRaisesRegex(HouseholdError, "request log changed"):
             vipps_dispatch_acknowledged({"requests": {}})
+
+    def test_vipps_dispatch_attempt_detects_pending_or_failed_payment_post(self):
+        for status in (None, 500, 201):
+            with self.subTest(status=status):
+                self.assertTrue(vipps_dispatch_attempted({"requests": [{
+                    "method": "POST",
+                    "status": status,
+                    "url": "https://platform-rest-prod.ngdata.no/api/order/payment",
+                }]}))
+        self.assertFalse(vipps_dispatch_attempted({"requests": []}))
 
     def test_order_search_requires_the_exact_successful_meny_endpoint(self):
         self.assertTrue(meny_order_search_completed({"requests": [{
@@ -3170,6 +3184,32 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client._invoke.call_count, 40)
         self.assertEqual(client._sleep.call_count, 39)
+
+    def test_vipps_dispatch_with_unchanged_checkout_and_no_post_is_precondition_failure(self):
+        client = self.client()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(return_value={"requests": []})
+        exact_checkout = mock.Mock(return_value=True)
+
+        with self.assertRaisesRegex(CheckoutPreconditionError, "did not dispatch.*fresh prepare"):
+            client._wait_for_vipps_dispatch(exact_checkout)
+
+        self.assertEqual(client._invoke.call_count, 41)
+        self.assertEqual(exact_checkout.call_count, 2)
+
+    def test_checkout_payment_not_dispatched_requires_exact_page_and_two_empty_logs(self):
+        client = self.client()
+        client._locked_operation = mock.MagicMock()
+        client._invoke = mock.Mock(side_effect=[{"requests": []}, {"requests": []}])
+        client._eval = mock.Mock(return_value={"ready": True})
+        review = {
+            "summary": {"total": 460.9, "delivery": {"display": "torsdag 3. september kl. 07:00-08:00"}},
+            "target_order_code": None,
+        }
+
+        self.assertTrue(client.checkout_payment_not_dispatched(review))
+        self.assertIn("46090", client._eval.call_args.args[0])
+        self.assertIn("torsdag 3. september kl. 07:00-08:00", client._eval.call_args.args[0])
 
     def test_vipps_gateway_fills_the_private_number_and_waits_for_mobile_dispatch(self):
         client = self.client()
@@ -3823,6 +3863,24 @@ class FlowTests(unittest.TestCase):
             self.assertFalse(reconciled["retry_allowed"])
             self.assertEqual(store.read()["pending_checkout"]["status"], "uncertain")
             self.assertEqual(provider.checkout_clicks, 0)
+
+    def test_proven_undispatched_checkout_is_reconciled_and_retryable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            provider.payment_not_dispatched = True
+            app = Application(store, provider, self.browser)
+            prepared = app.handle({"operation": "checkout", "action": "prepare"})
+            with store.locked() as state:
+                state["pending_checkout"]["status"] = "uncertain"
+
+            reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
+
+            self.assertFalse(reconciled["confirmed"])
+            self.assertTrue(reconciled["retry_allowed"])
+            self.assertFalse(reconciled["payment_dispatched"])
+            self.assertIsNone(store.read()["pending_checkout"])
+            self.assertIsNotNone(prepared["confirmation_id"])
 
     def test_meny_read_rechecks_pending_vipps_after_waiting_for_browser_lock(self):
         with tempfile.TemporaryDirectory() as temp:

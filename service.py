@@ -1406,6 +1406,11 @@ class Application:
             raise HouseholdError("checkout has not reached reconciliation")
         if pending.get("order_change"):
             return self._order_change_reconcile(pending, deadline)
+        payment_not_dispatched = (
+            self.provider == "meny"
+            and pending.get("status") == "uncertain"
+            and self.browser.checkout_payment_not_dispatched(pending["browser_review"], deadline=deadline)
+        )
         confirmation_order_id = self.browser.checkout_confirmation_order_id(deadline=deadline) if self.provider == "meny" else None
         after = self.oda.call("get_orders", {"page": 1, "size": 20}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_orders", {"page": 1, "size": 20})
         before_ids = {str(item.get("orderNumber") or item.get("order_number") or item.get("id") or "") for item in pending["orders_before"].get("orders", []) if isinstance(item, Mapping)}
@@ -1438,6 +1443,7 @@ class Application:
             confirmed = order is not None and candidate_id and candidate_id == details_id == tracking_id and tracking_status in fulfillable and order_matches_checkout(order, pending["summary"])
         expired_unpaid = False
         candidate_matches = order is not None and meny_order_matches_checkout(order, pending["summary"])
+        undispatched_retryable = payment_not_dispatched and confirmation_order_id is None and not candidates
         if self.provider == "meny" and pending.get("status") == "awaiting_user_payment" and not confirmed and confirmation_order_id is None and len(candidates) <= 1 and not candidate_matches:
             expiry = pending.get("payment_expires_at") or pending.get("expires_at")
             try:
@@ -1455,7 +1461,7 @@ class Application:
                     state["menu"] = pending["menu"]
                     state["menu"]["phase"] = "ordered"
                     state["menu"]["order_id"] = order_id
-            elif expired_unpaid:
+            elif expired_unpaid or undispatched_retryable:
                 state["pending_checkout"] = None
             else:
                 state["pending_checkout"]["status"] = "uncertain"
@@ -1464,7 +1470,8 @@ class Application:
             "expired": expired_unpaid,
             "order": order if confirmed else None,
             "tracking": tracking if confirmed else None,
-            "retry_allowed": expired_unpaid,
+            "retry_allowed": expired_unpaid or undispatched_retryable,
+            **({"payment_dispatched": False} if undispatched_retryable else {}),
         }
 
     def _order_change_reconcile(self, pending: Mapping[str, Any], deadline: float | None = None) -> dict[str, Any]:

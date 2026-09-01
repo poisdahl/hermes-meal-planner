@@ -208,18 +208,14 @@ def normalize_delivery_slot_ref(value: Any) -> tuple[str, str]:
     return slot_id, suffix
 
 
-def vipps_dispatch_acknowledged(value: Any) -> bool:
-    """Return true only when MENY has created the provider-side Vipps payment."""
-
+def _vipps_dispatch_requests(value: Any) -> list[Mapping[str, Any]]:
     if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
         raise HouseholdError("MENY browser payment request log changed")
+    result = []
     for request in value["requests"]:
         if not isinstance(request, Mapping):
             raise HouseholdError("MENY browser payment request log changed")
         if str(request.get("method") or "").upper() != "POST":
-            continue
-        status = request.get("status")
-        if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status < 300:
             continue
         parsed = urlparse(str(request.get("url") or ""))
         if parsed.scheme != "https":
@@ -228,10 +224,26 @@ def vipps_dispatch_acknowledged(value: Any) -> bool:
         if parsed.hostname == "platform-rest-prod.ngdata.no" and path.startswith((
             "/order/", "/api/order/", "/api/payment/", "/api/vipps/", "/api/checkout/",
         )):
-            return True
-        if parsed.hostname == "meny.no" and path.startswith((
+            result.append(request)
+        elif parsed.hostname == "meny.no" and path.startswith((
             "/api/user/order", "/api/payment/", "/api/vipps/", "/api/checkout/",
         )):
+            result.append(request)
+    return result
+
+
+def vipps_dispatch_attempted(value: Any) -> bool:
+    """Return true when a provider payment/order POST crossed the browser boundary."""
+
+    return bool(_vipps_dispatch_requests(value))
+
+
+def vipps_dispatch_acknowledged(value: Any) -> bool:
+    """Return true only when MENY has created the provider-side Vipps payment."""
+
+    for request in _vipps_dispatch_requests(value):
+        status = request.get("status")
+        if not isinstance(status, bool) and isinstance(status, int) and 200 <= status < 300:
             return True
     return False
 
@@ -1185,16 +1197,27 @@ __DELIVERY_BINDING__
         self._require_time(15)
         self._invoke("network", "requests", "--clear")
         before_dispatch()
-        self._invoke("click", selector)
-        self._wait_for_vipps_dispatch()
+        self._invoke("mouse", "down")
+        self._invoke("mouse", "up")
+        self._wait_for_vipps_dispatch(
+            lambda: self._eval(render_gate(False)) == {"ready": True}
+        )
 
-    def _wait_for_vipps_dispatch(self) -> None:
+    def _wait_for_vipps_dispatch(self, exact_checkout: Any = None) -> None:
+        requests: Any = {"requests": []}
         for attempt in range(40):
-            if vipps_dispatch_acknowledged(self._invoke("network", "requests")):
+            requests = self._invoke("network", "requests")
+            if vipps_dispatch_acknowledged(requests):
                 self._complete_vipps_request()
                 return
             if attempt < 39:
                 self._sleep(0.25)
+        if exact_checkout is not None and not vipps_dispatch_attempted(requests) and exact_checkout():
+            final_requests = self._invoke("network", "requests")
+            if not vipps_dispatch_attempted(final_requests) and exact_checkout():
+                raise CheckoutPreconditionError(
+                    "MENY did not dispatch the Vipps payment request; one fresh prepare is safe"
+                )
         raise HouseholdError(
             "MENY did not acknowledge the Vipps payment request; "
             "the outcome is uncertain and must be reconciled; do not retry"
@@ -1817,6 +1840,47 @@ __DELIVERY_BINDING__
                 raise HouseholdError("MENY login is required in the configured browser profile")
             order_id = result.get("order_id")
             return str(order_id) if order_id is not None else None
+
+    def checkout_payment_not_dispatched(self, review: Mapping[str, Any], *, deadline: float | None = None) -> bool:
+        """Prove that a fenced click never left the unchanged MENY checkout page."""
+
+        with self._locked_operation(MENY_READ_TIMEOUT, deadline):
+            if vipps_dispatch_attempted(self._invoke("network", "requests")):
+                return False
+            result = self._eval(r"""
+(() => {
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
+  const main = [...document.querySelectorAll('main')].filter(visible);
+  const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
+  if (main.length !== 1 || authenticated.length !== 1) return JSON.stringify({ready:false});
+  const root = main[0], leaf = selector => [...root.querySelectorAll(selector)].filter(visible).filter(x => ![...x.children].some(child => visible(child) && norm(child.innerText) === norm(x.innerText)));
+  const text = norm(root.innerText), expectedCode = __CODE__;
+  const activeCodes = [...text.matchAll(/Du endrer bestilling\s+([A-Za-z0-9-]+)/gi)].map(match => match[1]);
+  const targetReady = expectedCode === null ? activeCodes.length === 0 : activeCodes.length === 1 && activeCodes[0] === expectedCode;
+  const vipps = [...root.querySelectorAll('input[type="radio"], [role="radio"]')].filter(visible).filter(x => /^Vipps(?:\s|$)/i.test(norm(x.getAttribute('aria-label') || x.closest('label')?.innerText || x.parentElement?.innerText)));
+  const checked = vipps.length === 1 && (vipps[0].checked === true || vipps[0].getAttribute('aria-checked') === 'true');
+  const home = [...root.querySelectorAll('input[type="radio"], [role="radio"]')].filter(visible).filter(x => /^Levert på døren(?:\s|$)/i.test(norm(x.getAttribute('aria-label') || x.closest('label')?.innerText || x.parentElement?.innerText)));
+  const homeChecked = home.length === 1 && (home[0].checked === true || home[0].getAttribute('aria-checked') === 'true');
+  const buttons = [...root.querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Til betaling');
+  const totalLabels = leaf('*').filter(x => norm(x.innerText) === 'Totalsum');
+  const totals = [];
+  for (const label of totalLabels) {
+    let row = label.parentElement;
+    for (let depth=0; row && depth<3; depth++, row=row.parentElement) {
+      const values = [...norm(row.innerText).matchAll(/(?:^|\s)(\d+(?:[ .]\d{3})*),([0-9]{2})(?:\s|$)/g)].map(m => Number(`${m[1].replace(/[ .]/g,'')}.${m[2]}`));
+      if (values.length === 1) { totals.push(values[0]); break; }
+    }
+  }
+__DELIVERY_BINDING__
+  const exact = checked && homeChecked && targetReady && buttons.length === 1 && totalLabels.length === 1 && totals.length === 1 && Math.round(totals[0]*100) === __TOTAL__ && deliveryBinding?.root && deliveryBinding.display === __DELIVERY__ && location.href === __URL__;
+  return JSON.stringify({ready:Boolean(exact)});
+})()
+""".replace("__DELIVERY_BINDING__", CHECKOUT_DELIVERY_BINDING_JS).replace("__CODE__", json.dumps(review.get("target_order_code"))).replace("__TOTAL__", str(int(round(float(review["summary"]["total"]) * 100)))).replace("__DELIVERY__", json.dumps(review["summary"]["delivery"]["display"], ensure_ascii=False)).replace("__URL__", json.dumps(CHECKOUT_URL)))
+            if result != {"ready": True}:
+                return False
+            return not vipps_dispatch_attempted(self._invoke("network", "requests"))
 
     def verify_order_change(self, order_id: str | None, code: str | None, *, deadline: float | None = None) -> dict[str, Any]:
         with self._locked_operation(MENY_ORDER_TIMEOUT, deadline):
