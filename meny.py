@@ -1363,8 +1363,8 @@ __DELIVERY_BINDING__
   const position = label => lines.findIndex(line => line === label);
   const valueAfter = label => { const index=position(label); return index >= 0 ? lines[index+1] || null : null; };
   const actual = valueAfter('Ordrenummer');
-  const heading = [...root.querySelectorAll('h1')].filter(visible).map(x => norm(x.innerText)).filter(x => /^Bestilling\s+\S+/.test(x));
-  const totalText = valueAfter('Betalt beløp kort') || valueAfter('Reservert beløp (kort)') || valueAfter('Reservert beløp') || valueAfter('Totalsum');
+  const heading = [...root.querySelectorAll('h1')].filter(visible).map(x => norm(x.innerText)).filter(x => /^Bestilling\s+\S+/i.test(x));
+  const totalText = valueAfter('Betalt beløp (kort)') || valueAfter('Reservert beløp (kort)') || valueAfter('Reservert beløp') || valueAfter('Totalsum');
   const money = totalText?.match(/(\d+(?:[ .]\d{3})*),([0-9]{2})/);
   const total = money ? Number(`${money[1].replace(/[ .]/g,'')}.${money[2]}`) : null;
   const deliveredDatePattern = /^(?:0?[1-9]|[12]\d|3[01])\.(?:\s+(?:jan(?:uar)?|feb(?:ruar)?|mar(?:s)?|apr(?:il)?|mai|jun(?:i)?|jul(?:i)?|aug(?:ust)?|sep(?:tember)?|okt(?:ober)?|nov(?:ember)?|des(?:ember)?)\.?\s+\d{4}|\d{2}\.\d{4})$/i;

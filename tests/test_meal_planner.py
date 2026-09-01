@@ -1951,7 +1951,8 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(order["deliverySlotDisplay"], "31. august 2026")
         client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="order-items"]')
         self.assertEqual(client._sleep.call_args_list, [mock.call(1.5), mock.call(0.25), mock.call(0.25)])
-        self.assertIn("valueAfter('Betalt beløp kort')", scripts[-1])
+        self.assertIn("valueAfter('Betalt beløp (kort)')", scripts[-1])
+        self.assertIn(r"/^Bestilling\s+\S+/i", scripts[-1])
         self.assertIn("deliveredDatePattern", scripts[-1])
 
     def test_cart_read_polls_a_transient_missing_cart_control(self):
