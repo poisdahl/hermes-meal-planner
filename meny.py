@@ -1531,7 +1531,7 @@ __DELIVERY_BINDING__
     const url = new URL(anchor.href, location.origin), match = url.pathname.match(/^\/profil\/nettbutikk\/bestilling\/(\d{1,20})$/);
     if (!match || seen.has(match[1])) continue;
     seen.add(match[1]);
-    const root = anchor.closest('li,article,section') || anchor;
+    const root = anchor.closest('tr,li,article,section') || anchor;
     const summary = norm(root.innerText);
     const status = /kansellert/i.test(summary) ? 'cancelled' : /levert/i.test(summary) ? 'delivered' : /bekreftet|mottatt/i.test(summary) ? 'confirmed' : 'unknown';
     orders.push({order_number:match[1], id:match[1], status, summary});
@@ -1584,7 +1584,7 @@ __DELIVERY_BINDING__
   const delivery = valueAfter('Varene leveres') || (deliveredDates.length === 1 ? deliveredDates[0] : null);
   const code = valueAfter('Bestillingskode (for henting/levering)') || heading[0]?.replace(/^Bestilling\s+/, '') || null;
   const text = norm(root.innerText);
-  const status = /bestillingen er kansellert|kansellert bestilling/i.test(text) ? 'cancelled' : /bestillingen kan oppdateres|bekreftet/i.test(text) ? 'confirmed' : 'unknown';
+  const status = /bestillingen er kansellert|kansellert bestilling/i.test(text) ? 'cancelled' : deliveredDates.length === 1 ? 'delivered' : /bestillingen kan oppdateres|bekreftet/i.test(text) ? 'confirmed' : 'unknown';
   const itemButtons = [...root.querySelectorAll('button')].filter(visible).map(x => norm(x.innerText)).map(x => x.match(/^Bestilte varer \((\d+)\)$/)).filter(Boolean);
   const itemCount = itemButtons.length === 1 ? Number(itemButtons[0][1]) : null;
   const tables = [...root.querySelectorAll('table')].filter(visible).filter(table => {

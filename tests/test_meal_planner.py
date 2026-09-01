@@ -1998,6 +1998,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("valueAfter('Betalt beløp (kort)')", scripts[-1])
         self.assertIn(r"/^Bestilling\s+\S+/i", scripts[-1])
         self.assertIn("deliveredDatePattern", scripts[-1])
+        self.assertIn("deliveredDates.length === 1 ? 'delivered'", scripts[-1])
 
     def test_order_list_waits_for_the_completed_order_search_before_reading_dom(self):
         client = self.client()
@@ -2026,6 +2027,7 @@ class MenyClientTests(unittest.TestCase):
             mock.call("network", "requests", "--filter", "/api/order/search/"),
         ])
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.25), mock.call(0.5)])
+        self.assertIn("closest('tr,li,article,section')", client._eval.call_args_list[-1].args[0])
 
     def test_cart_read_polls_a_transient_missing_cart_control(self):
         client = self.client()
@@ -3467,6 +3469,26 @@ class FlowTests(unittest.TestCase):
             with self.assertRaisesRegex(HouseholdError, "reconcile the pending checkout"):
                 app.handle({"operation": "checkout", "action": "prepare"})
             self.assertEqual(provider.checkout_clicks, 1)
+
+    def test_expired_unacknowledged_checkout_never_becomes_retryable(self):
+        started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.now", return_value=started):
+                prepared = app.handle({"operation": "checkout", "action": "prepare"})
+            with store.locked() as state:
+                state["pending_checkout"]["status"] = "uncertain"
+
+            with mock.patch("service.now", return_value=started + timedelta(minutes=21)):
+                reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
+
+            self.assertFalse(reconciled["confirmed"])
+            self.assertFalse(reconciled["expired"])
+            self.assertFalse(reconciled["retry_allowed"])
+            self.assertEqual(store.read()["pending_checkout"]["status"], "uncertain")
+            self.assertEqual(provider.checkout_clicks, 0)
 
     def test_meny_read_rechecks_pending_vipps_after_waiting_for_browser_lock(self):
         with tempfile.TemporaryDirectory() as temp:

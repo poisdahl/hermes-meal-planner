@@ -46,7 +46,7 @@ def rpc(operation: str, **arguments: Any) -> dict[str, Any]:
 server = MCPServer(
     "meal-planner",
     description="Products, recipes, cart, menus and settings for this household's configured grocery provider.",
-    instructions="Use the current household and configured provider only. Follow the configured confirmation_policy. With fresh, prepare and ask once. With standing, a clear current request to order, pay or cancel may use submit or cancel_submit without asking again. A preview or prepare request never submits. Never retry an uncertain result; MENY still requires provider-enforced Vipps approval.",
+    instructions="Use the current household and configured provider only. Follow the configured confirmation_policy. With fresh, prepare and ask once. With standing, a clear current request to order, pay or cancel may use submit or cancel_submit without asking again. A preview or prepare request never submits. Never retry an uncertain result; MENY still requires provider-enforced Vipps approval. Declare checkout success only when submit or reconcile returns confirmed=true for its bound attempt, never from a generic order read after an error.",
     version="1.4.0",
 )
 

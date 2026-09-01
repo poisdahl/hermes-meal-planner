@@ -45,7 +45,10 @@ request to order, pay, check out or cancel is already authorized: use checkout
 prepared amount differs. A request only to preview or prepare never submits.
 MENY still waits for the user to approve the provider-enforced Vipps request
 before reconciliation. Never submit or retry while that approval or any result
-is uncertain; use the integration's reconciliation path.
+is uncertain; use the integration's reconciliation path. Declare checkout
+success only when checkout `submit` or `reconcile` returns `confirmed=true` for
+its bound attempt. Never infer success from a later generic order list or order
+read after checkout returned an error.
 For recurring runs or recipe email,
 apply the exact cron or email action returned by the integration and do not
 invent a second scheduler, recipient, state store or duplicate-order check. A

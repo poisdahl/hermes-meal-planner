@@ -116,6 +116,13 @@ preview or prepare remain read-only. This setting does not bypass a provider,
 Vipps, bank, device or platform approval, and an uncertain result is never
 retried automatically.
 
+Only the checkout tool's bound `submit` or `reconcile` result can establish a
+successful order. A generic order list or order read after checkout returned an
+error is not proof that the current attempt succeeded. A dispatched click that
+was not acknowledged stays uncertain even after its summary expires; only an
+acknowledged, unapproved Vipps request may expire into an explicitly retryable
+state.
+
 ## Provider login and startup
 
 Before starting the service, run the exact provider-login command printed by
