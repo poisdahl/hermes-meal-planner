@@ -2173,6 +2173,28 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.25), mock.call(0.5)])
         self.assertIn("closest('tr,li,article,section')", client._eval.call_args_list[-1].args[0])
 
+    def test_order_list_waits_through_a_transient_logged_out_render(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(side_effect=[
+            {},
+            {"requests": [{
+                "method": "GET",
+                "status": 200,
+                "url": "https://platform-rest-prod.ngdata.no/api/order/search/store/user",
+            }]},
+        ])
+        client._eval = mock.Mock(side_effect=[
+            {"ready": False, "authenticated": False, "orders": []},
+            {"ready": True, "authenticated": True, "orders": [{"order_number": "99990001"}]},
+        ])
+
+        result = client._get_orders(10)
+
+        self.assertEqual(result["orders"], [{"order_number": "99990001"}])
+        self.assertEqual(client._sleep.call_args_list, [mock.call(0.5), mock.call(0.25)])
+
     def test_cart_read_polls_a_transient_missing_cart_control(self):
         client = self.client()
         valid = {
