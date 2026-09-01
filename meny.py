@@ -408,6 +408,95 @@ def normalize_checkout_payment_snapshot(value: Any) -> dict[str, Any]:
     return {"total": normalized_total, "delivery": delivery}
 
 
+def meny_checkout_reviews_match(expected: Any, observed: Any) -> bool:
+    """Compare only the checkout fields that bind the protected payment."""
+
+    def identity(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, Mapping) or not isinstance(value.get("summary"), Mapping):
+            return None
+        summary = value["summary"]
+        items = summary.get("items")
+        order_lines = summary.get("order_lines")
+        delivery = summary.get("delivery")
+        total = summary.get("total")
+        count = summary.get("count")
+        if (
+            not isinstance(items, list)
+            or not items
+            or not isinstance(order_lines, list)
+            or not order_lines
+            or not isinstance(delivery, Mapping)
+            or isinstance(total, bool)
+            or not isinstance(total, (int, float))
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 1
+            or summary.get("payment") != "vipps"
+            or value.get("payment") != "vipps"
+            or isinstance(value.get("submit_controls"), bool)
+            or value.get("submit_controls") != 1
+            or not (
+                value.get("target_order_id") is None
+                or isinstance(value.get("target_order_id"), str)
+            )
+            or not (
+                value.get("target_order_code") is None
+                or isinstance(value.get("target_order_code"), str)
+            )
+        ):
+            return None
+        try:
+            total_cents = float(total) * 100
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(total_cents) or round(total_cents) < 1:
+            return None
+        for item in [*items, *order_lines]:
+            if (
+                not isinstance(item, Mapping)
+                or isinstance(item.get("quantity"), bool)
+                or not isinstance(item.get("quantity"), int)
+                or item.get("quantity") < 1
+            ):
+                return None
+        try:
+            item_identity = sorted(
+                (normalize_product_ref(item.get("product_id")), item["quantity"])
+                for item in items
+            )
+            line_identity = sorted(
+                (
+                    normalize_product_ref(item.get("product_id")),
+                    " ".join(str(item.get("identity") or "").split()),
+                    item["quantity"],
+                )
+                for item in order_lines
+            )
+            delivery_identity = meny_delivery_window_identity(delivery.get("display"))
+        except (HouseholdError, TypeError, ValueError):
+            return None
+        if (
+            any(not item_name for _, item_name, _ in line_identity)
+            or sum(quantity for _, quantity in item_identity) != count
+        ):
+            return None
+        return {
+            "items": item_identity,
+            "order_lines": line_identity,
+            "count": count,
+            "total_cents": round(total_cents),
+            "delivery": delivery_identity,
+            "summary_payment": summary.get("payment"),
+            "payment": value.get("payment"),
+            "submit_controls": value.get("submit_controls"),
+            "target_order_id": value.get("target_order_id"),
+            "target_order_code": value.get("target_order_code"),
+        }
+
+    expected_identity = identity(expected)
+    return expected_identity is not None and expected_identity == identity(observed)
+
+
 class MenyClient:
     """Expose the small provider interface used by the household service."""
 
@@ -2340,7 +2429,7 @@ __DELIVERY_BINDING__
                 final_cart = dict(cart)
                 final_cart["delivery"] = None
                 fresh = self._review_checkout(final_cart, order_change=order_change)
-                if fresh != dict(review):
+                if not meny_checkout_reviews_match(review, fresh):
                     raise HouseholdError("MENY checkout changed after review")
                 ready = self._eval(r"""
 (() => {

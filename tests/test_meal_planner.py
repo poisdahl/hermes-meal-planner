@@ -39,7 +39,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_checkout_reviews_match, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -1253,6 +1253,32 @@ class MenyClientTests(unittest.TestCase):
             vipps_phone_number="90000000",
         )
 
+    def checkout_review(self, *, target_order_id=None, target_order_code=None):
+        return {
+            "page_digest": "a" * 64,
+            "summary": {
+                "items": [{
+                    "product_id": MENY_PRODUCT,
+                    "name": "Brokkoli",
+                    "quantity": 1,
+                    "price": 19.9,
+                }],
+                "count": 1,
+                "total": 1234.56,
+                "delivery": {"display": "torsdag 3. september Kl. 09:00-12:00"},
+                "payment": "vipps",
+                "order_lines": [{
+                    "product_id": MENY_PRODUCT,
+                    "identity": "Brokkoli 400 g",
+                    "quantity": 1,
+                }],
+            },
+            "payment": "vipps",
+            "submit_controls": 1,
+            "target_order_id": target_order_id,
+            "target_order_code": target_order_code,
+        }
+
     def test_probe_requires_the_persistent_profile_to_be_logged_in(self):
         client = self.client()
         client._open = mock.Mock()
@@ -2395,6 +2421,43 @@ class MenyClientTests(unittest.TestCase):
                 with self.assertRaisesRegex(HouseholdError, "checkout page changed"):
                     normalize_checkout_payment_snapshot(malformed)
 
+    def test_checkout_review_identity_ignores_only_unprotected_presentation_changes(self):
+        expected = self.checkout_review()
+        observed = deepcopy(expected)
+        observed["page_digest"] = "b" * 64
+        observed["summary"]["items"][0]["name"] = "Brokkoli, fersk"
+        observed["summary"]["items"][0]["price"] = 20.9
+        observed["summary"]["delivery"]["display"] = "tor 3. sep. kl. 09:00–12:00"
+
+        self.assertTrue(meny_checkout_reviews_match(expected, observed))
+
+    def test_checkout_review_identity_rejects_every_protected_change(self):
+        expected = self.checkout_review()
+
+        def changed(update):
+            observed = deepcopy(expected)
+            update(observed)
+            return observed
+
+        changes = {
+            "item quantity": lambda value: value["summary"]["items"][0].__setitem__("quantity", 2),
+            "order-line identity": lambda value: value["summary"]["order_lines"][0].__setitem__("identity", "Blomkål 400 g"),
+            "order-line quantity": lambda value: value["summary"]["order_lines"][0].__setitem__("quantity", 2),
+            "count": lambda value: value["summary"].__setitem__("count", 2),
+            "total": lambda value: value["summary"].__setitem__("total", 1234.57),
+            "unbounded total": lambda value: value["summary"].__setitem__("total", 10**400),
+            "boolean quantity": lambda value: value["summary"]["items"][0].__setitem__("quantity", True),
+            "delivery": lambda value: value["summary"]["delivery"].__setitem__("display", "torsdag 3. september Kl. 10:00-12:00"),
+            "summary payment": lambda value: value["summary"].__setitem__("payment", "kort"),
+            "payment": lambda value: value.__setitem__("payment", "kort"),
+            "submit controls": lambda value: value.__setitem__("submit_controls", 2),
+            "target order": lambda value: value.__setitem__("target_order_id", "99990001"),
+            "target code": lambda value: value.__setitem__("target_order_code", "TEST-CODE-1"),
+        }
+        for label, update in changes.items():
+            with self.subTest(label=label):
+                self.assertFalse(meny_checkout_reviews_match(expected, changed(update)))
+
     def test_cart_read_reloads_one_nonempty_zero_total_snapshot(self):
         client = self.client()
         zero = {
@@ -3398,11 +3461,7 @@ class MenyClientTests(unittest.TestCase):
 
     def test_vipps_submit_dispatches_one_exact_final_click(self):
         client = self.client()
-        review = {
-            "page_digest": "a" * 64,
-            "summary": {"payment": "vipps", "total": 1234.56, "delivery": {"display": "torsdag 3. september Kl. 09:00-12:00"}},
-            "target_order_code": None,
-        }
+        review = self.checkout_review()
         client._review_checkout = mock.Mock(return_value=review)
         client._eval = mock.Mock(return_value={"ready": True})
         client._click_checkout_submit = mock.Mock()
@@ -3434,11 +3493,7 @@ class MenyClientTests(unittest.TestCase):
 
     def test_vipps_mouse_failure_after_dispatch_fence_is_uncertain(self):
         client = self.client()
-        review = {
-            "page_digest": "a" * 64,
-            "summary": {"payment": "vipps", "total": 1234.56, "delivery": {"display": "delivery"}},
-            "target_order_code": None,
-        }
+        review = self.checkout_review()
         client._review_checkout = mock.Mock(return_value=review)
         client._eval = mock.Mock(return_value={"ready": True})
 
@@ -3461,11 +3516,7 @@ class MenyClientTests(unittest.TestCase):
 
     def test_vipps_final_gate_failure_dispatches_no_click(self):
         client = self.client()
-        review = {
-            "page_digest": "a" * 64,
-            "summary": {"payment": "vipps", "total": 1234.56, "delivery": {"display": "torsdag 3. september Kl. 09:00-12:00"}},
-            "target_order_code": "TEST-CODE-1",
-        }
+        review = self.checkout_review(target_order_id="99990001", target_order_code="TEST-CODE-1")
         client._review_checkout = mock.Mock(return_value=review)
         client._eval = mock.Mock(return_value={"ready": False})
         client._invoke = mock.Mock()
