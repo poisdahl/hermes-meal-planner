@@ -679,8 +679,10 @@ class MenyClient:
                 break
             self._sleep(0.25)
         else:
-            missing = delta < 0 and before.get("page_ready") is True and before.get("quantity") == 0
-            reason = "product is not in the cart" if missing else "product control is unavailable"
+            if delta < 0:
+                self._remove_one_from_cart(product, order_change_code)
+                return
+            reason = "product control is unavailable"
             raise HouseholdError(f"MENY {reason}")
         previous = before.get("quantity")
         if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
@@ -733,6 +735,120 @@ class MenyClient:
 """)
         if remaining != {"clear": True}:
             raise HouseholdError("MENY order routing did not settle")
+
+    def _remove_one_from_cart(self, product: str, order_change_code: str | None) -> None:
+        cart = self._read_cart()
+        matches = [item for item in cart.get("items", []) if item.get("product_id") == product]
+        if len(matches) != 1 or isinstance(matches[0].get("quantity"), bool) or not isinstance(matches[0].get("quantity"), int):
+            raise HouseholdError("MENY product is not in the cart")
+        current = matches[0]["quantity"]
+        if current < 1:
+            raise HouseholdError("MENY product is not in the cart")
+        dispatched = False
+
+        def before_dispatch() -> None:
+            nonlocal dispatched
+            dispatched = True
+
+        try:
+            self._click_cart_remove_control(product, current, order_change_code, before_dispatch)
+            observed = self._wait_for_cart_quantity(product, current - 1, order_change_code)
+            if observed != current - 1:
+                raise HouseholdError("MENY cart quantity did not settle")
+            self._assert_authenticated()
+        except HouseholdError as exc:
+            if dispatched:
+                raise HouseholdError("MENY cart change is uncertain; read the cart and do not retry this request") from exc
+            raise
+
+    def _click_cart_remove_control(self, product: str, quantity: int, order_change_code: str | None, before_dispatch: Any) -> None:
+        selector = '[data-hermes-meal-planner-action="cart-remove"]'
+        gate = r"""
+(() => {
+  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
+  const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
+  const carts = [...document.querySelectorAll('[aria-label="Handlevogn"]')].filter(visible);
+  if (authenticated.length !== 1 || carts.length !== 1) return JSON.stringify({ready:false});
+  const cart = carts[0], expectedProduct = __PRODUCT__, expectedQuantity = __QUANTITY__, expectedCode = __CODE__, requireHit = __REQUIRE_HIT__;
+  const activeCodes = [...norm(cart.innerText).matchAll(/Du endrer bestilling\s+([A-Za-z0-9-]+)/gi)].map(x => x[1]);
+  const aborts = [...cart.querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Avbryt endring');
+  const modeReady = expectedCode === null ? activeCodes.length === 0 && aborts.length === 0 : activeCodes.length === 1 && activeCodes[0] === expectedCode && aborts.length === 1;
+  const roots = [];
+  for (const anchor of cart.querySelectorAll('a[href]')) {
+    const url = new URL(anchor.href, location.origin), root = url.origin === location.origin && url.pathname === expectedProduct ? anchor.closest('li') : null;
+    if (root && visible(root) && !roots.includes(root)) roots.push(root);
+  }
+  if (!modeReady || roots.length !== 1) return JSON.stringify({ready:false});
+  const root = roots[0], selects = [...root.querySelectorAll('select[aria-label*="endre mengde"]')].filter(visible);
+  if (selects.length !== 1) return JSON.stringify({ready:false});
+  const match = norm(selects[0].getAttribute('aria-label')).match(/^(\d+)\s+stk,\s*endre mengde\s+(.+)$/i);
+  const current = Number.parseInt(norm(selects[0].selectedOptions?.[0]?.innerText), 10), name = match?.[2] || '';
+  const labels = current === 1 ? [`Fjern ${name} fra handlevognen`] : [`Fjern 1 stk ${name} fra handlevognen`, `Fjern én stk ${name} fra handlevognen`];
+  const candidates = [...root.querySelectorAll('button')].filter(enabled).filter(x => labels.includes(norm(x.getAttribute('aria-label') || x.innerText)));
+  if (!match || Number(match[1]) !== current || current !== expectedQuantity || candidates.length !== 1) return JSON.stringify({ready:false});
+  const target = candidates[0];
+  target.setAttribute('data-hermes-meal-planner-action', 'cart-remove');
+  const marked = [...document.querySelectorAll('[data-hermes-meal-planner-action="cart-remove"]')];
+  const hit = requireHit ? document.elementFromPoint(__HIT_X__, __HIT_Y__) : target;
+  return JSON.stringify({ready:marked.length === 1 && marked[0] === target && Boolean(hit) && (hit === target || target.contains(hit))});
+})()
+"""
+
+        def render(require_hit: bool, x: int = 0, y: int = 0) -> str:
+            return gate.replace("__PRODUCT__", json.dumps(product)).replace("__QUANTITY__", str(quantity)).replace("__CODE__", json.dumps(order_change_code)).replace("__REQUIRE_HIT__", "true" if require_hit else "false").replace("__HIT_X__", str(x)).replace("__HIT_Y__", str(y))
+
+        if self._eval(render(False)) != {"ready": True}:
+            raise HouseholdError("MENY cart remove control changed")
+        self._invoke("scrollintoview", selector)
+        box = self._find_box(self._invoke("get", "box", selector))
+        if not box or box["width"] <= 0 or box["height"] <= 0:
+            raise HouseholdError("MENY cart remove control is not clickable")
+        x = round(box["x"] + box["width"] / 2)
+        y = round(box["y"] + box["height"] / 2)
+        self._invoke("mouse", "move", str(x), str(y))
+        if self._eval(render(True, x, y)) != {"ready": True}:
+            raise HouseholdError("MENY cart remove control changed or is obscured")
+        before_dispatch()
+        self._invoke("mouse", "down")
+        self._invoke("mouse", "up")
+
+    def _wait_for_cart_quantity(self, product: str, expected: int, order_change_code: str | None) -> int:
+        observed = -1
+        for _ in range(12):
+            self._sleep(0.25)
+            result = self._eval(r"""
+(() => {
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
+  const carts = [...document.querySelectorAll('[aria-label="Handlevogn"]')].filter(visible);
+  if (authenticated.length !== 1 || carts.length !== 1) return JSON.stringify({ready:false, authenticated:authenticated.length === 1});
+  const cart = carts[0], expectedProduct = __PRODUCT__, expectedCode = __CODE__;
+  const activeCodes = [...norm(cart.innerText).matchAll(/Du endrer bestilling\s+([A-Za-z0-9-]+)/gi)].map(x => x[1]);
+  const aborts = [...cart.querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Avbryt endring');
+  const modeReady = expectedCode === null ? activeCodes.length === 0 && aborts.length === 0 : activeCodes.length === 1 && activeCodes[0] === expectedCode && aborts.length === 1;
+  const roots = [];
+  for (const anchor of cart.querySelectorAll('a[href]')) {
+    const url = new URL(anchor.href, location.origin), root = url.origin === location.origin && url.pathname === expectedProduct ? anchor.closest('li') : null;
+    if (root && visible(root) && !roots.includes(root)) roots.push(root);
+  }
+  if (!modeReady || roots.length > 1) return JSON.stringify({ready:false, authenticated:true});
+  if (roots.length === 0) return JSON.stringify({ready:true, authenticated:true, quantity:0});
+  const selects = [...roots[0].querySelectorAll('select[aria-label*="endre mengde"]')].filter(visible);
+  const quantity = selects.length === 1 ? Number.parseInt(norm(selects[0].selectedOptions?.[0]?.innerText), 10) : null;
+  return JSON.stringify({ready:Number.isInteger(quantity) && quantity > 0, authenticated:true, quantity});
+})()
+""".replace("__PRODUCT__", json.dumps(product)).replace("__CODE__", json.dumps(order_change_code)))
+            if result.get("authenticated") is not True:
+                raise HouseholdError("MENY login is required in the configured browser profile")
+            if result.get("ready") is True and result.get("quantity") == expected:
+                return expected
+            if isinstance(result.get("quantity"), int):
+                observed = result["quantity"]
+        return observed
 
     def _product_control(self, action: str, delta: int, product: str) -> dict[str, Any]:
         return self._eval(r"""

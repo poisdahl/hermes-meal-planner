@@ -2489,6 +2489,39 @@ class MenyClientTests(unittest.TestCase):
         client._sleep.assert_called_once_with(0.25)
         client._click_cart_control.assert_called_once_with(MENY_PRODUCT, "Fjern Brokkoli fra handlevognen")
 
+    def test_cart_remove_falls_back_to_the_exact_cart_control(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._assert_authenticated = mock.Mock()
+        client._sleep = mock.Mock()
+        client._product_control = mock.Mock(return_value={"ready": False, "page_ready": False, "authenticated": True})
+        client._read_cart = mock.Mock(return_value={"items": [{"product_id": MENY_PRODUCT, "quantity": 1}]})
+        client._wait_for_cart_quantity = mock.Mock(return_value=0)
+        scripts = []
+        client._eval = lambda script: scripts.append(script) or {"ready": True}
+        calls = []
+        client._invoke = lambda *arguments: calls.append(arguments) or ({"box": {"x": 1, "y": 2, "width": 20, "height": 10}} if arguments[:2] == ("get", "box") else {})
+
+        client._change_one(MENY_PRODUCT, -1)
+
+        self.assertEqual(client._product_control.call_count, 20)
+        self.assertIn(("mouse", "down"), calls)
+        self.assertIn(("mouse", "up"), calls)
+        self.assertIn(MENY_PRODUCT, scripts[0])
+        self.assertIn("elementFromPoint", scripts[1])
+
+    def test_cart_remove_fallback_marks_post_dispatch_failure_uncertain(self):
+        client = self.client()
+        client._read_cart = mock.Mock(return_value={"items": [{"product_id": MENY_PRODUCT, "quantity": 1}]})
+
+        def fail_after_dispatch(_product, _quantity, _code, before_dispatch):
+            before_dispatch()
+            raise HouseholdError("transport failed")
+
+        client._click_cart_remove_control = fail_after_dispatch
+        with self.assertRaisesRegex(HouseholdError, "uncertain.*do not retry"):
+            client._remove_one_from_cart(MENY_PRODUCT, None)
+
     def test_checkout_review_rejects_same_quantity_with_a_different_product_path(self):
         client = self.client()
         client._verify_order_change = mock.Mock()
