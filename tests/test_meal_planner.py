@@ -1226,8 +1226,8 @@ class MenyClientTests(unittest.TestCase):
         client._eval = mock.Mock(return_value={"ready": True, "authenticated": False})
         with self.assertRaisesRegex(HouseholdError, "login is required"):
             client.probe()
-        self.assertEqual(client._eval.call_count, 20)
-        self.assertEqual(client._sleep.call_count, 20)
+        self.assertEqual(client._eval.call_count, 60)
+        self.assertEqual(client._sleep.call_count, 60)
         client._eval.return_value = {"ready": True, "authenticated": True}
         probe = client.probe()
         self.assertEqual(probe["provider"], "meny")
@@ -1243,6 +1243,20 @@ class MenyClientTests(unittest.TestCase):
         ])
         client._require_login()
         client._sleep.assert_called_once_with(0.25)
+
+    def test_login_check_allows_a_slow_authenticated_shell_to_hydrate(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._eval = mock.Mock(side_effect=[
+            *([{"ready": True, "authenticated": False}] * 32),
+            {"ready": True, "authenticated": True},
+        ])
+
+        client._require_login()
+
+        self.assertEqual(client._eval.call_count, 33)
+        self.assertEqual(client._sleep.call_count, 32)
 
     def test_cdp_is_restricted_to_an_explicit_loopback_endpoint(self):
         self.assertEqual(normalize_browser_cdp("http://127.0.0.1:9224"), "http://127.0.0.1:9224")
@@ -3080,6 +3094,58 @@ class FlowTests(unittest.TestCase):
                     "changes": {"enabled": True, "maximum_total": 1000, "delivery": {"weekday": "Saturday"}, "auto_checkout": True},
                 })
             self.assertFalse(store.read()["schedule"]["auto_checkout"])
+
+    def test_expired_unapproved_vipps_releases_the_checkout_for_a_fresh_prepare(self):
+        started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.now", return_value=started):
+                prepared = app.handle({"operation": "checkout", "action": "prepare"})
+                app.handle({
+                    "operation": "checkout",
+                    "action": "confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                })
+            pending = store.read()["pending_checkout"]
+            self.assertEqual(
+                datetime.fromisoformat(pending["payment_expires_at"]),
+                started + timedelta(minutes=11),
+            )
+
+            with mock.patch("service.now", return_value=started + timedelta(minutes=12)):
+                reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
+
+            self.assertFalse(reconciled["confirmed"])
+            self.assertTrue(reconciled["expired"])
+            self.assertTrue(reconciled["retry_allowed"])
+            self.assertIsNone(store.read()["pending_checkout"])
+            self.assertEqual(provider.checkout_clicks, 1)
+
+    def test_legacy_unapproved_vipps_uses_the_guarded_confirmation_expiry(self):
+        started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.now", return_value=started):
+                prepared = app.handle({"operation": "checkout", "action": "prepare"})
+                app.handle({
+                    "operation": "checkout",
+                    "action": "confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                })
+            with store.locked() as state:
+                state["pending_checkout"].pop("payment_requested_at")
+                state["pending_checkout"].pop("payment_expires_at")
+
+            with mock.patch("service.now", return_value=started + timedelta(minutes=21)):
+                reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
+
+            self.assertTrue(reconciled["expired"])
+            self.assertTrue(reconciled["retry_allowed"])
+            self.assertIsNone(store.read()["pending_checkout"])
 
     def test_awaiting_vipps_payment_locks_every_other_order_mutation(self):
         with tempfile.TemporaryDirectory() as temp:

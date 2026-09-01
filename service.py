@@ -40,6 +40,7 @@ from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyC
 
 MAX_REQUEST = 2 * 1024 * 1024
 CANCELLATION_OPERATION_TIMEOUT = 105
+MENY_VIPPS_EXPIRY_BUFFER = timedelta(minutes=11)
 UNRESOLVED_CHECKOUT_STATUSES = {"clicking", "uncertain", "awaiting_user_payment"}
 SCHEDULE_WEEKDAYS = {
     "monday": 0,
@@ -1278,11 +1279,14 @@ class Application:
                         deadline=deadline,
                     )
                 if self.provider == "meny" and isinstance(submit_result, Mapping) and submit_result.get("awaiting_user_payment") is True:
+                    requested_at = now()
                     with self.store.locked() as state:
                         current_pending = state.get("pending_checkout")
                         if not current_pending or current_pending.get("status") != "clicking" or current_pending.get("browser_review") != pending.get("browser_review"):
                             raise HouseholdError("checkout state changed after the Vipps request")
                         state["pending_checkout"]["status"] = "awaiting_user_payment"
+                        state["pending_checkout"]["payment_requested_at"] = requested_at.isoformat()
+                        state["pending_checkout"]["payment_expires_at"] = (requested_at + MENY_VIPPS_EXPIRY_BUFFER).isoformat()
                     return {
                         "confirmed": False,
                         "awaiting_user_payment": True,
@@ -1347,6 +1351,14 @@ class Application:
         else:
             fulfillable = {"paid_and_modifiable", "paid_and_not_modifiable", "picking", "shipped", "delivered"}
             confirmed = order is not None and candidate_id and candidate_id == details_id == tracking_id and tracking_status in fulfillable and order_matches_checkout(order, pending["summary"])
+        expired_unpaid = False
+        if self.provider == "meny" and not confirmed and confirmation_order_id is None and order is None:
+            expiry = pending.get("payment_expires_at") or pending.get("expires_at")
+            try:
+                expires_at = datetime.fromisoformat(str(expiry or ""))
+            except ValueError:
+                expires_at = None
+            expired_unpaid = expires_at is not None and expires_at.tzinfo is not None and now() >= expires_at
         with self.store.locked() as state:
             if canonical(state.get("pending_checkout")) != canonical(pending):
                 raise HouseholdError("checkout state changed while reconciling the order")
@@ -1357,9 +1369,17 @@ class Application:
                     state["menu"] = pending["menu"]
                     state["menu"]["phase"] = "ordered"
                     state["menu"]["order_id"] = order_id
+            elif expired_unpaid:
+                state["pending_checkout"] = None
             else:
                 state["pending_checkout"]["status"] = "uncertain"
-        return {"confirmed": confirmed, "order": order if confirmed else None, "tracking": tracking if confirmed else None, "retry_allowed": False}
+        return {
+            "confirmed": confirmed,
+            "expired": expired_unpaid,
+            "order": order if confirmed else None,
+            "tracking": tracking if confirmed else None,
+            "retry_allowed": expired_unpaid,
+        }
 
     def _order_change_reconcile(self, pending: Mapping[str, Any], deadline: float | None = None) -> dict[str, Any]:
         change = pending["order_change"]

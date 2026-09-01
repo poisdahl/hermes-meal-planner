@@ -335,7 +335,7 @@ class MenyClient:
     def _require_login(self) -> None:
         self._open(STORE_URL)
         result: dict[str, Any] = {}
-        for _ in range(20):
+        for _ in range(60):
             result = self._eval(r"""
 (() => {
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
