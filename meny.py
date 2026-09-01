@@ -271,10 +271,12 @@ def meny_order_search_completed(value: Any) -> bool:
 
 
 def meny_delivery_reservation_acknowledged(value: Any) -> bool:
-    """Return true only after MENY's dedicated delivery reservation succeeds."""
+    """Require both the delivery reservation and household selection writes."""
 
     if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
         raise HouseholdError("MENY browser delivery request log changed")
+    reservation = False
+    household = False
     for request in value["requests"]:
         if not isinstance(request, Mapping):
             raise HouseholdError("MENY browser delivery request log changed")
@@ -289,8 +291,18 @@ def meny_delivery_reservation_acknowledged(value: Any) -> bool:
             and parsed.hostname == "api.ngdata.no"
             and parsed.path == "/sylinder/hentevinduer/reservasjoner/v1/api"
         ):
-            return True
-    return False
+            reservation = True
+        if (
+            str(request.get("method") or "").upper() == "PUT"
+            and not isinstance(status, bool)
+            and isinstance(status, int)
+            and 200 <= status < 300
+            and parsed.scheme == "https"
+            and parsed.hostname == "platform-rest-prod.ngdata.no"
+            and re.fullmatch(r"/api/extended-user/\d{1,20}/household", parsed.path) is not None
+        ):
+            household = True
+    return reservation and household
 
 
 def normalize_cart_snapshot(value: Any) -> dict[str, Any]:
@@ -2500,7 +2512,11 @@ __DELIVERY_BINDING__
         try:
             with self._locked_operation(MENY_ORDER_TIMEOUT, deadline):
                 final_cart = dict(cart)
-                final_cart["delivery"] = None
+                review_summary = review.get("summary")
+                review_delivery = review_summary.get("delivery") if isinstance(review_summary, Mapping) else None
+                if not isinstance(review_delivery, Mapping):
+                    raise HouseholdError("MENY checkout delivery identity is unavailable")
+                final_cart["delivery"] = dict(review_delivery)
                 fresh = self._review_checkout(final_cart, order_change=order_change)
                 if not meny_checkout_reviews_match(review, fresh):
                     raise HouseholdError("MENY checkout changed after review")

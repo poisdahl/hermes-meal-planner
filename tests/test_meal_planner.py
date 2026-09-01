@@ -3431,11 +3431,11 @@ class MenyClientTests(unittest.TestCase):
 
     def test_delivery_reservation_requires_the_exact_successful_meny_endpoint(self):
         endpoint = "https://api.ngdata.no/sylinder/hentevinduer/reservasjoner/v1/api"
-        self.assertTrue(meny_delivery_reservation_acknowledged({"requests": [{
-            "method": "POST",
-            "status": 201,
-            "url": endpoint,
-        }]}))
+        household = "https://platform-rest-prod.ngdata.no/api/extended-user/123456/household"
+        self.assertTrue(meny_delivery_reservation_acknowledged({"requests": [
+            {"method": "POST", "status": 201, "url": endpoint},
+            {"method": "PUT", "status": 200, "url": household},
+        ]}))
         for request in (
             {"method": "POST", "status": None, "url": endpoint},
             {"method": "POST", "status": 500, "url": endpoint},
@@ -3451,9 +3451,13 @@ class MenyClientTests(unittest.TestCase):
     def test_delivery_selection_waits_for_the_reservation_response(self):
         client = self.client()
         endpoint = "https://api.ngdata.no/sylinder/hentevinduer/reservasjoner/v1/api"
+        household = "https://platform-rest-prod.ngdata.no/api/extended-user/123456/household"
         client._invoke = mock.Mock(side_effect=[
             {"requests": [{"method": "POST", "status": None, "url": endpoint}]},
-            {"requests": [{"method": "POST", "status": 200, "url": endpoint}]},
+            {"requests": [
+                {"method": "POST", "status": 200, "url": endpoint},
+                {"method": "PUT", "status": 200, "url": household},
+            ]},
         ])
         client._sleep = mock.Mock()
 
@@ -3637,7 +3641,10 @@ class MenyClientTests(unittest.TestCase):
         cart = {"items": [], "delivery": {"display": "torsdag 3. september Kl. 09:00-12:00"}}
         result = client.submit_checkout(cart, review)
         self.assertTrue(result["awaiting_user_payment"])
-        self.assertIsNone(client._review_checkout.call_args.args[0]["delivery"])
+        self.assertEqual(
+            client._review_checkout.call_args.args[0]["delivery"],
+            review["summary"]["delivery"],
+        )
         self.assertIsNotNone(cart["delivery"])
         client._click_checkout_submit.assert_called_once()
         self.assertEqual(client._click_checkout_submit.call_args.args[0], review)
