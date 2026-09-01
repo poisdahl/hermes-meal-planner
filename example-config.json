@@ -1,0 +1,7 @@
+{
+  "instance": "my-agent",
+  "household": "My household",
+  "provider": "meny",
+  "email_automation_profile": null,
+  "profile_overrides": {}
+}
