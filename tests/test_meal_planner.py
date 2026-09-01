@@ -2709,7 +2709,7 @@ class MenyClientTests(unittest.TestCase):
             return {}
 
         client._invoke = invoke
-        client._eval = mock.Mock(side_effect=[{"ready": True}, {"ready": True}])
+        client._eval = mock.Mock(side_effect=[{"ready": True}, {"ready": True}, {"ready": True}])
         client._click_checkout_control("checkout-next", expected_items=[(MENY_PRODUCT, 1)], target_code="TEST-CODE-1")
 
         selector = '[data-hermes-meal-planner-action="checkout-next"]'
@@ -2717,13 +2717,34 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(calls[1], ("get", "box", selector))
         self.assertEqual([call[:2] for call in calls[2:]], [("mouse", "move"), ("mouse", "down"), ("mouse", "up")])
         self.assertIn("location.href === 'https://meny.no/kassen'", client._eval.call_args_list[0].args[0])
-        self.assertIn("Se over varene", client._eval.call_args_list[1].args[0])
-        self.assertIn("enabled(target)", client._eval.call_args_list[1].args[0])
-        self.assertIn("candidates.length === 1", client._eval.call_args_list[1].args[0])
-        self.assertIn("removeAttribute", client._eval.call_args_list[1].args[0])
-        self.assertIn(MENY_PRODUCT, client._eval.call_args_list[1].args[0])
-        self.assertIn("TEST-CODE-1", client._eval.call_args_list[1].args[0])
-        self.assertIn("elementFromPoint", client._eval.call_args_list[1].args[0])
+        self.assertIn("Se over varene", client._eval.call_args_list[2].args[0])
+        self.assertIn("enabled(target)", client._eval.call_args_list[2].args[0])
+        self.assertIn("candidates.length === 1", client._eval.call_args_list[2].args[0])
+        self.assertIn("removeAttribute", client._eval.call_args_list[2].args[0])
+        self.assertIn(MENY_PRODUCT, client._eval.call_args_list[2].args[0])
+        self.assertIn("TEST-CODE-1", client._eval.call_args_list[2].args[0])
+        self.assertIn("elementFromPoint", client._eval.call_args_list[2].args[0])
+
+    def test_checkout_control_waits_for_smooth_scroll_to_reach_the_target(self):
+        client = self.client()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(side_effect=lambda *arguments: (
+            {"box": {"x": 10, "y": 2000, "width": 30, "height": 40}}
+            if arguments[:2] == ("get", "box") else {}
+        ))
+        client._eval = mock.Mock(side_effect=[
+            {"ready": True},
+            {"ready": False},
+            {"ready": False},
+            {"ready": True},
+            {"ready": True},
+        ])
+
+        client._click_checkout_control("checkout-next")
+
+        self.assertEqual(client._invoke.call_args_list.count(mock.call("get", "box", '[data-hermes-meal-planner-action="checkout-next"]')), 3)
+        self.assertEqual(client._sleep.call_args_list, [mock.call(0.1), mock.call(0.1)])
+        self.assertIn(mock.call("mouse", "down"), client._invoke.call_args_list)
 
     def test_checkout_control_fails_before_mouse_dispatch_if_obscured(self):
         client = self.client()
@@ -2736,7 +2757,7 @@ class MenyClientTests(unittest.TestCase):
             return {}
 
         client._invoke = invoke
-        client._eval = mock.Mock(side_effect=[{"ready": True}, {"ready": False}])
+        client._eval = mock.Mock(side_effect=[{"ready": True}, *([{"ready": False}] * 20)])
         with self.assertRaisesRegex(HouseholdError, "obscured or changed"):
             client._click_checkout_control("checkout-next")
         self.assertNotIn(("mouse", "down"), calls)
@@ -2778,9 +2799,9 @@ class MenyClientTests(unittest.TestCase):
         client._click_checkout_submit(review, lambda: events.append(("dispatch_fence",)))
 
         kinds = [event[0] for event in events]
-        self.assertEqual(kinds, ["eval", "scrollintoview", "get", "mouse", "eval", "require_time", "dispatch_fence", "mouse", "mouse"])
-        self.assertEqual(events[3], ("mouse", "move", "26", "41"))
-        second_gate = events[4][1]
+        self.assertEqual(kinds, ["eval", "scrollintoview", "get", "eval", "mouse", "eval", "require_time", "dispatch_fence", "mouse", "mouse"])
+        self.assertEqual(events[4], ("mouse", "move", "26", "41"))
+        second_gate = events[5][1]
         self.assertIn("elementFromPoint(26, 41)", second_gate)
         self.assertIn("location.href ===", second_gate)
         self.assertIn("123456", second_gate)
@@ -2794,7 +2815,7 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         review = {"summary": {"total": 1234.56, "delivery": {"display": "delivery"}}, "target_order_code": None}
         calls = []
-        client._eval = mock.Mock(side_effect=[{"ready": True}, {"ready": False}])
+        client._eval = mock.Mock(side_effect=[{"ready": True}, {"ready": True}, {"ready": False}])
         client._invoke = lambda *arguments: calls.append(arguments) or ({"box": {"x": 1, "y": 2, "width": 20, "height": 10}} if arguments[:2] == ("get", "box") else {})
         fence = mock.Mock()
         with self.assertRaisesRegex(HouseholdError, "changed or is obscured"):

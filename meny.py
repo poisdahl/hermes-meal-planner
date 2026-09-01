@@ -926,6 +926,19 @@ class MenyClient:
         self._invoke("mouse", "down")
         self._invoke("mouse", "up")
 
+    def _wait_for_checkout_hit(self, selector: str, render_gate: Any, error: str) -> tuple[int, int]:
+        self._invoke("scrollintoview", selector)
+        for attempt in range(20):
+            box = self._find_box(self._invoke("get", "box", selector))
+            if box and box["width"] > 0 and box["height"] > 0:
+                x = round(box["x"] + box["width"] / 2)
+                y = round(box["y"] + box["height"] / 2)
+                if self._eval(render_gate(True, x, y)) == {"ready": True}:
+                    return x, y
+            if attempt < 19:
+                self._sleep(0.1)
+        raise HouseholdError(error)
+
     def _click_checkout_control(
         self,
         action: str,
@@ -993,12 +1006,11 @@ class MenyClient:
         ready = self._eval(render_gate(False))
         if ready != {"ready": True}:
             raise HouseholdError("MENY checkout control changed")
-        self._invoke("scrollintoview", selector)
-        box = self._find_box(self._invoke("get", "box", selector))
-        if not box or box["width"] <= 0 or box["height"] <= 0:
-            raise HouseholdError("MENY checkout control is not clickable")
-        x = round(box["x"] + box["width"] / 2)
-        y = round(box["y"] + box["height"] / 2)
+        x, y = self._wait_for_checkout_hit(
+            selector,
+            render_gate,
+            "MENY checkout control is obscured or changed",
+        )
         self._invoke("mouse", "move", str(x), str(y))
         ready = self._eval(render_gate(True, x, y))
         if ready != {"ready": True}:
@@ -1052,12 +1064,11 @@ __DELIVERY_BINDING__
 
         if self._eval(render_gate(False)) != {"ready": True}:
             raise HouseholdError("MENY Vipps payment control changed")
-        self._invoke("scrollintoview", selector)
-        box = self._find_box(self._invoke("get", "box", selector))
-        if not box or box["width"] <= 0 or box["height"] <= 0:
-            raise HouseholdError("MENY Vipps payment control is not clickable")
-        x = round(box["x"] + box["width"] / 2)
-        y = round(box["y"] + box["height"] / 2)
+        x, y = self._wait_for_checkout_hit(
+            selector,
+            render_gate,
+            "MENY Vipps payment control changed or is obscured",
+        )
         self._invoke("mouse", "move", str(x), str(y))
         if self._eval(render_gate(True, x, y)) != {"ready": True}:
             raise HouseholdError("MENY Vipps payment control changed or is obscured")
