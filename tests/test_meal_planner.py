@@ -4358,20 +4358,20 @@ class FlowTests(unittest.TestCase):
             app.handle({"operation": "catalog", "action": "products", "query": "brokkoli"})
             self.assertEqual(app.integration["status"], "ready")
 
-    def test_meny_status_reprobes_after_interactive_login(self):
+    def test_meny_status_defers_startup_probe_and_checks_on_first_status(self):
         with tempfile.TemporaryDirectory() as temp:
             store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
             provider = FakeOda()
-            provider.probe = mock.Mock(side_effect=[
-                HouseholdError("MENY login is required in the configured browser profile"),
-                {"protocol_version": "browser-v1", "server": {"name": "MENY website"}, "tool_count": 11},
-            ])
+            provider.probe = mock.Mock(return_value={
+                "protocol_version": "browser-v1", "server": {"name": "MENY website"}, "tool_count": 11,
+            })
             app = Application(store, provider, self.browser)
-            self.assertEqual(app.integration["status"], "awaiting_login")
+            self.assertEqual(app.integration["status"], "unavailable")
+            provider.probe.assert_not_called()
             with mock.patch("service.time.monotonic", return_value=100.0):
                 status = app.handle({"operation": "status"})
             self.assertEqual(status["integration"]["status"], "ready")
-            self.assertEqual(provider.probe.call_args_list, [mock.call(), mock.call(deadline=210.0, allow_recovery=True)])
+            provider.probe.assert_called_once_with(deadline=210.0, allow_recovery=True)
 
     def test_meny_status_does_not_navigate_during_unresolved_checkout(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4382,8 +4382,8 @@ class FlowTests(unittest.TestCase):
             with store.locked() as state:
                 state["pending_checkout"] = {"status": "awaiting_user_payment"}
             status = app.handle({"operation": "status"})
-            self.assertEqual(status["integration"]["status"], "awaiting_login")
-            provider.probe.assert_called_once_with()
+            self.assertEqual(status["integration"]["status"], "unavailable")
+            provider.probe.assert_not_called()
 
     def test_wrapped_post_click_login_loss_updates_meny_status(self):
         with tempfile.TemporaryDirectory() as temp:

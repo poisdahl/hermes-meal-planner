@@ -419,7 +419,17 @@ class Application:
         self.browser_lock = threading.Lock()
         self.email_automation_profile = str(store.config.get("email_automation_profile") or "").strip()
         self.integration: dict[str, Any]
-        self._refresh_integration()
+        if self.provider == "meny":
+            # MENY readiness can require a full browser navigation. Keep the
+            # local RPC socket available during service startup and perform
+            # that bounded probe on the first status or provider operation.
+            self.integration = {
+                "status": "unavailable",
+                "provider": "meny",
+                "message": "MENY status has not been checked since service start",
+            }
+        else:
+            self._refresh_integration()
 
     def _refresh_integration(self, deadline: float | None = None, *, allow_recovery: bool = False) -> None:
         try:
