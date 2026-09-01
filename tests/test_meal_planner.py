@@ -1460,6 +1460,7 @@ class MenyClientTests(unittest.TestCase):
         old_id = "A" * 32
         new_id = "B" * 32
         url = "https://meny.no/sok?query=frosne%20erter&expanded=products"
+        client._viewport_primed = True
         client._cdp_request = mock.Mock(side_effect=[
             json.dumps([{"type": "page", "id": old_id, "url": url}]),
             json.dumps({"type": "page", "id": new_id, "url": url}),
@@ -1481,6 +1482,7 @@ class MenyClientTests(unittest.TestCase):
         ])
         client._terminate_browser_session.assert_called_once_with(mock.ANY)
         self.assertFalse(client._cdp_primed)
+        self.assertFalse(client._viewport_primed)
 
     def test_cdp_recovery_rejects_ambiguous_targets_and_short_deadlines(self):
         client = MenyClient(
@@ -1633,8 +1635,10 @@ class MenyClientTests(unittest.TestCase):
         client._site_shell_ready = mock.Mock(side_effect=lambda: events.append("ready") or next(readiness))
         client._sleep = mock.Mock()
         client._open("https://meny.no/varer")
-        self.assertEqual(events, ["ready", "open", "ready"])
+        self.assertEqual(events, ["set", "ready", "open", "ready"])
+        client._invoke.assert_any_call("set", "viewport", "1280", "900")
         self.assertTrue(client._cdp_primed)
+        self.assertTrue(client._viewport_primed)
 
     def test_primed_cdp_navigation_does_not_reload_the_same_ready_target(self):
         client = MenyClient(
@@ -1649,6 +1653,7 @@ class MenyClientTests(unittest.TestCase):
             cdp="http://127.0.0.1:9224",
         )
         client._cdp_primed = True
+        client._viewport_primed = True
         client._site_shell_ready = mock.Mock(return_value=True)
         client._invoke = mock.Mock()
 
@@ -1692,6 +1697,7 @@ class MenyClientTests(unittest.TestCase):
             cdp="http://127.0.0.1:9224",
         )
         client._cdp_primed = True
+        client._viewport_primed = True
         client.recovery_allowed = True
         client._invoke = mock.Mock(side_effect=lambda command, *_args: {"url": "https://meny.no/varer"} if command == "open" else {})
         client._invoke_once = mock.Mock(return_value={"url": "https://meny.no/varer"})
@@ -1721,6 +1727,7 @@ class MenyClientTests(unittest.TestCase):
             cdp="http://127.0.0.1:9224",
         )
         client._cdp_primed = True
+        client._viewport_primed = True
         client.recovery_allowed = False
         client._invoke = mock.Mock(side_effect=lambda command, *_args: {"url": "https://meny.no/varer"} if command == "open" else {})
         client._site_shell_ready = mock.Mock(return_value=False)

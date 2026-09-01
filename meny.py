@@ -86,6 +86,7 @@ MENY_READ_TIMEOUT = 110
 MENY_CART_TIMEOUT = 240
 MENY_ORDER_TIMEOUT = 240
 MAX_CART_CLICKS = 2
+MENY_VIEWPORT = (1280, 900)
 
 
 class _BrowserTransportError(HouseholdError):
@@ -525,6 +526,7 @@ class MenyClient:
         self.cdp = normalize_browser_cdp(cdp)
         self.vipps_phone_number = vipps_phone_number
         self._cdp_primed = False
+        self._viewport_primed = False
         self.session = f"hermes-meal-planner-meny-{instance}"
         self.lock = threading.Lock()
         self.deadline: float | None = None
@@ -2615,6 +2617,9 @@ __DELIVERY_BINDING__
             raise HouseholdError("MENY browser URL is invalid")
         self._shell_target = url
         if self.cdp is not None:
+            if not self._viewport_primed:
+                self._invoke("set", "viewport", *(str(value) for value in MENY_VIEWPORT))
+                self._viewport_primed = True
             try:
                 if self._site_shell_ready():
                     self._cdp_primed = True
@@ -2800,6 +2805,7 @@ __DELIVERY_BINDING__
                 return False
             if set(observed) == {created_id}:
                 self._cdp_primed = False
+                self._viewport_primed = False
                 return True
             if set(observed) != {target_id, created_id}:
                 return False
@@ -2811,6 +2817,7 @@ __DELIVERY_BINDING__
                 observed = self._cdp_page_targets(min(recovery_deadline, time.monotonic() + 0.5))
                 if set(observed) == {created_id} and observed[created_id] == recovery_url:
                     self._cdp_primed = False
+                    self._viewport_primed = False
                     return True
                 if not set(observed).issubset({target_id, created_id}) or created_id not in observed:
                     return False
