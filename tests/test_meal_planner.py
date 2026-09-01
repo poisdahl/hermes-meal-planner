@@ -272,6 +272,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(module.rpc_timeout("cart", {"action": "change"}), 300)
         self.assertEqual(module.rpc_timeout("cart", {"action": "get"}), 120)
         self.assertEqual(module.rpc_timeout("delivery", {"action": "list"}), 300)
+        self.assertEqual(module.rpc_timeout("checkout", {"action": "submit"}), 660)
         module.rpc = mock.Mock(return_value={})
         module.meal_planner_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
         module.rpc.assert_called_with(
@@ -3426,7 +3427,7 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client.review_checkout({}, allow_recovery=True), {"ready": True})
 
-        operation.assert_called_once_with(180, None, allow_recovery=True)
+        operation.assert_called_once_with(240, None, allow_recovery=True)
 
     def test_vipps_mouse_failure_after_dispatch_fence_is_uncertain(self):
         client = self.client()
@@ -3580,7 +3581,7 @@ class FlowTests(unittest.TestCase):
             app = Application(store, provider, self.browser)
             with mock.patch("service.time.monotonic", return_value=10.0):
                 app.handle({"operation": "orders", "action": "list"})
-            self.assertEqual(provider.call.call_args.kwargs["deadline"], 190.0)
+            self.assertEqual(provider.call.call_args.kwargs["deadline"], 250.0)
 
     def test_meny_delivery_reads_use_the_full_order_deadline(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -3590,7 +3591,7 @@ class FlowTests(unittest.TestCase):
             app = Application(store, provider, self.browser)
             with mock.patch("service.time.monotonic", return_value=10.0):
                 app.handle({"operation": "delivery", "action": "list"})
-            self.assertEqual(provider.call.call_args.kwargs["deadline"], 190.0)
+            self.assertEqual(provider.call.call_args.kwargs["deadline"], 250.0)
 
     def test_cart_change_accepts_intuitive_action_and_snake_case_product_id(self):
         self.app.handle({"operation": "cart", "action": "update", "operations": [{"product_id": "10", "quantity": 1}]})
@@ -3615,7 +3616,7 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(prepared["summary"]["payment"], "vipps")
             prepare_calls = provider.call.call_args_list[:]
             self.assertEqual([call.args[0] for call in prepare_calls], ["get_cart", "get_orders"])
-            self.assertTrue(all(call.kwargs.get("deadline") == 250.0 for call in prepare_calls))
+            self.assertTrue(all(call.kwargs.get("deadline") == 610.0 for call in prepare_calls))
             self.assertTrue(all(call.kwargs.get("allow_recovery") is True for call in prepare_calls))
             self.assertEqual(provider.checkout_review_recovery, [True])
             with mock.patch("service.time.monotonic", return_value=20.0):
@@ -3623,7 +3624,7 @@ class FlowTests(unittest.TestCase):
             self.assertTrue(result["awaiting_user_payment"])
             confirm_calls = provider.call.call_args_list[len(prepare_calls):]
             self.assertEqual([call.args[0] for call in confirm_calls], ["get_cart"])
-            self.assertEqual(confirm_calls[0].kwargs.get("deadline"), 260.0)
+            self.assertEqual(confirm_calls[0].kwargs.get("deadline"), 620.0)
             self.assertEqual(store.read()["pending_checkout"]["status"], "awaiting_user_payment")
             self.assertEqual(provider.checkout_clicks, 1)
             provider.confirmation_order_id = "99990002"
@@ -3645,8 +3646,8 @@ class FlowTests(unittest.TestCase):
             self.assertIsNone(store.read()["pending_checkout"])
             reconcile_calls = provider.call.call_args_list[reconcile_start:]
             self.assertEqual(len(reconcile_calls), 3)
-            self.assertTrue(all(call.kwargs.get("deadline") == 260.0 for call in reconcile_calls))
-            self.assertEqual(provider.checkout_confirmation_order_id.call_args.kwargs["deadline"], 260.0)
+            self.assertTrue(all(call.kwargs.get("deadline") == 620.0 for call in reconcile_calls))
+            self.assertEqual(provider.checkout_confirmation_order_id.call_args.kwargs["deadline"], 620.0)
             with self.assertRaisesRegex(HouseholdError, "cart_ready"):
                 app.handle({
                     "operation": "schedule",
@@ -4054,8 +4055,8 @@ class FlowTests(unittest.TestCase):
                 app.handle({"operation": "orders", "action": "change_begin", "order_id": "99990001"})
             protected_calls = [call for call in provider.call.call_args_list if call.args[0] in {"get_order", "order_tracking"}]
             self.assertEqual(len(protected_calls), 2)
-            self.assertTrue(all(call.kwargs.get("deadline") == 190.0 for call in protected_calls))
-            self.assertEqual(provider.begin_order_change.call_args.kwargs["deadline"], 190.0)
+            self.assertTrue(all(call.kwargs.get("deadline") == 250.0 for call in protected_calls))
+            self.assertEqual(provider.begin_order_change.call_args.kwargs["deadline"], 250.0)
 
     def test_meny_cancellation_propagates_each_absolute_deadline_to_all_reads(self):
         with tempfile.TemporaryDirectory() as temp:

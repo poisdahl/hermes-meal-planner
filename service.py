@@ -40,6 +40,7 @@ from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyC
 
 MAX_REQUEST = 2 * 1024 * 1024
 CANCELLATION_OPERATION_TIMEOUT = 105
+MENY_CHECKOUT_OPERATION_TIMEOUT = 600
 MENY_VIPPS_EXPIRY_BUFFER = timedelta(minutes=11)
 UNRESOLVED_CHECKOUT_STATUSES = {"clicking", "uncertain", "awaiting_user_payment"}
 SCHEDULE_WEEKDAYS = {
@@ -1100,7 +1101,7 @@ class Application:
 
     def _checkout(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "prepare")
-        deadline = time.monotonic() + 240
+        deadline = time.monotonic() + (MENY_CHECKOUT_OPERATION_TIMEOUT if self.provider == "meny" else 240)
         if action == "prepare":
             return self._checkout_prepare(deadline)
         if action == "confirm":
