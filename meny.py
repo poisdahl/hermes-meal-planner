@@ -270,6 +270,29 @@ def meny_order_search_completed(value: Any) -> bool:
     return False
 
 
+def meny_delivery_reservation_acknowledged(value: Any) -> bool:
+    """Return true only after MENY's dedicated delivery reservation succeeds."""
+
+    if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
+        raise HouseholdError("MENY browser delivery request log changed")
+    for request in value["requests"]:
+        if not isinstance(request, Mapping):
+            raise HouseholdError("MENY browser delivery request log changed")
+        status = request.get("status")
+        parsed = urlparse(str(request.get("url") or ""))
+        if (
+            str(request.get("method") or "").upper() == "POST"
+            and not isinstance(status, bool)
+            and isinstance(status, int)
+            and 200 <= status < 300
+            and parsed.scheme == "https"
+            and parsed.hostname == "api.ngdata.no"
+            and parsed.path == "/sylinder/hentevinduer/reservasjoner/v1/api"
+        ):
+            return True
+    return False
+
+
 def normalize_cart_snapshot(value: Any) -> dict[str, Any]:
     """Reject incomplete or ambiguous MENY cart DOM snapshots."""
 
@@ -1686,6 +1709,18 @@ __DELIVERY_BINDING__
             slots = [slot for slot in slots if slot.get("date") == delivery_date]
         return {"provider": "meny", "slots": slots}
 
+    def _wait_for_delivery_reservation(self) -> None:
+        requests: Any = {"requests": []}
+        for attempt in range(40):
+            requests = self._invoke("network", "requests")
+            if meny_delivery_reservation_acknowledged(requests):
+                return
+            if attempt < 39:
+                self._sleep(0.25)
+        raise HouseholdError(
+            "MENY did not acknowledge the delivery reservation; inspect the selected slot before retrying"
+        )
+
     def _select_delivery_slot(self, value: Any, *, _allow_refresh: bool = True) -> dict[str, Any]:
         slot_id, expected_suffix = normalize_delivery_slot_ref(value)
         self._open_delivery_picker()
@@ -1789,7 +1824,9 @@ __DELIVERY_BINDING__
             self._sleep(0.25)
         else:
             raise HouseholdError("MENY delivery confirmation changed")
+        self._invoke("network", "requests", "--clear")
         self._invoke("click", '[data-hermes-meal-planner-action="delivery-confirm"]')
+        self._wait_for_delivery_reservation()
         self._wait_delivery_picker_closed()
         if refreshing:
             try:

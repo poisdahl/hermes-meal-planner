@@ -39,7 +39,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_checkout_reviews_match, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -1980,6 +1980,7 @@ class MenyClientTests(unittest.TestCase):
         ])
         client._eval = lambda script: scripts.append(script) or next(results)
         client._invoke = mock.Mock(return_value={})
+        client._wait_for_delivery_reservation = mock.Mock()
 
         result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
 
@@ -1998,9 +1999,11 @@ class MenyClientTests(unittest.TestCase):
         client._sleep.assert_called_once_with(0.25)
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
+            mock.call("network", "requests", "--clear"),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
         ])
+        client._wait_for_delivery_reservation.assert_called_once_with()
 
     def test_already_selected_delivery_refreshes_through_a_verified_temporary_slot(self):
         client = self.client()
@@ -2021,6 +2024,7 @@ class MenyClientTests(unittest.TestCase):
         ])
         client._invoke = mock.Mock(return_value={})
         client._wait_delivery_picker_closed = mock.Mock()
+        client._wait_for_delivery_reservation = mock.Mock()
 
         result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
 
@@ -2028,12 +2032,15 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._open_delivery_picker.call_count, 3)
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("click", '[data-hermes-meal-planner-action="delivery-refresh-slot"]'),
+            mock.call("network", "requests", "--clear"),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
+            mock.call("network", "requests", "--clear"),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
         ])
         self.assertEqual(client._wait_delivery_picker_closed.call_count, 3)
+        self.assertEqual(client._wait_for_delivery_reservation.call_count, 2)
 
     def test_already_selected_delivery_waits_until_the_dialog_is_closed(self):
         client = self.client()
@@ -2063,6 +2070,7 @@ class MenyClientTests(unittest.TestCase):
             *([{"ready": False, "identity": True, "authenticated": True, "dialog_count": 1}] * 20),
         ])
         client._invoke = mock.Mock(return_value={})
+        client._wait_for_delivery_reservation = mock.Mock()
 
         with self.assertRaisesRegex(HouseholdError, "selection is uncertain"):
             client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
@@ -2070,6 +2078,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._open_delivery_picker.call_count, 1)
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
+            mock.call("network", "requests", "--clear"),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
         ])
 
@@ -3419,6 +3428,42 @@ class MenyClientTests(unittest.TestCase):
             "status": 200,
             "url": "https://platform-rest-prod.ngdata.no/api/client-notifications/",
         }]}))
+
+    def test_delivery_reservation_requires_the_exact_successful_meny_endpoint(self):
+        endpoint = "https://api.ngdata.no/sylinder/hentevinduer/reservasjoner/v1/api"
+        self.assertTrue(meny_delivery_reservation_acknowledged({"requests": [{
+            "method": "POST",
+            "status": 201,
+            "url": endpoint,
+        }]}))
+        for request in (
+            {"method": "POST", "status": None, "url": endpoint},
+            {"method": "POST", "status": 500, "url": endpoint},
+            {"method": "GET", "status": 200, "url": endpoint},
+            {"method": "POST", "status": 200, "url": f"{endpoint}/other"},
+            {"method": "POST", "status": 200, "url": "https://example.test/sylinder/hentevinduer/reservasjoner/v1/api"},
+        ):
+            with self.subTest(request=request):
+                self.assertFalse(meny_delivery_reservation_acknowledged({"requests": [request]}))
+        with self.assertRaisesRegex(HouseholdError, "delivery request log changed"):
+            meny_delivery_reservation_acknowledged({"requests": {}})
+
+    def test_delivery_selection_waits_for_the_reservation_response(self):
+        client = self.client()
+        endpoint = "https://api.ngdata.no/sylinder/hentevinduer/reservasjoner/v1/api"
+        client._invoke = mock.Mock(side_effect=[
+            {"requests": [{"method": "POST", "status": None, "url": endpoint}]},
+            {"requests": [{"method": "POST", "status": 200, "url": endpoint}]},
+        ])
+        client._sleep = mock.Mock()
+
+        client._wait_for_delivery_reservation()
+
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("network", "requests"),
+            mock.call("network", "requests"),
+        ])
+        client._sleep.assert_called_once_with(0.25)
 
     def test_vipps_dispatch_waits_for_the_payment_response(self):
         client = self.client()
