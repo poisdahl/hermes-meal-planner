@@ -38,16 +38,17 @@ if two different paths share that identity.
 ## One-agent installation
 
 The supported path is a standard non-root Hermes Agent 0.20.5 or newer on a
-systemd-based Linux host, plus non-snap Chromium and
+systemd-based Linux host or Apple Silicon macOS, plus Chromium or Google Chrome and
 [`agent-browser`](https://github.com/vercel-labs/agent-browser).
 The meal planner deliberately uses Hermes's managed Python runtime; a system
 `python3` normally does not contain Hermes's MCP and OAuth modules. There is no
 database, web app, scheduler service or multi-agent controller.
 
-Install a non-snap Chromium or Google Chrome with the Linux distribution's
-package manager. Hermes Agent 0.20.5 installs its supported Node.js 26 runtime
-under `HERMES_HOME`; use that exact npm to install the tested browser adapter
-under your home rather than Debian's older Node.js:
+On Linux, install a non-snap Chromium or Google Chrome with the distribution's
+package manager. On macOS, install the normal Google Chrome or Chromium app in
+`/Applications` or `~/Applications`; the installer discovers those app bundles.
+Hermes uses a supported Node.js runtime; use its npm, or the supported Node on
+`PATH`, to install the tested browser adapter under your home:
 
 ```sh
 sudo apt-get update
@@ -91,25 +92,24 @@ hermes config set mcp_servers.oda-weekly.enabled false
 ./install.sh --provider oda --household "My household"
 ```
 
-For MENY:
+For MENY, run the installer from an interactive terminal; it prompts privately
+for the eight-digit Vipps mobile number. For non-interactive installation, set
+`MEAL_PLANNER_VIPPS_PHONE_NUMBER` only for the installer process.
 
 ```sh
-read -r -s -p "Vipps mobile number (8 digits): " MEAL_PLANNER_VIPPS_PHONE_NUMBER
-export MEAL_PLANNER_VIPPS_PHONE_NUMBER
 ./install.sh --provider meny --household "My household"
-unset MEAL_PLANNER_VIPPS_PHONE_NUMBER
 ```
 
-The installer verifies Hermes's managed Python, `agent-browser`, non-snap
-Chromium and a running user systemd manager; creates one private config,
+The installer verifies Hermes's managed Python, `agent-browser`, Chromium and
+the platform's user service manager; creates one private config,
 provider-bound state, browser profile and Unix socket under
 `$HERMES_HOME/meal-planner` (normally `~/.hermes/meal-planner`); installs the
 single skill; registers the local MCP bridge with `hermes mcp add`; and installs
-a user-level systemd service. It does not start a provider session or overwrite
+a user-level systemd service on Linux or LaunchAgent on macOS. It does not start a provider session or overwrite
 an existing household/provider config. If the machine uses non-standard paths,
 set `HERMES_PYTHON`, `MEAL_PLANNER_AGENT_BROWSER` or
 `MEAL_PLANNER_BROWSER_EXECUTABLE` while running the installer; their resolved
-values are saved in the private systemd unit.
+values are saved in the private service definition.
 
 New installations use `"confirmation_policy": "fresh"`: Hermes prepares the
 exact checkout or cancellation summary and asks once before dispatch. An owner
@@ -153,14 +153,31 @@ same account used for `oda-weekly`, the intended delivery address and an
 already configured provider-side payment method. Every new-cart or add-to-order
 protected Oda summary includes the browser-verified address and only the
 payment method's last four digits so the user can catch a wrong profile before
-confirming; the meal planner never stores full payment data. Start and verify
-the service:
+confirming; the meal planner never stores full payment data.
+
+On systemd Linux, start and verify the service:
 
 ```sh
 systemctl --user enable --now hermes-meal-planner.service
 systemctl --user status hermes-meal-planner.service
 hermes mcp test meal_planner
 ```
+
+On macOS, the installer prints the exact LaunchAgent path and label. With the
+defaults, start and verify it with:
+
+```sh
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/com.hermes-agent.meal-planner.plist"
+launchctl print "gui/$(id -u)/com.hermes-agent.meal-planner"
+hermes mcp test meal_planner
+```
+
+Restart with `launchctl kickstart -k
+"gui/$(id -u)/com.hermes-agent.meal-planner"`. Stop and unload it with
+`launchctl bootout "gui/$(id -u)/com.hermes-agent.meal-planner"`; start it
+again with the `bootstrap` command above. Standard output and errors go to
+`~/Library/Logs/com.hermes-agent.meal-planner.out.log` and `.err.log`.
 
 Restart the Hermes CLI or gateway after adding the MCP server. Current Hermes
 registers the tools as `mcp__meal_planner__meal_planner_*` and makes them
@@ -169,7 +186,7 @@ toolset edit. If a platform is explicitly restricted under
 `platform_toolsets.<platform>`, add the raw server name `meal_planner` to that
 platform's list.
 
-The systemd unit restarts the service on failure. For MENY, `agent-browser`
+The systemd unit or LaunchAgent restarts the service on failure. For MENY, `agent-browser`
 owns the headless Chromium instance privately and launches it from the exact
 persistent profile when needed; the service never attaches to a fixed or
 pre-existing remote-debugging endpoint. The service reports `awaiting_login`
@@ -178,6 +195,14 @@ when the MENY session is absent or expired and
 unattended server, enable the user's systemd
 lingering according to the distribution's policy so user services start before
 interactive login.
+
+For rollback, stop the service, keep a private copy of the config/state/profile,
+check out the previously working public commit in the stable clone, rerun the
+installer, and start the service again. For uninstall, stop and disable/unload
+the service, run `hermes mcp remove meal_planner`, and move its service
+definition aside before removing the installed skill, stable clone and private
+meal-planner directory. The private directory contains provider state and must
+not be deleted before its backup is verified.
 
 Status reports pending checkout, cancellation and order-change status
 explicitly without exposing their private payloads, so an uncertain protected

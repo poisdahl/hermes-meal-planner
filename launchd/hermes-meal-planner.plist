@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@LAUNCHD_LABEL@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@SOURCE_ROOT@/run-service.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>@HERMES_HOME@</string>
+    <key>HERMES_PYTHON</key>
+    <string>@HERMES_PYTHON@</string>
+    <key>MEAL_PLANNER_AGENT_BROWSER</key>
+    <string>@AGENT_BROWSER@</string>
+    <key>MEAL_PLANNER_BROWSER_EXECUTABLE</key>
+    <string>@BROWSER_EXECUTABLE@</string>
+    <key>PATH</key>
+    <string>@RUNTIME_PATH@</string>
+    <key>MEAL_PLANNER_HOME</key>
+    <string>@PRIVATE_ROOT@</string>
+    <key>MEAL_PLANNER_CONFIG</key>
+    <string>@CONFIG_PATH@</string>
+    <key>MEAL_PLANNER_STATE</key>
+    <string>@PRIVATE_ROOT@/state</string>
+    <key>MEAL_PLANNER_SOCKET</key>
+    <string>@SOCKET_PATH@</string>
+    <key>MEAL_PLANNER_BROWSER_HOME</key>
+    <string>@PRIVATE_ROOT@/browser</string>
+    <key>MEAL_PLANNER_BROWSER_PROFILE</key>
+    <string>@PRIVATE_ROOT@/browser/profile</string>
+    <key>MEAL_PLANNER_BROWSER_SOCKET_DIR</key>
+    <string>@BROWSER_SOCKET_DIRECTORY@</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@STDOUT_PATH@</string>
+  <key>StandardErrorPath</key>
+  <string>@STDERR_PATH@</string>
+</dict>
+</plist>

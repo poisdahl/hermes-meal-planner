@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import threading
@@ -37,7 +38,7 @@ from oda_browser import (  # noqa: E402
     checkout_lines_match,
     product_identity,
 )
-from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout  # noqa: E402
+from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
 from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, meny_order_search_completed, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged  # noqa: E402
 
 
@@ -302,6 +303,17 @@ class CoreTests(unittest.TestCase):
             listener.bind.assert_called_once_with(str(path))
             chown.assert_called_once_with(path, -1, 4321)
             chmod.assert_called_once_with(path, 0o660)
+
+    def test_darwin_peer_credentials_authorize_the_effective_uid(self):
+        connection = mock.Mock()
+        connection.getsockopt.return_value = struct.pack("@IIh16i", 0, 501, 0, *([0] * 16))
+        with (
+            mock.patch("service.socket.SO_PEERCRED", None, create=True),
+            mock.patch("service.socket.SOL_LOCAL", 0, create=True),
+            mock.patch("service.socket.LOCAL_PEERCRED", 1, create=True),
+        ):
+            self.assertEqual(peer_uid(connection), 501)
+        connection.getsockopt.assert_called_once_with(0, 1, 256)
 
     def test_household_config_defaults_and_casefolds_provider_for_runtime_startup(self):
         with tempfile.TemporaryDirectory() as directory:

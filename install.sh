@@ -74,6 +74,10 @@ browser_socket_directory="${MEAL_PLANNER_BROWSER_SOCKET_DIR:-${XDG_RUNTIME_DIR:-
 unit_path="$hermes_home/systemd/hermes-meal-planner.service"
 xdg_config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 user_unit_path="$xdg_config_home/systemd/user/hermes-meal-planner.service"
+launchd_label="${MEAL_PLANNER_LAUNCHD_LABEL:-com.hermes-agent.meal-planner}"
+launch_agent_path="${MEAL_PLANNER_LAUNCH_AGENT_PATH:-$HOME/Library/LaunchAgents/$launchd_label.plist}"
+launchd_stdout_path="${MEAL_PLANNER_STDOUT_LOG:-$HOME/Library/Logs/$launchd_label.out.log}"
+launchd_stderr_path="${MEAL_PLANNER_STDERR_LOG:-$HOME/Library/Logs/$launchd_label.err.log}"
 
 find_hermes_python() {
   local candidate
@@ -99,6 +103,8 @@ if [[ -n "${MEAL_PLANNER_AGENT_BROWSER:-}" && -x "$MEAL_PLANNER_AGENT_BROWSER" ]
   agent_browser="$MEAL_PLANNER_AGENT_BROWSER"
 elif command -v agent-browser >/dev/null 2>&1; then
   agent_browser="$(command -v agent-browser)"
+elif [[ -x "$HOME/.local/lib/hermes-meal-planner/node_modules/.bin/agent-browser" ]]; then
+  agent_browser="$HOME/.local/lib/hermes-meal-planner/node_modules/.bin/agent-browser"
 elif [[ -x "$hermes_home/node/bin/agent-browser" ]]; then
   agent_browser="$hermes_home/node/bin/agent-browser"
 else
@@ -139,6 +145,18 @@ else
       break
     fi
   done
+  if [[ -z "$chromium" && "$(uname -s)" == "Darwin" ]]; then
+    for candidate in \
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+      "$HOME/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+      if [[ -x "$candidate" ]]; then
+        chromium="$candidate"
+        break
+      fi
+    done
+  fi
 fi
 if [[ -z "$chromium" ]]; then
   echo "Chromium is missing. Install it or set MEAL_PLANNER_BROWSER_EXECUTABLE" >&2
@@ -167,13 +185,38 @@ if not isinstance(server, dict) or server.get("enabled") is not False:
     raise SystemExit("disable the raw oda-weekly MCP server before installing the guarded meal planner")
 PY
 fi
-if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user show-environment >/dev/null 2>&1; then
-  echo "A running user systemd manager is required for supervised installation." >&2
-  exit 1
-fi
+case "$(uname -s)" in
+  Darwin)
+    if ! command -v launchctl >/dev/null 2>&1; then
+      echo "launchctl is required for supervised macOS installation." >&2
+      exit 1
+    fi
+    if [[ ! "$launchd_label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      echo "MEAL_PLANNER_LAUNCHD_LABEL contains unsupported characters" >&2
+      exit 2
+    fi
+    service_manager=launchd
+    ;;
+  Linux)
+    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl --user show-environment >/dev/null 2>&1; then
+      echo "A running user systemd manager is required for supervised installation." >&2
+      exit 1
+    fi
+    service_manager=systemd
+    ;;
+  *)
+    echo "Only systemd-based Linux and macOS are supported." >&2
+    exit 1
+    ;;
+esac
 
 umask 077
-mkdir -p "$private_root/state" "$private_root/browser/profile" "$browser_socket_directory" "$hermes_home/skills/meal-planner" "$(dirname -- "$unit_path")" "$(dirname -- "$user_unit_path")"
+mkdir -p "$private_root/state" "$private_root/browser/profile" "$browser_socket_directory" "$hermes_home/skills/meal-planner"
+if [[ "$service_manager" == "systemd" ]]; then
+  mkdir -p "$(dirname -- "$unit_path")" "$(dirname -- "$user_unit_path")"
+else
+  mkdir -p "$(dirname -- "$launch_agent_path")" "$(dirname -- "$launchd_stdout_path")" "$(dirname -- "$launchd_stderr_path")"
+fi
 chmod 700 "$private_root" "$private_root/state" "$private_root/browser" "$private_root/browser/profile" "$browser_socket_directory"
 
 if [[ -e "$config_path" ]]; then
@@ -207,17 +250,18 @@ chmod 600 "$config_path"
 cp "$source_root/skill/SKILL.md" "$hermes_home/skills/meal-planner/SKILL.md"
 chmod 600 "$hermes_home/skills/meal-planner/SKILL.md"
 
-SOURCE_ROOT="$source_root" \
-INSTALL_HERMES_HOME="$hermes_home" \
-INSTALL_HERMES_PYTHON="$python" \
-INSTALL_AGENT_BROWSER="$agent_browser" \
-INSTALL_BROWSER_EXECUTABLE="$chromium" \
-INSTALL_PRIVATE_ROOT="$private_root" \
-INSTALL_CONFIG_PATH="$config_path" \
-INSTALL_SOCKET_PATH="$socket_path" \
-INSTALL_BROWSER_SOCKET_DIRECTORY="$browser_socket_directory" \
-INSTALL_RUNTIME_PATH="$runtime_path" \
-  "$python" - "$source_root/systemd/hermes-meal-planner.service" "$unit_path" <<'PY'
+if [[ "$service_manager" == "systemd" ]]; then
+  SOURCE_ROOT="$source_root" \
+  INSTALL_HERMES_HOME="$hermes_home" \
+  INSTALL_HERMES_PYTHON="$python" \
+  INSTALL_AGENT_BROWSER="$agent_browser" \
+  INSTALL_BROWSER_EXECUTABLE="$chromium" \
+  INSTALL_PRIVATE_ROOT="$private_root" \
+  INSTALL_CONFIG_PATH="$config_path" \
+  INSTALL_SOCKET_PATH="$socket_path" \
+  INSTALL_BROWSER_SOCKET_DIRECTORY="$browser_socket_directory" \
+  INSTALL_RUNTIME_PATH="$runtime_path" \
+    "$python" - "$source_root/systemd/hermes-meal-planner.service" "$unit_path" <<'PY'
 import os
 from pathlib import Path
 import sys
@@ -241,9 +285,63 @@ for marker, value in values.items():
     source = source.replace(marker, value.replace("%", "%%"))
 Path(sys.argv[2]).write_text(source, encoding="utf-8")
 PY
-chmod 600 "$unit_path"
-cp "$unit_path" "$user_unit_path"
-chmod 600 "$user_unit_path"
+  chmod 600 "$unit_path"
+  cp "$unit_path" "$user_unit_path"
+  chmod 600 "$user_unit_path"
+else
+  SOURCE_ROOT="$source_root" \
+  INSTALL_LAUNCHD_LABEL="$launchd_label" \
+  INSTALL_HERMES_HOME="$hermes_home" \
+  INSTALL_HERMES_PYTHON="$python" \
+  INSTALL_AGENT_BROWSER="$agent_browser" \
+  INSTALL_BROWSER_EXECUTABLE="$chromium" \
+  INSTALL_PRIVATE_ROOT="$private_root" \
+  INSTALL_CONFIG_PATH="$config_path" \
+  INSTALL_SOCKET_PATH="$socket_path" \
+  INSTALL_BROWSER_SOCKET_DIRECTORY="$browser_socket_directory" \
+  INSTALL_RUNTIME_PATH="$runtime_path" \
+  INSTALL_STDOUT_PATH="$launchd_stdout_path" \
+  INSTALL_STDERR_PATH="$launchd_stderr_path" \
+    "$python" - "$source_root/launchd/hermes-meal-planner.plist" "$launch_agent_path" <<'PY'
+import os
+from pathlib import Path
+import plistlib
+import sys
+
+value = plistlib.loads(Path(sys.argv[1]).read_bytes())
+markers = {
+    "@LAUNCHD_LABEL@": os.environ["INSTALL_LAUNCHD_LABEL"],
+    "@SOURCE_ROOT@": os.environ["SOURCE_ROOT"],
+    "@HERMES_HOME@": os.environ["INSTALL_HERMES_HOME"],
+    "@HERMES_PYTHON@": os.environ["INSTALL_HERMES_PYTHON"],
+    "@AGENT_BROWSER@": os.environ["INSTALL_AGENT_BROWSER"],
+    "@BROWSER_EXECUTABLE@": os.environ["INSTALL_BROWSER_EXECUTABLE"],
+    "@PRIVATE_ROOT@": os.environ["INSTALL_PRIVATE_ROOT"],
+    "@CONFIG_PATH@": os.environ["INSTALL_CONFIG_PATH"],
+    "@SOCKET_PATH@": os.environ["INSTALL_SOCKET_PATH"],
+    "@BROWSER_SOCKET_DIRECTORY@": os.environ["INSTALL_BROWSER_SOCKET_DIRECTORY"],
+    "@RUNTIME_PATH@": os.environ["INSTALL_RUNTIME_PATH"],
+    "@STDOUT_PATH@": os.environ["INSTALL_STDOUT_PATH"],
+    "@STDERR_PATH@": os.environ["INSTALL_STDERR_PATH"],
+}
+
+def replace(item):
+    if isinstance(item, str):
+        for marker, replacement in markers.items():
+            item = item.replace(marker, replacement)
+        return item
+    if isinstance(item, list):
+        return [replace(child) for child in item]
+    if isinstance(item, dict):
+        return {key: replace(child) for key, child in item.items()}
+    return item
+
+with Path(sys.argv[2]).open("wb") as handle:
+    plistlib.dump(replace(value), handle, sort_keys=False)
+PY
+  chmod 600 "$launch_agent_path"
+  plutil -lint "$launch_agent_path" >/dev/null
+fi
 
 mcp_state="$("$python" - "$hermes_home/config.yaml" "$python" "$source_root/mcp_server.py" "$socket_path" <<'PY'
 from pathlib import Path
@@ -287,9 +385,9 @@ if server.get("enabled") is not True:
     raise SystemExit("Hermes saved meal_planner disabled; resolve MCP discovery before continuing")
 PY
 
-systemctl --user daemon-reload
-
-cat <<EOF
+if [[ "$service_manager" == "systemd" ]]; then
+  systemctl --user daemon-reload
+  cat <<EOF
 Installed the meal planner for $household with provider $provider.
 
 Next:
@@ -303,6 +401,30 @@ Resolved runtime:
   agent-browser: $agent_browser
   Chromium: $chromium
 EOF
+else
+  launchd_domain="gui/$(id -u)"
+  cat <<EOF
+Installed the meal planner for $household with provider $provider.
+
+Next:
+  1. Complete provider login with the exact browser command printed below.
+  2. launchctl bootstrap $launchd_domain "$launch_agent_path"
+  3. hermes mcp test meal_planner
+  4. Restart Hermes, then ask: "Show my meal-planner status."
+
+Lifecycle:
+  Status:  launchctl print $launchd_domain/$launchd_label
+  Restart: launchctl kickstart -k $launchd_domain/$launchd_label
+  Stop:    launchctl bootout $launchd_domain/$launchd_label
+  Start:   launchctl bootstrap $launchd_domain "$launch_agent_path"
+  Logs:    "$launchd_stdout_path" and "$launchd_stderr_path"
+
+Resolved runtime:
+  Hermes Python: $python
+  agent-browser: $agent_browser
+  Chromium: $chromium
+EOF
+fi
 printf '  Login command: %q --user-data-dir=%q %q\n' \
   "$chromium" \
   "$private_root/browser/profile" \

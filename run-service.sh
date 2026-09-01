@@ -37,6 +37,11 @@ find_agent_browser() {
     command -v agent-browser
     return 0
   fi
+  candidate="$HOME/.local/lib/hermes-meal-planner/node_modules/.bin/agent-browser"
+  if [[ -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
   candidate="$hermes_home/node/bin/agent-browser"
   if [[ -x "$candidate" ]]; then
     printf '%s\n' "$candidate"
@@ -58,6 +63,18 @@ find_chromium() {
       return 0
     fi
   done
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    for candidate in \
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+      "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+      "$HOME/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+      if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  fi
   echo "Chromium or Google Chrome was not found; set MEAL_PLANNER_BROWSER_EXECUTABLE" >&2
   return 1
 }

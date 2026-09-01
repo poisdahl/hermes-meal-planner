@@ -53,6 +53,23 @@ SCHEDULE_WEEKDAYS = {
 }
 
 
+def peer_uid(connection: socket.socket) -> int:
+    """Return the effective UID at the other end of a local Unix socket."""
+    linux_option = getattr(socket, "SO_PEERCRED", None)
+    if linux_option is not None:
+        credentials = connection.getsockopt(socket.SOL_SOCKET, linux_option, struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", credentials)
+        return uid
+    darwin_option = getattr(socket, "LOCAL_PEERCRED", None)
+    if darwin_option is not None:
+        credentials = connection.getsockopt(getattr(socket, "SOL_LOCAL", 0), darwin_option, 256)
+        version, uid = struct.unpack_from("@II", credentials)
+        if version != 0:
+            raise PermissionError("unsupported local peer credential version")
+        return uid
+    raise RuntimeError("local peer credentials are unavailable")
+
+
 def now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -1593,8 +1610,7 @@ class Server:
 
     def _serve(self, connection: socket.socket) -> None:
         with connection:
-            credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
-            _pid, uid, _gid = struct.unpack("3i", credentials)
+            uid = peer_uid(connection)
             if uid not in {0, self.allowed_uid}:
                 return
             data = b""
