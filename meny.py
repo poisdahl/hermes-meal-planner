@@ -2095,7 +2095,9 @@ __DELIVERY_BINDING__
                 return {"awaiting_user_payment": True, "payment": "vipps"}
         except HouseholdError as exc:
             if not final_dispatched:
-                raise CheckoutPreconditionError(str(exc)) from exc
+                raise CheckoutPreconditionError(
+                    f"{exc}; no payment was dispatched; one fresh prepare is safe"
+                ) from exc
             raise
 
     def review_cancellation(self, order_id: str, order: Mapping[str, Any], *, deadline: float | None = None) -> dict[str, Any]:

@@ -122,6 +122,10 @@ error is not proof that the current attempt succeeded. A dispatched click that
 was not acknowledged stays uncertain even after its summary expires; only an
 acknowledged, unapproved Vipps request may expire into an explicitly retryable
 state.
+When a known pre-dispatch check stops checkout, the error states that no payment
+was dispatched. Under standing authorization, the agent may perform exactly one
+fresh submit for the same current request; this is distinct from retrying an
+uncertain dispatched action.
 
 ## Provider login and startup
 

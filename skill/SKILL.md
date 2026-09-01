@@ -48,7 +48,10 @@ before reconciliation. Never submit or retry while that approval or any result
 is uncertain; use the integration's reconciliation path. Declare checkout
 success only when checkout `submit` or `reconcile` returns `confirmed=true` for
 its bound attempt. Never infer success from a later generic order list or order
-read after checkout returned an error.
+read after checkout returned an error. If checkout explicitly reports that no
+payment was dispatched and one fresh prepare is safe, a standing-authorized
+current request may use `submit` once more; do not describe the stopped attempt
+as sent. Never make more than that one pre-dispatch retry.
 For recurring runs or recipe email,
 apply the exact cron or email action returned by the integration and do not
 invent a second scheduler, recipient, state store or duplicate-order check. A

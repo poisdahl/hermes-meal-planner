@@ -3013,7 +3013,7 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         client._review_checkout = mock.Mock(side_effect=HouseholdError("checkout changed"))
         client._invoke = mock.Mock()
-        with self.assertRaises(CheckoutPreconditionError):
+        with self.assertRaisesRegex(CheckoutPreconditionError, "no payment was dispatched; one fresh prepare is safe"):
             client.submit_checkout({"items": []}, {"page_digest": "old"})
         client._invoke.assert_not_called()
 
