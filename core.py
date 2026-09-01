@@ -223,7 +223,7 @@ def item_key(item: Mapping[str, Any]) -> str:
     product_id = str(item.get("product_id") or "").strip()
     is_meny_path = (
         len(product_id) <= 512
-        and re.fullmatch(r"/varer/(?!kampanjer/)[A-Za-z0-9._~%/-]+-\d{6,14}", product_id) is not None
+        and re.fullmatch(r"/varer/(?!kampanjer/)[A-Za-z0-9._~%/-]+-\d{4,14}", product_id) is not None
         and ".." not in product_id
         and "//" not in product_id
     )

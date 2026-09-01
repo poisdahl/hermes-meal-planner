@@ -330,6 +330,9 @@ class CoreTests(unittest.TestCase):
                     normalize_product_ref(invalid)
         favorites = put_item([], {"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1})
         self.assertEqual(favorites[0]["product_id"], MENY_PRODUCT)
+        short_suffix = "/varer/frukt-gront/gronnsaker/kal/brokkoli/brokkoli-4349"
+        saved = put_item([], {"product_id": short_suffix, "product_name": "Brokkoli", "quantity": 1})
+        self.assertEqual(saved[0]["product_id"], short_suffix)
 
     def test_meny_delivery_slot_identity_is_exact_and_canonical(self):
         slot = "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00"
