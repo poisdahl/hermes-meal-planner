@@ -838,9 +838,15 @@ class Application:
         order_id = str(request.get("order_id") or "")
         if action == "get":
             deadline = request.get("_deadline") if self.provider == "meny" else None
+            if self.provider == "meny":
+                order = self.oda.call("get_order", {"order_number": order_id}, deadline=deadline, allow_recovery=request.get("_allow_browser_recovery") is True)
+                return {
+                    "order": order,
+                    "tracking": {"order_id": order_id, "status": str(order.get("status") or "unknown")},
+                }
             return {
-                "order": self.oda.call("get_order", {"order_number": order_id}, deadline=deadline, allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("get_order", {"order_number": order_id}),
-                "tracking": self.oda.call("order_tracking", {"order_number": order_id}, deadline=deadline, allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("order_tracking", {"order_number": order_id}),
+                "order": self.oda.call("get_order", {"order_number": order_id}),
+                "tracking": self.oda.call("order_tracking", {"order_number": order_id}),
             }
         if action == "change_begin":
             if not order_id:

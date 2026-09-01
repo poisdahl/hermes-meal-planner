@@ -4550,7 +4550,7 @@ class FlowTests(unittest.TestCase):
             with mock.patch("service.time.monotonic", return_value=10.0):
                 app.handle({"operation": "orders", "action": "change_begin", "order_id": "99990001"})
             protected_calls = [call for call in provider.call.call_args_list if call.args[0] in {"get_order", "order_tracking"}]
-            self.assertEqual(len(protected_calls), 2)
+            self.assertEqual([call.args[0] for call in protected_calls], ["get_order"])
             self.assertTrue(all(call.kwargs.get("deadline") == 250.0 for call in protected_calls))
             self.assertEqual(provider.begin_order_change.call_args.kwargs["deadline"], 250.0)
 
@@ -4568,7 +4568,7 @@ class FlowTests(unittest.TestCase):
             with mock.patch("service.time.monotonic", return_value=10.0):
                 prepared = app.handle({"operation": "orders", "action": "cancel_prepare", "order_id": "99990001"})
             prepare_calls = provider.call.call_args_list[:]
-            self.assertEqual([call.args[0] for call in prepare_calls], ["get_order", "order_tracking"])
+            self.assertEqual([call.args[0] for call in prepare_calls], ["get_order"])
             self.assertTrue(all(call.kwargs.get("deadline") == 115.0 for call in prepare_calls))
             with mock.patch("service.time.monotonic", return_value=20.0):
                 result = app.handle({
@@ -4577,7 +4577,7 @@ class FlowTests(unittest.TestCase):
                 })
             self.assertTrue(result["cancelled"])
             confirm_calls = provider.call.call_args_list[len(prepare_calls):]
-            self.assertEqual([call.args[0] for call in confirm_calls], ["get_order", "order_tracking", "order_tracking"])
+            self.assertEqual([call.args[0] for call in confirm_calls], ["get_order", "order_tracking"])
             self.assertTrue(all(call.kwargs.get("deadline") == 125.0 for call in confirm_calls))
             self.assertEqual(provider.cancellation_review_deadlines, [115.0])
             self.assertEqual(provider.cancellation_submit_deadlines, [125.0])
@@ -4595,7 +4595,7 @@ class FlowTests(unittest.TestCase):
 
             def racing_call(tool, arguments, **kwargs):
                 result = original_call(tool, arguments, **kwargs)
-                if tool == "order_tracking":
+                if tool == "get_order":
                     with store.locked() as state:
                         state["order_change"] = {"provider": "meny", "order_id": "99990001", "status": "starting"}
                 return result
