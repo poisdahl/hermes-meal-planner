@@ -3406,8 +3406,11 @@ class MenyClientTests(unittest.TestCase):
         client._review_checkout = mock.Mock(return_value=review)
         client._eval = mock.Mock(return_value={"ready": True})
         client._click_checkout_submit = mock.Mock()
-        result = client.submit_checkout({"items": []}, review)
+        cart = {"items": [], "delivery": {"display": "torsdag 3. september Kl. 09:00-12:00"}}
+        result = client.submit_checkout(cart, review)
         self.assertTrue(result["awaiting_user_payment"])
+        self.assertIsNone(client._review_checkout.call_args.args[0]["delivery"])
+        self.assertIsNotNone(cart["delivery"])
         client._click_checkout_submit.assert_called_once()
         self.assertEqual(client._click_checkout_submit.call_args.args[0], review)
         self.assertTrue(callable(client._click_checkout_submit.call_args.args[1]))

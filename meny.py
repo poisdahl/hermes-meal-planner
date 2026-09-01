@@ -2337,7 +2337,9 @@ __DELIVERY_BINDING__
         final_dispatched = False
         try:
             with self._locked_operation(MENY_ORDER_TIMEOUT, deadline):
-                fresh = self._review_checkout(cart, order_change=order_change)
+                final_cart = dict(cart)
+                final_cart["delivery"] = None
+                fresh = self._review_checkout(final_cart, order_change=order_change)
                 if fresh != dict(review):
                     raise HouseholdError("MENY checkout changed after review")
                 ready = self._eval(r"""
