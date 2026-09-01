@@ -1461,6 +1461,26 @@ class Application:
             raise HouseholdError("checkout has not reached reconciliation")
         if pending.get("order_change"):
             return self._order_change_reconcile(pending, deadline)
+        payment_expiry = pending.get("payment_expires_at")
+        try:
+            payment_expires_at = datetime.fromisoformat(str(payment_expiry or ""))
+        except ValueError:
+            payment_expires_at = None
+        if (
+            self.provider == "meny"
+            and payment_expires_at is not None
+            and payment_expires_at.tzinfo is not None
+            and now() < payment_expires_at
+            and self.browser.checkout_payment_awaiting_user(deadline=deadline)
+        ):
+            return {
+                "confirmed": False,
+                "expired": False,
+                "order": None,
+                "tracking": None,
+                "retry_allowed": False,
+                "awaiting_user_payment": True,
+            }
         payment_not_dispatched = (
             self.provider == "meny"
             and pending.get("status") == "uncertain"
@@ -1499,16 +1519,18 @@ class Application:
         expired_unpaid = False
         candidate_matches = order is not None and meny_order_matches_checkout(order, pending["summary"])
         undispatched_retryable = payment_not_dispatched and confirmation_order_id is None and not candidates
-        payment_expiry = pending.get("payment_expires_at")
         expirable_payment = pending.get("status") == "awaiting_user_payment" or (
             pending.get("status") == "uncertain" and payment_expiry is not None
         )
         if self.provider == "meny" and expirable_payment and not confirmed and confirmation_order_id is None and len(candidates) <= 1 and not candidate_matches:
             expiry = payment_expiry or pending.get("expires_at")
-            try:
-                expires_at = datetime.fromisoformat(str(expiry or ""))
-            except ValueError:
-                expires_at = None
+            if expiry == payment_expiry:
+                expires_at = payment_expires_at
+            else:
+                try:
+                    expires_at = datetime.fromisoformat(str(expiry or ""))
+                except ValueError:
+                    expires_at = None
             expired_unpaid = expires_at is not None and expires_at.tzinfo is not None and now() >= expires_at
         with self.store.locked() as state:
             if canonical(state.get("pending_checkout")) != canonical(pending):

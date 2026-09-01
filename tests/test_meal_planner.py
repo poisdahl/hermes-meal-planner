@@ -182,6 +182,7 @@ class FakeMeny(FakeOda):
         self.cancellation_submit_deadlines = []
         self.checkout_review_recovery = []
         self.payment_not_dispatched = False
+        self.payment_waiting = False
 
     def probe(self, **_kwargs):
         return {"protocol_version": "browser-v1", "server": {"name": "MENY website"}, "tool_count": 11}
@@ -236,6 +237,9 @@ class FakeMeny(FakeOda):
 
     def checkout_confirmation_order_id(self, *, deadline=None):
         return self.confirmation_order_id
+
+    def checkout_payment_awaiting_user(self, *, deadline=None):
+        return self.payment_waiting
 
     def checkout_payment_not_dispatched(self, review, *, deadline=None):
         return self.payment_not_dispatched
@@ -3651,6 +3655,20 @@ class MenyClientTests(unittest.TestCase):
         self.assertIsNone(client.checkout_confirmation_order_id())
         self.assertIn("about:blank", client._eval.call_args.args[0])
 
+    def test_checkout_reconcile_keeps_the_vipps_waiting_page_alive(self):
+        client = self.client()
+        client._locked_operation = mock.MagicMock()
+        client._sleep = mock.Mock()
+        client._eval = mock.Mock(side_effect=[
+            {"waiting": True},
+            {"waiting": True},
+            {"waiting": False},
+        ])
+
+        self.assertFalse(client.checkout_payment_awaiting_user())
+        self.assertEqual(client._sleep.call_count, 2)
+        self.assertIn("We've sent a payment request to", client._eval.call_args.args[0])
+
     def test_checkout_submit_does_not_open_dispatch_fence_when_post_hover_gate_fails(self):
         client = self.client()
         review = {"summary": {"total": 1234.56, "delivery": {"display": "delivery"}}, "target_order_code": None}
@@ -4082,14 +4100,17 @@ class FlowTests(unittest.TestCase):
                 started + timedelta(minutes=11),
             )
 
+            provider.payment_waiting = True
             with mock.patch("service.now", return_value=started + timedelta(minutes=1)):
                 waiting = app.handle({"operation": "checkout", "action": "reconcile"})
 
             self.assertFalse(waiting["confirmed"])
             self.assertFalse(waiting["expired"])
             self.assertFalse(waiting["retry_allowed"])
-            self.assertEqual(store.read()["pending_checkout"]["status"], "uncertain")
+            self.assertTrue(waiting["awaiting_user_payment"])
+            self.assertEqual(store.read()["pending_checkout"]["status"], "awaiting_user_payment")
 
+            provider.payment_waiting = False
             with mock.patch("service.now", return_value=started + timedelta(minutes=12)):
                 reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
 

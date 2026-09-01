@@ -2043,6 +2043,27 @@ __DELIVERY_BINDING__
             order_id = result.get("order_id")
             return str(order_id) if order_id is not None else None
 
+    def checkout_payment_awaiting_user(self, *, deadline: float | None = None) -> bool:
+        """Keep an acknowledged Vipps page alive while mobile approval is pending."""
+
+        with self._locked_operation(MENY_READ_TIMEOUT, deadline):
+            for attempt in range(120):
+                result = self._eval(r"""
+(() => {
+  const text = (document.body.innerText || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const url = new URL(location.href);
+  const waiting = url.origin === 'https://api.vipps.no' &&
+    url.pathname === '/dwo-api-application/v1/deeplink/vippsgateway' &&
+    /We've sent a payment request to/i.test(text) && /Open Vipps/i.test(text);
+  return JSON.stringify({waiting});
+})()
+""")
+                if result != {"waiting": True}:
+                    return False
+                if attempt < 119:
+                    self._sleep(0.25)
+            return True
+
     def checkout_payment_not_dispatched(self, review: Mapping[str, Any], *, deadline: float | None = None) -> bool:
         """Prove that a fenced click never left the unchanged MENY checkout page."""
 
