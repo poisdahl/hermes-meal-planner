@@ -1989,6 +1989,29 @@ class MenyClientTests(unittest.TestCase):
                     client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
                 client._invoke.assert_not_called()
 
+    def test_order_context_verification_waits_for_the_cart_shell_to_settle(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock()
+        client._eval = mock.Mock(side_effect=[
+            {"ready": False, "open": False, "authenticated": True},
+            {"ready": True, "open": True, "authenticated": True},
+            {"ready": False, "authenticated": True},
+            {"ready": True, "authenticated": True, "active": False, "code": None},
+        ])
+
+        result = client._verify_order_change(None, None)
+
+        self.assertFalse(result["editing"])
+        self.assertEqual(client._eval.call_count, 4)
+        self.assertEqual(client._sleep.call_args_list, [
+            mock.call(0.25),
+            mock.call(0.25),
+            mock.call(0.25),
+        ])
+        client._invoke.assert_not_called()
+
     def test_cart_read_opens_the_visible_cart_and_returns_provider_shape(self):
         client = self.client()
         results = iter([
@@ -2669,6 +2692,30 @@ class MenyClientTests(unittest.TestCase):
         client._invoke.assert_not_called()
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.8), mock.call(0.25)])
 
+    def test_checkout_review_reports_the_exact_home_delivery_minimum(self):
+        client = self.client()
+        client._verify_order_change = mock.Mock()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._eval = mock.Mock(return_value={
+            "ready": True,
+            "authenticated": True,
+            "step": 1,
+            "next_enabled": False,
+            "minimum_message": "Du må handle for 286,10 kr til for å få varene levert på døren.",
+            "items": [{"product_id": MENY_PRODUCT, "identity": "Brokkoli 400g", "quantity": 1}],
+            "unavailable_items": [],
+            "active_order_change": False,
+        })
+        client._invoke = mock.Mock()
+        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 13.9}], "total": 72.9}
+
+        with self.assertRaisesRegex(HouseholdError, "286,10 kr"):
+            client._review_checkout(cart)
+
+        client._invoke.assert_not_called()
+        self.assertIn("minimumMessage", client._eval.call_args.args[0])
+
     def test_checkout_review_stops_before_next_for_inline_unavailable_items(self):
         client = self.client()
         client._verify_order_change = mock.Mock()
@@ -3053,6 +3100,16 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client.checkout_confirmation_order_id(), "7631908")
         script = client._eval.call_args.args[0]
         self.assertIn("(?:din )?bestilling(?:en)?", script)
+
+    def test_checkout_confirmation_treats_the_exact_vipps_gateway_as_unconfirmed(self):
+        client = self.client()
+        client._locked_operation = mock.MagicMock()
+        client._eval = mock.Mock(return_value={"authenticated": False, "vipps_gateway": True, "order_id": None})
+
+        self.assertIsNone(client.checkout_confirmation_order_id())
+        script = client._eval.call_args.args[0]
+        self.assertIn("https://api.vipps.no", script)
+        self.assertIn("/dwo-api-application/v1/deeplink/vippsgateway", script)
 
     def test_checkout_submit_does_not_open_dispatch_fence_when_post_hover_gate_fails(self):
         client = self.client()

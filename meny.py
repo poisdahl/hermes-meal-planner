@@ -1732,11 +1732,14 @@ __DELIVERY_BINDING__
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const main = [...document.querySelectorAll('main')].filter(visible);
   const url = new URL(location.href), orderId = url.pathname === '/kassen/bekreftelse' ? url.searchParams.get('orderid') : null;
+  const vippsGateway = url.origin === 'https://api.vipps.no' && url.pathname === '/dwo-api-application/v1/deeplink/vippsgateway';
   const confirmed = main.length === 1 && /Takk for (?:din )?bestilling(?:en)?|Bestillingen (?:er|ble) (?:mottatt|oppdatert)|Ordrebekreftelse/i.test(norm(main[0].innerText));
-  return JSON.stringify({authenticated:authenticated.length === 1, order_id:confirmed && /^\d{1,20}$/.test(orderId || '') ? orderId : null});
+  return JSON.stringify({authenticated:authenticated.length === 1, vipps_gateway:vippsGateway, order_id:confirmed && /^\d{1,20}$/.test(orderId || '') ? orderId : null});
 })()
 """)
             if result.get("authenticated") is not True:
+                if result.get("vipps_gateway") is True and result.get("order_id") is None:
+                    return None
                 raise HouseholdError("MENY login is required in the configured browser profile")
             order_id = result.get("order_id")
             return str(order_id) if order_id is not None else None
@@ -1755,7 +1758,7 @@ __DELIVERY_BINDING__
                 raise HouseholdError("MENY order change identity is invalid")
         self._open(STORE_URL)
         self._sleep(0.25)
-        state = self._eval(r"""
+        state_script = r"""
 (() => {
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
@@ -1768,7 +1771,14 @@ __DELIVERY_BINDING__
   open[0].setAttribute('data-hermes-meal-planner-action', 'verify-cart-open');
   return JSON.stringify({ready:true, open:false, authenticated:authenticated.length === 1});
 })()
-""")
+"""
+        state: dict[str, Any] = {}
+        for attempt in range(20):
+            state = self._eval(state_script)
+            if state.get("ready") is True:
+                break
+            if attempt < 19:
+                self._sleep(0.25)
         if state.get("authenticated") is not True:
             raise HouseholdError("MENY login is required in the configured browser profile")
         if state.get("ready") is not True:
@@ -1776,7 +1786,7 @@ __DELIVERY_BINDING__
         if state.get("open") is not True:
             self._invoke("click", '[data-hermes-meal-planner-action="verify-cart-open"]')
             self._sleep(0.4)
-        result = self._eval(r"""
+        result_script = r"""
 (() => {
   const expected = CODE;
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
@@ -1791,7 +1801,14 @@ __DELIVERY_BINDING__
   const ready = expected === null ? (!active && activeCodes.length === 0 && aborts.length === 0) : (active && activeCodes[0] === expected);
   return JSON.stringify({ready, authenticated:true, active, code:active ? activeCodes[0] : null});
 })()
-""".replace("CODE", json.dumps(code)))
+""".replace("CODE", json.dumps(code))
+        result: dict[str, Any] = {}
+        for attempt in range(20):
+            result = self._eval(result_script)
+            if result.get("ready") is True:
+                break
+            if attempt < 19:
+                self._sleep(0.25)
         if result.get("authenticated") is not True:
             raise HouseholdError("MENY login is required in the configured browser profile")
         if result.get("ready") is not True:
@@ -1960,9 +1977,10 @@ __DELIVERY_BINDING__
     if (!item || paths.length !== 1 || !name || !identity || !Number.isInteger(quantity) || quantity < 1) return JSON.stringify({ready:false, authenticated:true});
     items.push({product_id:paths[0], identity, quantity});
   }
+  const minimumMessage = text.match(/Du må handle for \d+(?:[ .]\d{3})*,\d{2}\s*kr til for å få varene levert på døren\.?/i)?.[0] || null;
   const ready = /Se over varene/.test(text) && targetReady && unavailableReady && buttons.length === 1 && controls.length > 0 && items.length === controls.length;
   if (ready && enabled) buttons[0].setAttribute('data-hermes-meal-planner-action', 'checkout-next');
-  return JSON.stringify({ready, authenticated:true, step:1, next_enabled:enabled, items, unavailable_items:unavailableItems, active_order_change:active});
+  return JSON.stringify({ready, authenticated:true, step:1, next_enabled:enabled, minimum_message:minimumMessage, items, unavailable_items:unavailableItems, active_order_change:active});
 })()
 """.replace("TARGET", json.dumps(target_code or None))
         step: dict[str, Any] = {}
@@ -2015,6 +2033,13 @@ __DELIVERY_BINDING__
         if sorted(observed_items) != expected_items:
             raise HouseholdError("MENY checkout items changed after the cart was reviewed")
         if step.get("next_enabled") is not True:
+            minimum_message = " ".join(str(step.get("minimum_message") or "").split())
+            if re.fullmatch(
+                r"Du må handle for \d+(?:[ .]\d{3})*,\d{2}\s*kr til for å få varene levert på døren\.?",
+                minimum_message,
+                flags=re.IGNORECASE,
+            ):
+                raise HouseholdError(f"MENY checkout cannot continue: {minimum_message}")
             raise HouseholdError("MENY checkout cannot continue; check the home-delivery minimum and cart messages")
         self._click_checkout_control("checkout-next", expected_items=expected_items, target_code=target_code or None)
         self._sleep(0.6)
