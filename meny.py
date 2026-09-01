@@ -288,6 +288,21 @@ def normalize_cart_snapshot(value: Any) -> dict[str, Any]:
     expected_totals = 0 if empty else 1
     if isinstance(value.get("total_count"), bool) or value.get("total_count") != expected_totals:
         raise HouseholdError("MENY cart total is ambiguous")
+    expected_subtotals = 0 if empty else 1
+    subtotal_count = value.get("subtotal_count")
+    subtotal = value.get("subtotal")
+    if isinstance(subtotal_count, bool) or subtotal_count != expected_subtotals:
+        raise HouseholdError("MENY cart subtotal is ambiguous")
+    if empty:
+        if subtotal is not None:
+            raise HouseholdError("MENY cart subtotal is invalid")
+    elif (
+        isinstance(subtotal, bool)
+        or not isinstance(subtotal, (int, float))
+        or not math.isfinite(float(subtotal))
+        or float(subtotal) <= 0
+    ):
+        raise HouseholdError("MENY cart subtotal is invalid")
 
     normalized: list[dict[str, Any]] = []
     count = 0
@@ -325,6 +340,7 @@ def normalize_cart_snapshot(value: Any) -> dict[str, Any]:
         or value.get("count") != count
         or (empty and float(total) != 0)
         or (not empty and float(total) <= 0)
+        or (not empty and float(total) < float(subtotal))
     ):
         raise HouseholdError("MENY cart total is invalid")
     delivery_count = value.get("delivery_count")
@@ -1344,9 +1360,17 @@ __DELIVERY_BINDING__
   const totals = [...cart.querySelectorAll('strong')].filter(visible).map(x => norm(x.innerText)).filter(x => /^Totalsum\s+\d+(?:[ .]\d{3})*,\d{2}\s*kr$/i.test(x));
   const totalText = totals.length === 1 ? totals[0] : null;
   const match = totalText?.match(/(\d+(?:[ .]\d{3})*),([0-9]{2})/);
+  const priceSummaries = [...cart.querySelectorAll('.ws-price-summary.ws-cart__price-summary')].filter(visible);
+  const subtotalRows = priceSummaries.length === 1 ? [...priceSummaries[0].querySelectorAll('.ws-summary-line__main')].filter(visible).filter(row => {
+    const titles = [...row.querySelectorAll('.ws-summary-line__title')].filter(visible).filter(x => norm(x.innerText) === 'Sum');
+    return titles.length === 1;
+  }) : [];
+  const subtotalValues = subtotalRows.length === 1 ? [...norm(subtotalRows[0].innerText).matchAll(/(?:^|\s)(\d+(?:[ .]\d{3})*),([0-9]{2})(?:\s|$)/g)].map(value => Number(`${value[1].replace(/[ .]/g, '')}.${value[2]}`)) : [];
+  const subtotal = subtotalValues.length === 1 ? subtotalValues[0] : null;
   const empty = itemRoots.length === 0 && /(?:handlevognen(?: din)? er tom|ingen varer i handlevognen)/i.test(norm(cart.innerText));
   const total = match ? Number(`${match[1].replace(/[ .]/g, '')}.${match[2]}`) : empty && totals.length === 0 ? 0 : null;
   const totalReady = empty ? totals.length === 0 && total === 0 : totals.length === 1 && total !== null && total > 0;
+  const subtotalReady = empty ? subtotalRows.length === 0 && subtotal === null : priceSummaries.length === 1 && subtotalRows.length === 1 && subtotal !== null && subtotal > 0 && total !== null && total >= subtotal;
   const deliveryPrefix = 'Du har valgt at varene leveres på døren';
   const deliveryHint = norm(cart.innerText).toLocaleLowerCase('nb-NO').includes(deliveryPrefix.toLocaleLowerCase('nb-NO'));
   const deliveryParagraphs = [...cart.querySelectorAll('p')].filter(visible).filter(x => norm(x.innerText).toLocaleLowerCase('nb-NO').startsWith(deliveryPrefix.toLocaleLowerCase('nb-NO')));
@@ -1361,21 +1385,30 @@ __DELIVERY_BINDING__
       deliveryReady = true;
     }
   }
-  const ready = authenticated.length === 1 && itemRoots.length === controls.length && items.length === itemRoots.length && (items.length > 0 || empty) && totalReady && deliveryReady;
-  return JSON.stringify({ready, authenticated:authenticated.length === 1, root_count:1, item_root_count:itemRoots.length, control_count:controls.length, empty, total_count:totals.length, delivery_count:deliveryParagraphs.length, delivery, items, count:items.reduce((sum,item) => sum + item.quantity, 0), total});
+  const ready = authenticated.length === 1 && itemRoots.length === controls.length && items.length === itemRoots.length && (items.length > 0 || empty) && totalReady && subtotalReady && deliveryReady;
+  return JSON.stringify({ready, authenticated:authenticated.length === 1, root_count:1, item_root_count:itemRoots.length, control_count:controls.length, empty, total_count:totals.length, subtotal_count:subtotalRows.length, subtotal, delivery_count:deliveryParagraphs.length, delivery, items, count:items.reduce((sum,item) => sum + item.quantity, 0), total});
 })()
 """)
             if result.get("ready") is True:
                 break
-            if result.get("authenticated") is True and result.get("item_root_count", 0) > 0 and result.get("total_count") == 1 and result.get("total") == 0:
+            if (
+                result.get("authenticated") is True
+                and result.get("item_root_count", 0) > 0
+                and (
+                    (result.get("total_count") == 1 and result.get("total") == 0)
+                    or (result.get("subtotal_count") == 1 and result.get("subtotal") == 0)
+                )
+            ):
                 break
             self._sleep(0.25)
         if (
             allow_reload
             and result.get("authenticated") is True
             and result.get("item_root_count", 0) > 0
-            and result.get("total_count") == 1
-            and result.get("total") == 0
+            and (
+                (result.get("total_count") == 1 and result.get("total") == 0)
+                or (result.get("subtotal_count") == 1 and result.get("subtotal") == 0)
+            )
         ):
             self._invoke("reload")
             self._sleep(0.5)

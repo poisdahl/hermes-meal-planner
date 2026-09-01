@@ -2070,7 +2070,7 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         results = iter([
             {"open": False, "ready": True, "authenticated": True, "root_count": 0, "open_count": 1},
-            {"ready": True, "authenticated": True, "root_count": 1, "item_root_count": 1, "control_count": 1, "empty": False, "total_count": 1, "delivery_count": 1, "delivery": {"display": "torsdag 3. sep. kl. 10:00-12:00"}, "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}], "count": 1, "total": 19.9},
+            {"ready": True, "authenticated": True, "root_count": 1, "item_root_count": 1, "control_count": 1, "empty": False, "total_count": 1, "subtotal_count": 1, "subtotal": 19.9, "delivery_count": 1, "delivery": {"display": "torsdag 3. sep. kl. 10:00-12:00"}, "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}], "count": 1, "total": 19.9},
         ])
         scripts = []
         client._eval = lambda script: scripts.append(script) or next(results)
@@ -2160,6 +2160,8 @@ class MenyClientTests(unittest.TestCase):
             "control_count": 1,
             "empty": False,
             "total_count": 1,
+            "subtotal_count": 1,
+            "subtotal": 19.9,
             "delivery_count": 0,
             "delivery": None,
             "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}],
@@ -2188,6 +2190,8 @@ class MenyClientTests(unittest.TestCase):
             "control_count": 0,
             "empty": True,
             "total_count": 0,
+            "subtotal_count": 0,
+            "subtotal": None,
             "delivery_count": 0,
             "delivery": None,
             "items": [],
@@ -2213,6 +2217,8 @@ class MenyClientTests(unittest.TestCase):
             "control_count": 1,
             "empty": False,
             "total_count": 1,
+            "subtotal_count": 1,
+            "subtotal": 19.9,
             "delivery_count": 0,
             "delivery": None,
             "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}],
@@ -2224,6 +2230,9 @@ class MenyClientTests(unittest.TestCase):
             {**valid, "root_count": 2},
             {**valid, "control_count": 0},
             {**valid, "total_count": 2},
+            {**valid, "subtotal_count": 2},
+            {**valid, "subtotal": 0},
+            {**valid, "subtotal": 20},
             {**valid, "items": [], "item_root_count": 0, "control_count": 0, "count": 0, "total": 0, "empty": False},
             {**valid, "items": [], "item_root_count": 0, "control_count": 0, "count": 0, "total": 500, "empty": True},
             {**valid, "empty": True},
@@ -2246,6 +2255,8 @@ class MenyClientTests(unittest.TestCase):
             "control_count": 0,
             "empty": True,
             "total_count": 0,
+            "subtotal_count": 0,
+            "subtotal": None,
             "delivery_count": 0,
             "delivery": None,
             "items": [],
@@ -2316,13 +2327,15 @@ class MenyClientTests(unittest.TestCase):
             "control_count": 1,
             "empty": False,
             "total_count": 1,
+            "subtotal_count": 1,
+            "subtotal": 0,
             "delivery_count": 0,
             "delivery": None,
             "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}],
             "count": 1,
             "total": 0,
         }
-        valid = {**zero, "ready": True, "total": 19.9}
+        valid = {**zero, "ready": True, "subtotal": 19.9, "total": 19.9}
         client._eval = mock.Mock(side_effect=[
             {"open": True, "ready": True, "authenticated": True, "root_count": 1},
             zero,
