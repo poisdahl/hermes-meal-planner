@@ -3249,6 +3249,26 @@ class FlowTests(unittest.TestCase):
             self.assertIsNone(store.read()["pending_checkout"])
             provider.call.assert_not_called()
 
+    def test_expired_unsubmitted_cancellation_does_not_disable_safe_meny_checkout_recovery(self):
+        started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            provider.call = mock.Mock(wraps=provider.call)
+            app = Application(store, provider, self.browser)
+            with store.locked() as state:
+                state["pending_cancellation"] = {
+                    "status": "awaiting_confirmation",
+                    "expires_at": (started - timedelta(seconds=1)).isoformat(),
+                }
+
+            with mock.patch("service.now", return_value=started):
+                app.handle({"operation": "checkout", "action": "prepare"})
+
+            self.assertIsNone(store.read()["pending_cancellation"])
+            self.assertTrue(all(call.kwargs.get("allow_recovery") is True for call in provider.call.call_args_list))
+            self.assertEqual(provider.checkout_review_recovery, [True])
+
     def test_expired_unapproved_vipps_releases_the_checkout_for_a_fresh_prepare(self):
         started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as temp:

@@ -1155,6 +1155,8 @@ class Application:
             if baseline and baseline.get("status") in UNRESOLVED_CHECKOUT_STATUSES:
                 raise HouseholdError("reconcile the pending checkout before preparing another")
             order_change = deepcopy(state.get("order_change"))
+            if expired_awaiting_confirmation(state.get("pending_cancellation")):
+                state["pending_cancellation"] = None
             pending_cancellation = deepcopy(state.get("pending_cancellation"))
         allow_recovery = self.provider == "meny" and not order_change and not pending_cancellation
         if order_change:
