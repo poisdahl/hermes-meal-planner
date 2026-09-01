@@ -1686,7 +1686,7 @@ __DELIVERY_BINDING__
             slots = [slot for slot in slots if slot.get("date") == delivery_date]
         return {"provider": "meny", "slots": slots}
 
-    def _select_delivery_slot(self, value: Any) -> dict[str, Any]:
+    def _select_delivery_slot(self, value: Any, *, _allow_refresh: bool = True) -> dict[str, Any]:
         slot_id, expected_suffix = normalize_delivery_slot_ref(value)
         self._open_delivery_picker()
         marked: dict[str, Any] = {}
@@ -1711,10 +1711,14 @@ __DELIVERY_BINDING__
       const parts = norm(x.getAttribute('aria-label') || x.innerText).match(/^Behold levering (?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(.+)$/i);
       return parts && parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix;
     });
-    if (selected.length !== 1 || keep.length > 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length});
-    const action = keep.length === 1 ? 'delivery-renew' : 'delivery-dismiss';
-    (keep[0] || dismiss[0]).setAttribute('data-hermes-meal-planner-action', action);
-    return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, renew_available:keep.length === 1});
+    const alternatives = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => x !== buttons[0] && slotPattern.test(norm(x.getAttribute('aria-label') || x.innerText)));
+    if (selected.length !== 1 || keep.length > 1 || (keep.length === 1 && alternatives.length === 0)) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length});
+    if (keep.length === 1) {
+      alternatives[0].setAttribute('data-hermes-meal-planner-action', 'delivery-refresh-slot');
+      return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:true, refresh_slot:norm(alternatives[0].getAttribute('aria-label') || alternatives[0].innerText)});
+    }
+    dismiss[0].setAttribute('data-hermes-meal-planner-action', 'delivery-dismiss');
+    return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:false});
   }
   buttons[0].setAttribute('data-hermes-meal-planner-action', 'delivery-slot');
   return JSON.stringify({ready:true, identity, authenticated:true, already_selected:false});
@@ -1729,16 +1733,25 @@ __DELIVERY_BINDING__
             self._sleep(0.25)
         else:
             raise HouseholdError("MENY delivery slot changed or is unavailable")
-        if marked.get("already_selected") is True:
-            action = "delivery-renew" if marked.get("renew_available") is True else "delivery-dismiss"
-            self._invoke("click", f'[data-hermes-meal-planner-action="{action}"]')
+        selected_slot_id = slot_id
+        selected_suffix = expected_suffix
+        refreshing = False
+        if marked.get("already_selected") is True and marked.get("refresh_available") is not True:
+            self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
             self._wait_delivery_picker_closed()
-            if marked.get("renew_available") is not True:
-                return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
+            return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
+        if marked.get("already_selected") is True:
+            if not _allow_refresh:
+                raise HouseholdError("MENY delivery reservation could not be refreshed")
+            selected_slot_id, selected_suffix = normalize_delivery_slot_ref(marked.get("refresh_slot"))
+            if selected_slot_id == slot_id:
+                raise HouseholdError("MENY delivery refresh slot is invalid")
+            refreshing = True
+            self._invoke("click", '[data-hermes-meal-planner-action="delivery-refresh-slot"]')
         else:
             self._invoke("click", '[data-hermes-meal-planner-action="delivery-slot"]')
-            for _ in range(20):
-                confirmation = self._eval(r"""
+        for _ in range(20):
+            confirmation = self._eval(r"""
 (() => {
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const wanted = WANTED;
@@ -1766,18 +1779,25 @@ __DELIVERY_BINDING__
   (confirm[0] || keep[0]).setAttribute('data-hermes-meal-planner-action', 'delivery-confirm');
   return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1, keeping_existing:keep.length === 1});
 })()
-""".replace("WANTED", json.dumps(slot_id, ensure_ascii=False)).replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
-                if confirmation.get("identity") is not True:
-                    raise HouseholdError("MENY delivery route changed")
-                if confirmation.get("authenticated") is not True:
-                    raise HouseholdError("MENY login is required in the configured browser profile")
-                if confirmation.get("ready") is True:
-                    break
-                self._sleep(0.25)
-            else:
-                raise HouseholdError("MENY delivery confirmation changed")
-            self._invoke("click", '[data-hermes-meal-planner-action="delivery-confirm"]')
-            self._wait_delivery_picker_closed()
+""".replace("WANTED", json.dumps(selected_slot_id, ensure_ascii=False)).replace("EXPECTED_SUFFIX", json.dumps(selected_suffix, ensure_ascii=False)))
+            if confirmation.get("identity") is not True:
+                raise HouseholdError("MENY delivery route changed")
+            if confirmation.get("authenticated") is not True:
+                raise HouseholdError("MENY login is required in the configured browser profile")
+            if confirmation.get("ready") is True:
+                break
+            self._sleep(0.25)
+        else:
+            raise HouseholdError("MENY delivery confirmation changed")
+        self._invoke("click", '[data-hermes-meal-planner-action="delivery-confirm"]')
+        self._wait_delivery_picker_closed()
+        if refreshing:
+            try:
+                return self._select_delivery_slot(slot_id, _allow_refresh=False)
+            except HouseholdError as exc:
+                raise HouseholdError(
+                    "MENY delivery refresh stopped on a temporary slot; select the requested slot again"
+                ) from exc
         self._open_delivery_picker()
         selected: dict[str, Any] = {}
         for _ in range(20):

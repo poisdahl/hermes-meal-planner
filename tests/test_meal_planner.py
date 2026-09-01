@@ -2002,11 +2002,21 @@ class MenyClientTests(unittest.TestCase):
             mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
         ])
 
-    def test_already_selected_delivery_renews_an_expired_reservation_and_verifies_it(self):
+    def test_already_selected_delivery_refreshes_through_a_verified_temporary_slot(self):
         client = self.client()
         client._open_delivery_picker = mock.Mock()
         client._eval = mock.Mock(side_effect=[
-            {"ready": True, "identity": True, "authenticated": True, "already_selected": True, "renew_available": True},
+            {
+                "ready": True,
+                "identity": True,
+                "authenticated": True,
+                "already_selected": True,
+                "refresh_available": True,
+                "refresh_slot": "fra 0 kr fra 0 kroner, 3. september klokka 08:00 til 10:00",
+            },
+            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
+            {"ready": True, "identity": True, "authenticated": True, "already_selected": False},
+            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
             {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
         ])
         client._invoke = mock.Mock(return_value={})
@@ -2015,12 +2025,15 @@ class MenyClientTests(unittest.TestCase):
         result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
 
         self.assertEqual(result["selected"]["display"], "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
-        self.assertEqual(client._open_delivery_picker.call_count, 2)
+        self.assertEqual(client._open_delivery_picker.call_count, 3)
         self.assertEqual(client._invoke.call_args_list, [
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-renew"]'),
+            mock.call("click", '[data-hermes-meal-planner-action="delivery-refresh-slot"]'),
+            mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
+            mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
+            mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
         ])
-        self.assertEqual(client._wait_delivery_picker_closed.call_count, 2)
+        self.assertEqual(client._wait_delivery_picker_closed.call_count, 3)
 
     def test_already_selected_delivery_waits_until_the_dialog_is_closed(self):
         client = self.client()
