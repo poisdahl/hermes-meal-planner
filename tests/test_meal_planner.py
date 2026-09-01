@@ -1812,6 +1812,7 @@ class MenyClientTests(unittest.TestCase):
             },
         ])
         client._invoke = mock.Mock(return_value={})
+        client._wait_delivery_picker_closed = mock.Mock()
 
         result = client._delivery_slots("2026-09-02")
 
@@ -1821,6 +1822,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertNotIn("['Avbryt','Lukk']", client._eval.call_args.args[0])
         client._sleep.assert_called_once_with(0.25)
         client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        client._wait_delivery_picker_closed.assert_called_once_with()
 
     def test_delivery_selection_binds_both_native_dialog_steps(self):
         client = self.client()
@@ -1833,6 +1835,7 @@ class MenyClientTests(unittest.TestCase):
             {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
             {"ready": True, "identity": True, "authenticated": True, "dialog_count": 0},
             {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
+            {"ready": True, "identity": True, "authenticated": True, "dialog_count": 0},
         ])
         client._eval = lambda script: scripts.append(script) or next(results)
         client._invoke = mock.Mock(return_value={})
@@ -1854,6 +1857,24 @@ class MenyClientTests(unittest.TestCase):
             mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
         ])
+
+    def test_already_selected_delivery_waits_until_the_dialog_is_closed(self):
+        client = self.client()
+        client._open_delivery_picker = mock.Mock()
+        client._eval = mock.Mock(return_value={
+            "ready": True,
+            "identity": True,
+            "authenticated": True,
+            "already_selected": True,
+        })
+        client._invoke = mock.Mock(return_value={})
+        client._wait_delivery_picker_closed = mock.Mock()
+
+        result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+
+        self.assertEqual(result["selected"]["display"], "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        client._wait_delivery_picker_closed.assert_called_once_with()
 
     def test_delivery_selection_cannot_reuse_a_tentative_open_dialog(self):
         client = self.client()

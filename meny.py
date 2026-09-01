@@ -1324,6 +1324,7 @@ __DELIVERY_BINDING__
         else:
             raise HouseholdError("MENY delivery slots are unavailable")
         self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        self._wait_delivery_picker_closed()
         slots = result["slots"]
         if delivery_date:
             slots = [slot for slot in slots if slot.get("date") == delivery_date]
@@ -1369,6 +1370,7 @@ __DELIVERY_BINDING__
             raise HouseholdError("MENY delivery slot changed or is unavailable")
         if marked.get("already_selected") is True:
             self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+            self._wait_delivery_picker_closed()
             return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
         self._invoke("click", '[data-hermes-meal-planner-action="delivery-slot"]')
         for _ in range(20):
@@ -1439,6 +1441,7 @@ __DELIVERY_BINDING__
         else:
             raise HouseholdError("MENY selected delivery could not be verified")
         self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        self._wait_delivery_picker_closed()
         return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
 
     def _get_orders(self, limit: int) -> dict[str, Any]:
