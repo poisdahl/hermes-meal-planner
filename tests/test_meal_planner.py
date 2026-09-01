@@ -1922,6 +1922,38 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("deliveryPrefix = 'Du har valgt at varene leveres på døren'", scripts[-1])
         self.assertNotIn("ws-cart-notification", scripts[-1])
 
+    def test_order_details_wait_for_current_delivered_shape_and_expand_items(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        waiting = {"ready": False, "expand": False, "authenticated": True}
+        expandable = {"ready": False, "expand": True, "authenticated": True}
+        ready = {
+            "ready": True,
+            "expand": False,
+            "authenticated": True,
+            "order_number": "99990001",
+            "code": "TEST-CODE-1",
+            "status": "delivered",
+            "total": 123.45,
+            "delivery": "31. august 2026",
+            "item_count": 1,
+            "products": [{"identity": "Testprodukt", "name": "Testprodukt", "quantity": 1}],
+        }
+        scripts = []
+        client._eval = mock.Mock(side_effect=lambda script: scripts.append(script) or [waiting, expandable, ready][len(scripts) - 1])
+        client._invoke = mock.Mock(return_value={})
+
+        order = client._get_order("99990001")
+
+        self.assertEqual(order["status"], "delivered")
+        self.assertEqual(order["grossAmount"], 123.45)
+        self.assertEqual(order["deliverySlotDisplay"], "31. august 2026")
+        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="order-items"]')
+        self.assertEqual(client._sleep.call_args_list, [mock.call(1.5), mock.call(0.25), mock.call(0.25)])
+        self.assertIn("valueAfter('Betalt beløp kort')", scripts[-1])
+        self.assertIn("deliveredDatePattern", scripts[-1])
+
     def test_cart_read_polls_a_transient_missing_cart_control(self):
         client = self.client()
         valid = {

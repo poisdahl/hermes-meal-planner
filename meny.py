@@ -1364,10 +1364,12 @@ __DELIVERY_BINDING__
   const valueAfter = label => { const index=position(label); return index >= 0 ? lines[index+1] || null : null; };
   const actual = valueAfter('Ordrenummer');
   const heading = [...root.querySelectorAll('h1')].filter(visible).map(x => norm(x.innerText)).filter(x => /^Bestilling\s+\S+/.test(x));
-  const totalText = valueAfter('Reservert beløp (kort)') || valueAfter('Reservert beløp') || valueAfter('Totalsum');
+  const totalText = valueAfter('Betalt beløp kort') || valueAfter('Reservert beløp (kort)') || valueAfter('Reservert beløp') || valueAfter('Totalsum');
   const money = totalText?.match(/(\d+(?:[ .]\d{3})*),([0-9]{2})/);
   const total = money ? Number(`${money[1].replace(/[ .]/g,'')}.${money[2]}`) : null;
-  const delivery = valueAfter('Varene leveres');
+  const deliveredDatePattern = /^(?:0?[1-9]|[12]\d|3[01])\.(?:\s+(?:jan(?:uar)?|feb(?:ruar)?|mar(?:s)?|apr(?:il)?|mai|jun(?:i)?|jul(?:i)?|aug(?:ust)?|sep(?:tember)?|okt(?:ober)?|nov(?:ember)?|des(?:ember)?)\.?\s+\d{4}|\d{2}\.\d{4})$/i;
+  const deliveredDates = lines.flatMap((line, index) => /\blevert$/i.test(line) && deliveredDatePattern.test(lines[index + 1] || '') ? [lines[index + 1]] : []);
+  const delivery = valueAfter('Varene leveres') || (deliveredDates.length === 1 ? deliveredDates[0] : null);
   const code = valueAfter('Bestillingskode (for henting/levering)') || heading[0]?.replace(/^Bestilling\s+/, '') || null;
   const text = norm(root.innerText);
   const status = /bestillingen er kansellert|kansellert bestilling/i.test(text) ? 'cancelled' : /bestillingen kan oppdateres|bekreftet/i.test(text) ? 'confirmed' : 'unknown';
@@ -1397,14 +1399,19 @@ __DELIVERY_BINDING__
   return JSON.stringify({ready:baseReady && rowsReady, expand:baseReady && expand, authenticated:true, order_number:actual, code, status, total, delivery, item_count:itemCount, products});
 })()
 """.replace("EXPECTED", json.dumps(order_id))
-        result = self._eval(script)
-        if result.get("expand") is True:
-            self._invoke("click", '[data-hermes-meal-planner-action="order-items"]')
-            self._sleep(0.4)
+        result: dict[str, Any] = {}
+        expanded = False
+        for _ in range(20):
             result = self._eval(script)
-        if result.get("authenticated") is not True:
-            raise HouseholdError("MENY login is required in the configured browser profile")
-        if result.get("ready") is not True:
+            if result.get("authenticated") is not True:
+                raise HouseholdError("MENY login is required in the configured browser profile")
+            if result.get("ready") is True:
+                break
+            if result.get("expand") is True and not expanded:
+                self._invoke("click", '[data-hermes-meal-planner-action="order-items"]')
+                expanded = True
+            self._sleep(0.25)
+        else:
             raise HouseholdError("MENY order details changed or are unavailable")
         return {
             "provider": "meny",
