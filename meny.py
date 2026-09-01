@@ -2242,19 +2242,17 @@ __DELIVERY_BINDING__
 })()
 """.replace("TARGET", json.dumps(target_code or None))
         step: dict[str, Any] = {}
-        for attempt in range(20):
+        for attempt in range(120):
             step = self._eval(step_script)
             unavailable_items = step.get("unavailable_items")
             if (
-                step.get("authenticated") is not True
-                or (
-                    step.get("ready") is True
-                    and isinstance(unavailable_items, list)
-                    and (unavailable_items or step.get("next_enabled") is True)
-                )
+                step.get("authenticated") is True
+                and step.get("ready") is True
+                and isinstance(unavailable_items, list)
+                and (unavailable_items or step.get("next_enabled") is True)
             ):
                 break
-            if attempt < 19:
+            if attempt < 119:
                 self._sleep(0.25)
         if step.get("authenticated") is not True:
             raise HouseholdError("MENY login is required in the configured browser profile")

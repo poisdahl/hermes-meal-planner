@@ -2900,6 +2900,35 @@ class MenyClientTests(unittest.TestCase):
         client._invoke.assert_not_called()
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.8), mock.call(0.25)])
 
+    def test_checkout_review_waits_for_slow_authenticated_shell_to_hydrate(self):
+        client = self.client()
+        client._verify_order_change = mock.Mock()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        settling = {
+            "ready": False,
+            "authenticated": False,
+            "items": [],
+            "unavailable_items": [],
+        }
+        ready = {
+            "ready": True,
+            "authenticated": True,
+            "step": 1,
+            "next_enabled": True,
+            "items": [{"product_id": "/varer/frukt-gront/gronnsaker/kal/blomkal/blomkal-1234", "identity": "Blomkål 400g", "quantity": 1}],
+            "unavailable_items": [],
+            "active_order_change": False,
+        }
+        client._eval = mock.Mock(side_effect=[*([settling] * 32), ready])
+        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}], "total": 19.9, "delivery": {"display": "torsdag 3. sep. kl. 07:00-08:00"}}
+
+        with self.assertRaisesRegex(HouseholdError, "items changed"):
+            client._review_checkout(cart)
+
+        self.assertEqual(client._eval.call_count, 33)
+        self.assertEqual(client._sleep.call_args_list, [mock.call(0.8), *([mock.call(0.25)] * 32)])
+
     def test_checkout_review_reports_the_exact_home_delivery_minimum(self):
         client = self.client()
         client._verify_order_change = mock.Mock()
