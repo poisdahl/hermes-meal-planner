@@ -262,6 +262,8 @@ class CoreTests(unittest.TestCase):
             "mcp.server.mcpserver": mcp_server_module,
         }):
             spec.loader.exec_module(module)
+        self.assertEqual(module.rpc_timeout("cart", {"action": "change"}), 300)
+        self.assertEqual(module.rpc_timeout("cart", {"action": "get"}), 120)
         module.rpc = mock.Mock(return_value={})
         module.meal_planner_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
         module.rpc.assert_called_with(
@@ -1685,7 +1687,7 @@ class MenyClientTests(unittest.TestCase):
         client._require_login = mock.Mock()
         client._change_one = mock.Mock()
         client._read_cart = mock.Mock()
-        with mock.patch("meny.time.monotonic", side_effect=[0, 0, 0, 95]):
+        with mock.patch("meny.time.monotonic", side_effect=[0, 0, 0, 235]):
             with self.assertRaisesRegex(HouseholdError, "changed partially.*do not retry"):
                 client.call("manipulate_cart", {"operations": [{"productId": MENY_PRODUCT, "quantity": 2}]})
         client._change_one.assert_called_once_with(MENY_PRODUCT, 1, order_change_code=None)
@@ -3272,7 +3274,7 @@ class FlowTests(unittest.TestCase):
             provider = FakeOda()
             app = Application(store, provider, self.browser)
             provider.calls.clear()
-            with mock.patch("service.time.monotonic", side_effect=[0, 101]):
+            with mock.patch("service.time.monotonic", side_effect=[0, 241]):
                 with self.assertRaisesRegex(HouseholdError, "deadline reached"):
                     app.handle({"operation": "cart", "action": "change", "operations": [{"product_id": MENY_PRODUCT, "quantity": 1}]})
             self.assertEqual(provider.calls, [])
