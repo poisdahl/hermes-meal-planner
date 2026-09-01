@@ -39,7 +39,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, _DeliveryReservationError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, _DeliveryReservationError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_card_status, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -2310,6 +2310,40 @@ class MenyClientTests(unittest.TestCase):
         ])
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.25), mock.call(0.5)])
         self.assertIn("closest('tr,li,article,section')", client._eval.call_args_list[-1].args[0])
+
+    def test_order_card_status_uses_the_explicit_marker_not_delivery_wording(self):
+        self.assertEqual(meny_order_card_status("KAN ENDRES"), "confirmed")
+        self.assertEqual(meny_order_card_status("LEVERT"), "delivered")
+        self.assertEqual(meny_order_card_status("KANSELLERT BESTILLING"), "cancelled")
+        self.assertEqual(meny_order_card_status("Levert på døren"), "unknown")
+
+    def test_order_list_maps_and_removes_the_private_dom_status_marker(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(side_effect=[
+            {},
+            {"requests": [{
+                "method": "GET",
+                "status": 200,
+                "url": "https://platform-rest-prod.ngdata.no/api/order/search/store/user",
+            }]},
+        ])
+        client._eval = mock.Mock(return_value={
+            "ready": True,
+            "authenticated": True,
+            "orders": [{
+                "order_number": "99990001",
+                "id": "99990001",
+                "status_marker": "KAN ENDRES",
+                "summary": "TEST KAN ENDRES Levert på døren Leveres torsdag",
+            }],
+        })
+
+        result = client._get_orders(10)
+
+        self.assertEqual(result["orders"][0]["status"], "confirmed")
+        self.assertNotIn("status_marker", result["orders"][0])
 
     def test_order_list_waits_through_a_transient_logged_out_render(self):
         client = self.client()

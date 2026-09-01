@@ -274,6 +274,19 @@ def meny_order_search_completed(value: Any) -> bool:
     return False
 
 
+def meny_order_card_status(value: Any) -> str:
+    """Map the order card's explicit status line without reading delivery copy as status."""
+
+    marker = " ".join(str(value or "").split()).casefold()
+    if marker in {"kansellert", "kansellert bestilling"}:
+        return "cancelled"
+    if marker == "levert":
+        return "delivered"
+    if marker in {"kan endres", "bekreftet", "mottatt"}:
+        return "confirmed"
+    return "unknown"
+
+
 def meny_order_detail_request_id(value: Any, order_id: str) -> str | None:
     """Return the completed provider request for one exact MENY order."""
 
@@ -1946,9 +1959,11 @@ __DELIVERY_BINDING__
     if (!match || seen.has(match[1])) continue;
     seen.add(match[1]);
     const root = anchor.closest('tr,li,article,section') || anchor;
+    const lines = (root.innerText || '').split(/\n+/).map(norm).filter(Boolean);
     const summary = norm(root.innerText);
-    const status = /kansellert/i.test(summary) ? 'cancelled' : /levert/i.test(summary) ? 'delivered' : /bekreftet|mottatt/i.test(summary) ? 'confirmed' : 'unknown';
-    orders.push({order_number:match[1], id:match[1], status, summary});
+    const statusMarkers = lines.filter(line => /^(?:KANSELLERT(?: BESTILLING)?|LEVERT|KAN ENDRES|BEKREFTET|MOTTATT)$/i.test(line));
+    const status_marker = statusMarkers.length === 1 ? statusMarkers[0] : null;
+    orders.push({order_number:match[1], id:match[1], status_marker, summary});
   }
   return JSON.stringify({ready:authenticated.length === 1 && Boolean(document.querySelector('main')), authenticated:authenticated.length === 1, orders});
 })()
@@ -1965,7 +1980,13 @@ __DELIVERY_BINDING__
                         self._sleep(0.5)
                 result = self._eval(script)
                 if result.get("authenticated") is True and search_completed and result.get("ready") is True and isinstance(result.get("orders"), list):
-                    return {"provider": "meny", "orders": result["orders"][:limit]}
+                    orders = []
+                    for value in result["orders"][:limit]:
+                        order = dict(value)
+                        if "status_marker" in order:
+                            order["status"] = meny_order_card_status(order.pop("status_marker"))
+                        orders.append(order)
+                    return {"provider": "meny", "orders": orders}
                 if (
                     phase == 0
                     and attempt >= 3
