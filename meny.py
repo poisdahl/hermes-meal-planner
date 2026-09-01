@@ -546,8 +546,9 @@ class MenyClient:
     def _require_login(self) -> None:
         self._open(STORE_URL)
         result: dict[str, Any] = {}
-        for _ in range(120):
-            result = self._eval(r"""
+        for attempt in range(2):
+            for _ in range(120):
+                result = self._eval(r"""
 (() => {
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
@@ -558,9 +559,11 @@ class MenyClient:
   });
 })()
 """)
-            if result.get("ready") is True and result.get("authenticated") is True:
-                return
-            self._sleep(0.25)
+                if result.get("ready") is True and result.get("authenticated") is True:
+                    return
+                self._sleep(0.25)
+            if attempt == 0:
+                self._invoke("reload")
         if result.get("ready") is not True:
             raise HouseholdError("MENY website is unavailable")
         raise HouseholdError("MENY login is required in the configured browser profile")

@@ -1283,11 +1283,13 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         client._open = mock.Mock()
         client._sleep = mock.Mock()
+        client._invoke = mock.Mock()
         client._eval = mock.Mock(return_value={"ready": True, "authenticated": False})
         with self.assertRaisesRegex(HouseholdError, "login is required"):
             client.probe()
-        self.assertEqual(client._eval.call_count, 120)
-        self.assertEqual(client._sleep.call_count, 120)
+        self.assertEqual(client._eval.call_count, 240)
+        self.assertEqual(client._sleep.call_count, 240)
+        client._invoke.assert_called_once_with("reload")
         client._eval.return_value = {"ready": True, "authenticated": True}
         probe = client.probe()
         self.assertEqual(probe["provider"], "meny")
@@ -1318,6 +1320,20 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client._eval.call_count, 73)
         self.assertEqual(client._sleep.call_count, 72)
+
+    def test_login_check_reloads_one_stuck_store_shell(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock()
+        stuck = {"ready": False, "authenticated": False}
+        client._eval = mock.Mock(side_effect=[*([stuck] * 120), {"ready": True, "authenticated": True}])
+
+        client._require_login()
+
+        self.assertEqual(client._eval.call_count, 121)
+        self.assertEqual(client._sleep.call_count, 120)
+        client._invoke.assert_called_once_with("reload")
 
     def test_cdp_is_restricted_to_an_explicit_loopback_endpoint(self):
         self.assertEqual(normalize_browser_cdp("http://127.0.0.1:9224"), "http://127.0.0.1:9224")
