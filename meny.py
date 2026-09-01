@@ -1255,7 +1255,7 @@ class MenyClient:
   const home = [...root.querySelectorAll('input[type="radio"], [role="radio"]')].filter(visible).filter(x => /^Levert på døren(?:\s|$)/i.test(norm(x.getAttribute('aria-label') || x.closest('label')?.innerText || x.parentElement?.innerText)));
   const homeChecked = home.length === 1 && (home[0].checked === true || home[0].getAttribute('aria-checked') === 'true');
   const buttons = [...root.querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Til betaling');
-  const blockingDialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"]')].filter(visible);
+  const blockingDialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[role="alert"],[aria-modal="true"]')].filter(visible);
   const totalLabels = leaf('*').filter(x => norm(x.innerText) === 'Totalsum');
   const totals = [];
   for (const label of totalLabels) {
@@ -1300,8 +1300,8 @@ __DELIVERY_BINDING__
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
-  const dialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"]')].filter(visible).filter(x => norm(x.innerText) === 'Du har dessverre mistet din reservasjon. Velg tidspunkt på nytt for å kunne betale.');
-  return JSON.stringify({reservation_expired:location.href === 'https://meny.no/kassen' && authenticated.length === 1 && dialogs.length === 1});
+  const notices = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[role="alert"],[aria-modal="true"]')].filter(visible).filter(x => norm(x.innerText) === 'Du har dessverre mistet din reservasjon. Velg tidspunkt på nytt for å kunne betale.');
+  return JSON.stringify({reservation_expired:location.href === 'https://meny.no/kassen' && authenticated.length === 1 && notices.length === 1});
 })()
 """),
         )

@@ -3339,7 +3339,7 @@ class MenyClientTests(unittest.TestCase):
         client._eval = evaluate
         client._invoke = invoke
         client._require_time = lambda value: events.append(("require_time", value))
-        client._wait_for_vipps_dispatch = lambda *_args: events.append(("wait_for_vipps_dispatch",))
+        client._wait_for_vipps_dispatch = lambda *args: events.append(("wait_for_vipps_dispatch", *args))
         client._click_checkout_submit(review, lambda: events.append(("dispatch_fence",)))
 
         kinds = [event[0] for event in events]
@@ -3355,7 +3355,11 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("torsdag 3. september Kl. 09:00-12:00", second_gate)
         self.assertIn("Endre dato og tid", second_gate)
         self.assertIn("deliveryBinding", second_gate)
+        self.assertIn('[role="alert"]', second_gate)
         self.assertNotIn("deliveryRoots", second_gate)
+        known_failure = events[-1][2]
+        known_failure()
+        self.assertIn('[role="alert"]', events[-1][1])
 
     def test_vipps_dispatch_requires_one_successful_payment_post(self):
         self.assertTrue(vipps_dispatch_acknowledged({"requests": [{
