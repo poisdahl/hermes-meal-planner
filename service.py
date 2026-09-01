@@ -35,7 +35,7 @@ from core import (
     remove_item,
 )
 from oda import OdaClient
-from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, normalize_product_ref
+from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, meny_checkout_reviews_match, normalize_product_ref
 
 
 MAX_REQUEST = 2 * 1024 * 1024
@@ -1267,6 +1267,29 @@ class Application:
                 if refreshed_summary["count"] != summary["count"] or refreshed_lines != reviewed_lines:
                     raise HouseholdError("MENY cart items changed after the delivery reservation")
                 cart = refreshed_cart
+                reviewed_delivery = summary.get("delivery")
+                if not isinstance(reviewed_delivery, Mapping):
+                    raise HouseholdError("MENY checkout returned no verified delivery")
+                review_cart = dict(cart)
+                review_cart["delivery"] = deepcopy(dict(reviewed_delivery))
+                for _ in range(3):
+                    stable_review = self.browser.review_checkout(
+                        review_cart,
+                        order_change=order_change,
+                        deadline=deadline,
+                        allow_recovery=allow_recovery,
+                    )
+                    stable_summary = stable_review.get("summary")
+                    if not isinstance(stable_summary, Mapping):
+                        raise HouseholdError("MENY checkout returned no verified summary")
+                    if meny_checkout_reviews_match(review, stable_review):
+                        review = stable_review
+                        summary = deepcopy(dict(stable_summary))
+                        break
+                    review = stable_review
+                    summary = deepcopy(dict(stable_summary))
+                else:
+                    raise HouseholdError("MENY checkout summary did not settle")
             payment_display = None
             if self.provider == "oda":
                 payment_display = str((review.get("summary") or {}).get("payment") or review.get("payment_display") or "")

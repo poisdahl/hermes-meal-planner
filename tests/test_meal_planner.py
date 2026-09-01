@@ -218,7 +218,7 @@ class FakeMeny(FakeOda):
                 "items": deepcopy(cart["items"]),
                 "count": cart["count"],
                 "total": 40.0,
-                "delivery": {"slot_id": None, "display": "Dato og tid torsdag 3. september Kl. 09:00-12:00"},
+                "delivery": {"slot_id": None, "display": "torsdag 3. september Kl. 09:00-12:00"},
                 "payment": "vipps",
             "order_lines": [{"product_id": MENY_PRODUCT, "identity": "Brokkoli 400g", "quantity": 1}],
             },
@@ -3848,7 +3848,7 @@ class FlowTests(unittest.TestCase):
             self.assertEqual([call.args[0] for call in prepare_calls], ["get_cart", "get_orders", "get_cart"])
             self.assertTrue(all(call.kwargs.get("deadline") == 610.0 for call in prepare_calls))
             self.assertTrue(all(call.kwargs.get("allow_recovery") is True for call in prepare_calls))
-            self.assertEqual(provider.checkout_review_recovery, [True])
+            self.assertEqual(provider.checkout_review_recovery, [True, True])
             with mock.patch("service.time.monotonic", return_value=20.0):
                 result = app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
             self.assertTrue(result["awaiting_user_payment"])
@@ -3921,6 +3921,27 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(pending["cart"]["total"], 39.0)
             self.assertEqual([call[0] for call in provider.calls], ["get_cart", "get_orders", "get_cart"])
 
+    def test_meny_prepare_waits_for_two_matching_checkout_reviews(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            original_review = provider.review_checkout
+            totals = iter([40.0, 41.0, 41.0])
+
+            def changing_review(cart, **kwargs):
+                review = original_review(cart, **kwargs)
+                review["summary"]["total"] = next(totals)
+                return review
+
+            provider.review_checkout = changing_review
+            app = Application(store, provider, self.browser)
+
+            prepared = app.handle({"operation": "checkout", "action": "prepare"})
+
+            self.assertEqual(prepared["summary"]["total"], 41.0)
+            self.assertEqual(store.read()["pending_checkout"]["summary"]["total"], 41.0)
+            self.assertEqual(provider.checkout_review_recovery, [True, True, True])
+
     def test_standing_submit_reuses_one_fresh_prepared_meny_checkout(self):
         with tempfile.TemporaryDirectory() as temp:
             store = StateStore(Path(temp), {**CONFIG, "provider": "meny", "confirmation_policy": "standing"})
@@ -3986,7 +4007,7 @@ class FlowTests(unittest.TestCase):
 
             self.assertIsNone(store.read()["pending_cancellation"])
             self.assertTrue(all(call.kwargs.get("allow_recovery") is True for call in provider.call.call_args_list))
-            self.assertEqual(provider.checkout_review_recovery, [True])
+            self.assertEqual(provider.checkout_review_recovery, [True, True])
 
     def test_expired_unapproved_vipps_releases_the_checkout_for_a_fresh_prepare(self):
         started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
