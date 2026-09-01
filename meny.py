@@ -2633,7 +2633,7 @@ __DELIVERY_BINDING__
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
-  const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
+  const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
   if (dialogs.length !== 1) return JSON.stringify({ready:false});
   const root = dialogs[0], final = [...root.querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Kanseller');
   const dismiss = [...root.querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Avbryt');
@@ -2650,7 +2650,7 @@ __DELIVERY_BINDING__
 (() => {
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
-  const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
+  const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
   return JSON.stringify({clear:dialogs.length === 0});
 })()
 """)
@@ -2705,7 +2705,7 @@ __DELIVERY_BINDING__
   const lines = main.length === 1 ? (main[0].innerText || '').split(/\n+/).map(norm).filter(Boolean) : [];
   const index = lines.findIndex(x => x === 'Ordrenummer');
   if (location.pathname !== path || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({ready:false});
-  const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
+  const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
   if (dialogs.length !== 1) return JSON.stringify({ready:false});
   const confirm = [...dialogs[0].querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Kanseller');
   const dismiss = [...dialogs[0].querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Avbryt');

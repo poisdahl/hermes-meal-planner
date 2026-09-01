@@ -3790,6 +3790,28 @@ class MenyClientTests(unittest.TestCase):
         client.submit_cancellation("99990001", order, review)
         self.assertEqual(client._invoke.call_count, 2)
         self.assertTrue(all("99990001" in script and "location.pathname" in script and "Ordrenummer" in script for script in scripts))
+        self.assertIn("dialog,[role=\"dialog\"]", scripts[1])
+
+    def test_meny_cancellation_review_accepts_a_native_dialog(self):
+        client = self.client()
+        order = {
+            "provider": "meny", "orderNumber": "99990001", "order_number": "99990001", "id": "99990001",
+            "code": "TEST-CODE-1", "status": "confirmed", "grossAmount": 1200.0,
+            "deliverySlotDisplay": "torsdag 3. sep. kl. 09:00-12:00", "productQuantityCount": 1,
+            "products": [{"identity": "Brokkoli 400g", "name": "Brokkoli 400g", "quantity": 1}],
+        }
+        client._get_order = mock.Mock(return_value=deepcopy(order))
+        scripts = []
+        results = iter([{"available": True}, {"ready": True, "consequence": None}, {"clear": True}])
+        client._eval = lambda script: scripts.append(script) or next(results)
+        client._invoke = mock.Mock(return_value={})
+        client._sleep = mock.Mock()
+
+        review = client.review_cancellation("99990001", order)
+
+        self.assertTrue(review["available"])
+        self.assertIn("dialog,[role=\"dialog\"]", scripts[1])
+        self.assertIn("dialog,[role=\"dialog\"]", scripts[2])
 
     def test_meny_cancellation_rejects_a_fresh_order_change_before_any_click(self):
         client = self.client()
