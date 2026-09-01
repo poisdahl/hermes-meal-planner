@@ -670,11 +670,17 @@ class MenyClient:
     def _change_one(self, product: str, delta: int, *, order_change_code: str | None = None) -> None:
         self._open(BASE_URL + product)
         self._assert_authenticated()
-        before = self._product_control("mark", delta, product)
-        if before.get("authenticated") is not True:
-            raise HouseholdError("MENY login is required in the configured browser profile")
-        if before.get("ready") is not True:
-            reason = "product is not in the cart" if delta < 0 else "product control is unavailable"
+        before: dict[str, Any] = {}
+        for _ in range(20):
+            before = self._product_control("mark", delta, product)
+            if before.get("authenticated") is not True:
+                raise HouseholdError("MENY login is required in the configured browser profile")
+            if before.get("ready") is True:
+                break
+            self._sleep(0.25)
+        else:
+            missing = delta < 0 and before.get("page_ready") is True and before.get("quantity") == 0
+            reason = "product is not in the cart" if missing else "product control is unavailable"
             raise HouseholdError(f"MENY {reason}")
         previous = before.get("quantity")
         if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
@@ -737,8 +743,8 @@ class MenyClient:
   const headings = [...document.querySelectorAll('main h1')].filter(visible);
   const abouts = [...document.querySelectorAll('main h2')].filter(visible).filter(x => norm(x.innerText) === 'Om produktet');
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
-  if (location.origin !== 'https://meny.no' || location.pathname !== PRODUCT) return JSON.stringify({ready:false, authenticated:authenticated.length === 1});
-  if (headings.length !== 1 || abouts.length !== 1) return JSON.stringify({ready:false, authenticated:authenticated.length === 1});
+  if (location.origin !== 'https://meny.no' || location.pathname !== PRODUCT) return JSON.stringify({ready:false, page_ready:false, authenticated:authenticated.length === 1});
+  if (headings.length !== 1 || abouts.length !== 1) return JSON.stringify({ready:false, page_ready:false, authenticated:authenticated.length === 1});
   const heading = headings[0], about = abouts[0];
   const between = x => (heading.compareDocumentPosition(x) & Node.DOCUMENT_POSITION_FOLLOWING) && (x.compareDocumentPosition(about) & Node.DOCUMENT_POSITION_FOLLOWING);
   const selects = [...document.querySelectorAll('main select[aria-label*="endre mengde"]')].filter(x => visible(x) && between(x));
@@ -746,7 +752,7 @@ class MenyClient:
   const select = selects[0];
   const selected = norm(select?.selectedOptions?.[0]?.innerText || '');
   const quantity = Number.parseInt(selected, 10) || 0;
-  if (ACTION === 'read') return JSON.stringify({ready:true, authenticated:authenticated.length === 1, quantity});
+  if (ACTION === 'read') return JSON.stringify({ready:true, page_ready:true, authenticated:authenticated.length === 1, quantity});
   const name = norm(heading.innerText);
   const buttons = [...document.querySelectorAll('main button')].filter(x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true' && between(x));
   const candidates = buttons.filter(button => {
@@ -755,11 +761,11 @@ class MenyClient:
       ? (label === `Legg ${name} i handlevognen` || label === `Legg til 1 stk ${name} i handlevognen`)
       : label === `Fjern ${name} fra handlevognen`;
   });
-  if (candidates.length !== 1 || (DELTA < 0 && quantity < 1)) return JSON.stringify({ready:false, authenticated:authenticated.length === 1, quantity});
+  if (candidates.length !== 1 || (DELTA < 0 && quantity < 1)) return JSON.stringify({ready:false, page_ready:true, authenticated:authenticated.length === 1, quantity});
   candidates[0].setAttribute('data-hermes-meal-planner-action', 'cart');
   const marked = [...document.querySelectorAll('[data-hermes-meal-planner-action="cart"]')];
   const label = norm(candidates[0].getAttribute('aria-label') || candidates[0].innerText);
-  return JSON.stringify({ready:marked.length === 1 && marked[0] === candidates[0], authenticated:authenticated.length === 1, quantity, label});
+  return JSON.stringify({ready:marked.length === 1 && marked[0] === candidates[0], page_ready:true, authenticated:authenticated.length === 1, quantity, label});
 })()
 """.replace("ACTION", json.dumps(action)).replace("DELTA", str(delta)).replace("PRODUCT", json.dumps(product)))
 

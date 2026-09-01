@@ -2471,6 +2471,24 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._assert_authenticated.call_count, 2)
         client._click_cart_control.assert_called_once_with(MENY_PRODUCT, "Legg Brokkoli i handlevognen")
 
+    def test_cart_change_waits_for_the_product_controls_to_render(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._assert_authenticated = mock.Mock()
+        client._sleep = mock.Mock()
+        client._product_control = mock.Mock(side_effect=[
+            {"ready": False, "page_ready": False, "authenticated": True},
+            {"ready": True, "page_ready": True, "authenticated": True, "quantity": 1, "label": "Fjern Brokkoli fra handlevognen"},
+        ])
+        client._click_cart_control = mock.Mock()
+        client._resolve_order_route = mock.Mock()
+        client._wait_for_quantity = mock.Mock(return_value=0)
+
+        client._change_one(MENY_PRODUCT, -1)
+
+        client._sleep.assert_called_once_with(0.25)
+        client._click_cart_control.assert_called_once_with(MENY_PRODUCT, "Fjern Brokkoli fra handlevognen")
+
     def test_checkout_review_rejects_same_quantity_with_a_different_product_path(self):
         client = self.client()
         client._verify_order_change = mock.Mock()
