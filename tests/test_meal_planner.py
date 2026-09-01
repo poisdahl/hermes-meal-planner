@@ -38,7 +38,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, meny_order_search_completed, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -1993,6 +1993,34 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn(r"/^Bestilling\s+\S+/i", scripts[-1])
         self.assertIn("deliveredDatePattern", scripts[-1])
 
+    def test_order_list_waits_for_the_completed_order_search_before_reading_dom(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(side_effect=[
+            {},
+            {"requests": []},
+            {"requests": [{
+                "method": "GET",
+                "status": 200,
+                "url": "https://platform-rest-prod.ngdata.no/api/order/search/store/user",
+            }]},
+        ])
+        client._eval = mock.Mock(side_effect=[
+            {"ready": True, "authenticated": True, "orders": []},
+            {"ready": True, "authenticated": True, "orders": [{"order_number": "99990001"}]},
+        ])
+
+        result = client._get_orders(10)
+
+        self.assertEqual(len(result["orders"]), 1)
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("network", "requests", "--clear"),
+            mock.call("network", "requests", "--filter", "/api/order/search/"),
+            mock.call("network", "requests", "--filter", "/api/order/search/"),
+        ])
+        self.assertEqual(client._sleep.call_args_list, [mock.call(0.25), mock.call(0.5)])
+
     def test_cart_read_polls_a_transient_missing_cart_control(self):
         client = self.client()
         valid = {
@@ -2832,12 +2860,14 @@ class MenyClientTests(unittest.TestCase):
         self.assertTrue(vipps_dispatch_acknowledged({"requests": [{
             "method": "POST",
             "status": 200,
-            "url": "https://platform-rest-prod.ngdata.no/api/orders/payment",
+            "url": "https://platform-rest-prod.ngdata.no/api/order/payment",
         }]}))
         for request in (
-            {"method": "GET", "status": 200, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"},
-            {"method": "POST", "status": 500, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"},
+            {"method": "GET", "status": 200, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"},
+            {"method": "POST", "status": 500, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"},
             {"method": "POST", "status": 200, "url": "https://platform-rest-prod.ngdata.no/api/client-notifications/"},
+            {"method": "POST", "status": 200, "url": "https://meny.no/api/visitor-group-cookie/refresh"},
+            {"method": "POST", "status": 200, "url": "https://platform-rest-prod.ngdata.no/api/calculator/"},
             {"method": "POST", "status": 200, "url": "https://analytics.example/payment"},
         ):
             with self.subTest(request=request):
@@ -2845,12 +2875,24 @@ class MenyClientTests(unittest.TestCase):
         with self.assertRaisesRegex(HouseholdError, "request log changed"):
             vipps_dispatch_acknowledged({"requests": {}})
 
+    def test_order_search_requires_the_exact_successful_meny_endpoint(self):
+        self.assertTrue(meny_order_search_completed({"requests": [{
+            "method": "GET",
+            "status": 200,
+            "url": "https://platform-rest-prod.ngdata.no/api/order/search/store/user?page=1",
+        }]}))
+        self.assertFalse(meny_order_search_completed({"requests": [{
+            "method": "GET",
+            "status": 200,
+            "url": "https://platform-rest-prod.ngdata.no/api/client-notifications/",
+        }]}))
+
     def test_vipps_dispatch_waits_for_the_payment_response(self):
         client = self.client()
         client._sleep = mock.Mock()
         client._invoke = mock.Mock(side_effect=[
-            {"requests": [{"method": "POST", "status": None, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"}]},
-            {"requests": [{"method": "POST", "status": 201, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"}]},
+            {"requests": [{"method": "POST", "status": None, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"}]},
+            {"requests": [{"method": "POST", "status": 201, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"}]},
         ])
 
         client._wait_for_vipps_dispatch()
@@ -3169,6 +3211,62 @@ class FlowTests(unittest.TestCase):
             self.assertTrue(reconciled["retry_allowed"])
             self.assertIsNone(store.read()["pending_checkout"])
             self.assertEqual(provider.checkout_clicks, 1)
+
+    def test_expired_vipps_ignores_one_unrelated_order_missing_from_the_baseline(self):
+        started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.now", return_value=started):
+                prepared = app.handle({"operation": "checkout", "action": "prepare"})
+                app.handle({
+                    "operation": "checkout",
+                    "action": "confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                })
+            provider.orders.append({
+                "orderNumber": "99990001", "order_number": "99990001", "id": "99990001",
+                "status": "confirmed", "grossAmount": 10.0,
+                "deliverySlotDisplay": "fredag 4. sep. kl. 12:00-14:00",
+                "productQuantityCount": 1,
+                "products": [{"identity": "Et annet produkt", "quantity": 1}],
+            })
+
+            with mock.patch("service.now", return_value=started + timedelta(minutes=12)):
+                reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
+
+            self.assertTrue(reconciled["expired"])
+            self.assertTrue(reconciled["retry_allowed"])
+            self.assertIsNone(store.read()["pending_checkout"])
+
+    def test_expired_vipps_keeps_an_exact_unconfirmed_order_candidate_locked(self):
+        started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.now", return_value=started):
+                prepared = app.handle({"operation": "checkout", "action": "prepare"})
+                app.handle({
+                    "operation": "checkout",
+                    "action": "confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                })
+            provider.orders.append({
+                "orderNumber": "99990002", "order_number": "99990002", "id": "99990002",
+                "status": "confirmed", "grossAmount": 40.0,
+                "deliverySlotDisplay": "torsdag 3. sep. kl. 09:00-12:00",
+                "productQuantityCount": 1,
+                "products": [{"identity": "Brokkoli 400g", "quantity": 1}],
+            })
+
+            with mock.patch("service.now", return_value=started + timedelta(minutes=12)):
+                reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
+
+            self.assertFalse(reconciled["expired"])
+            self.assertFalse(reconciled["retry_allowed"])
+            self.assertEqual(store.read()["pending_checkout"]["status"], "uncertain")
 
     def test_legacy_unapproved_vipps_uses_the_guarded_confirmation_expiry(self):
         started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)

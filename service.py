@@ -1352,7 +1352,8 @@ class Application:
             fulfillable = {"paid_and_modifiable", "paid_and_not_modifiable", "picking", "shipped", "delivered"}
             confirmed = order is not None and candidate_id and candidate_id == details_id == tracking_id and tracking_status in fulfillable and order_matches_checkout(order, pending["summary"])
         expired_unpaid = False
-        if self.provider == "meny" and not confirmed and confirmation_order_id is None and order is None:
+        candidate_matches = order is not None and meny_order_matches_checkout(order, pending["summary"])
+        if self.provider == "meny" and not confirmed and confirmation_order_id is None and len(candidates) <= 1 and not candidate_matches:
             expiry = pending.get("payment_expires_at") or pending.get("expires_at")
             try:
                 expires_at = datetime.fromisoformat(str(expiry or ""))

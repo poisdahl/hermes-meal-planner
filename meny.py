@@ -81,7 +81,6 @@ MENY_READ_TIMEOUT = 110
 MENY_CART_TIMEOUT = 240
 MENY_ORDER_TIMEOUT = 180
 MAX_CART_CLICKS = 2
-VIPPS_DISPATCH_HOSTS = {"meny.no", "platform-rest-prod.ngdata.no", "api.vipps.no"}
 
 
 class _BrowserTransportError(HouseholdError):
@@ -181,11 +180,40 @@ def vipps_dispatch_acknowledged(value: Any) -> bool:
         if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status < 300:
             continue
         parsed = urlparse(str(request.get("url") or ""))
-        if parsed.scheme != "https" or parsed.hostname not in VIPPS_DISPATCH_HOSTS:
+        if parsed.scheme != "https":
             continue
-        if parsed.hostname == "platform-rest-prod.ngdata.no" and parsed.path.rstrip("/").casefold() == "/api/client-notifications":
-            continue
-        return True
+        path = parsed.path.casefold()
+        if parsed.hostname == "api.vipps.no":
+            return True
+        if parsed.hostname == "platform-rest-prod.ngdata.no" and path.startswith((
+            "/api/order/", "/api/payment/", "/api/vipps/", "/api/checkout/",
+        )):
+            return True
+        if parsed.hostname == "meny.no" and path.startswith((
+            "/api/user/order", "/api/payment/", "/api/vipps/", "/api/checkout/",
+        )):
+            return True
+    return False
+
+
+def meny_order_search_completed(value: Any) -> bool:
+    if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
+        raise HouseholdError("MENY browser order request log changed")
+    for request in value["requests"]:
+        if not isinstance(request, Mapping):
+            raise HouseholdError("MENY browser order request log changed")
+        status = request.get("status")
+        parsed = urlparse(str(request.get("url") or ""))
+        if (
+            str(request.get("method") or "").upper() == "GET"
+            and not isinstance(status, bool)
+            and isinstance(status, int)
+            and 200 <= status < 300
+            and parsed.scheme == "https"
+            and parsed.hostname == "platform-rest-prod.ngdata.no"
+            and parsed.path.casefold().startswith("/api/order/search/")
+        ):
+            return True
     return False
 
 
@@ -1491,9 +1519,9 @@ __DELIVERY_BINDING__
         return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
 
     def _get_orders(self, limit: int) -> dict[str, Any]:
+        self._invoke("network", "requests", "--clear")
         self._open(ORDERS_URL)
-        self._sleep(1.5)
-        result = self._eval(r"""
+        script = r"""
 (() => {
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -1510,10 +1538,23 @@ __DELIVERY_BINDING__
   }
   return JSON.stringify({ready:authenticated.length === 1 && Boolean(document.querySelector('main')), authenticated:authenticated.length === 1, orders});
 })()
-""")
-        if result.get("authenticated") is not True:
-            raise HouseholdError("MENY login is required in the configured browser profile")
-        if result.get("ready") is not True or not isinstance(result.get("orders"), list):
+"""
+        result: dict[str, Any] = {}
+        search_completed = False
+        for _ in range(40):
+            if not search_completed:
+                search_completed = meny_order_search_completed(
+                    self._invoke("network", "requests", "--filter", "/api/order/search/")
+                )
+                if search_completed:
+                    self._sleep(0.5)
+            result = self._eval(script)
+            if result.get("authenticated") is not True:
+                raise HouseholdError("MENY login is required in the configured browser profile")
+            if search_completed and result.get("ready") is True and isinstance(result.get("orders"), list):
+                break
+            self._sleep(0.25)
+        else:
             raise HouseholdError("MENY orders did not finish rendering")
         return {"provider": "meny", "orders": result["orders"][:limit]}
 
