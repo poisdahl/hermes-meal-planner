@@ -353,7 +353,6 @@ def normalize_cart_snapshot(value: Any) -> dict[str, Any]:
         or value.get("count") != count
         or (empty and float(total) != 0)
         or (not empty and float(total) <= 0)
-        or (not empty and float(total) < float(subtotal))
     ):
         raise HouseholdError("MENY cart total is invalid")
     delivery_count = value.get("delivery_count")
@@ -1502,7 +1501,7 @@ __DELIVERY_BINDING__
   const empty = itemRoots.length === 0 && /(?:handlevognen(?: din)? er tom|ingen varer i handlevognen)/i.test(norm(cart.innerText));
   const total = match ? Number(`${match[1].replace(/[ .]/g, '')}.${match[2]}`) : empty && totals.length === 0 ? 0 : null;
   const totalReady = empty ? totals.length === 0 && total === 0 : totals.length === 1 && total !== null && total > 0;
-  const subtotalReady = empty ? subtotalRows.length === 0 && subtotal === null : priceSummaries.length === 1 && subtotalRows.length === 1 && subtotal !== null && subtotal > 0 && total !== null && total >= subtotal;
+  const subtotalReady = empty ? subtotalRows.length === 0 && subtotal === null : priceSummaries.length === 1 && subtotalRows.length === 1 && subtotal !== null && subtotal > 0;
   const deliveryPrefix = 'Du har valgt at varene leveres på døren';
   const deliveryHint = norm(cart.innerText).toLocaleLowerCase('nb-NO').includes(deliveryPrefix.toLocaleLowerCase('nb-NO'));
   const deliveryParagraphs = [...cart.querySelectorAll('p')].filter(visible).filter(x => norm(x.innerText).toLocaleLowerCase('nb-NO').startsWith(deliveryPrefix.toLocaleLowerCase('nb-NO')));

@@ -2392,7 +2392,6 @@ class MenyClientTests(unittest.TestCase):
             {**valid, "total_count": 2},
             {**valid, "subtotal_count": 2},
             {**valid, "subtotal": 0},
-            {**valid, "subtotal": 20},
             {**valid, "items": [], "item_root_count": 0, "control_count": 0, "count": 0, "total": 0, "empty": False},
             {**valid, "items": [], "item_root_count": 0, "control_count": 0, "count": 0, "total": 500, "empty": True},
             {**valid, "empty": True},
@@ -2405,6 +2404,29 @@ class MenyClientTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(HouseholdError):
                     normalize_cart_snapshot(value)
+
+    def test_cart_snapshot_accepts_a_discounted_total_below_the_pre_discount_sum(self):
+        self.assertEqual(normalize_cart_snapshot({
+            "ready": True,
+            "authenticated": True,
+            "root_count": 1,
+            "item_root_count": 1,
+            "control_count": 1,
+            "empty": False,
+            "total_count": 1,
+            "subtotal_count": 1,
+            "subtotal": 20.0,
+            "delivery_count": 0,
+            "delivery": None,
+            "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 20.0}],
+            "count": 1,
+            "total": 19.9,
+        }), {
+            "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 20.0}],
+            "count": 1,
+            "total": 19.9,
+            "delivery": None,
+        })
 
     def test_cart_snapshot_accepts_one_explicit_empty_cart_without_a_total_row(self):
         self.assertEqual(normalize_cart_snapshot({
