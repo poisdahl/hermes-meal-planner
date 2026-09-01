@@ -1723,11 +1723,11 @@ __DELIVERY_BINDING__
 
     def _wait_for_delivery_reservation(self) -> None:
         requests: Any = {"requests": []}
-        for attempt in range(40):
+        for attempt in range(120):
             requests = self._invoke("network", "requests")
             if meny_delivery_reservation_acknowledged(requests):
                 return
-            if attempt < 39:
+            if attempt < 119:
                 self._sleep(0.25)
         raise HouseholdError(
             "MENY did not acknowledge the delivery reservation; inspect the selected slot before retrying"

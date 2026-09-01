@@ -3469,6 +3469,24 @@ class MenyClientTests(unittest.TestCase):
         ])
         client._sleep.assert_called_once_with(0.25)
 
+    def test_delivery_selection_accepts_a_slow_reservation_response(self):
+        client = self.client()
+        endpoint = "https://api.ngdata.no/sylinder/hentevinduer/reservasjoner/v1/api"
+        household = "https://platform-rest-prod.ngdata.no/api/extended-user/123456/household"
+        client._invoke = mock.Mock(side_effect=[
+            *([{"requests": []}] * 40),
+            {"requests": [
+                {"method": "POST", "status": 200, "url": endpoint},
+                {"method": "PUT", "status": 200, "url": household},
+            ]},
+        ])
+        client._sleep = mock.Mock()
+
+        client._wait_for_delivery_reservation()
+
+        self.assertEqual(client._invoke.call_count, 41)
+        self.assertEqual(client._sleep.call_count, 40)
+
     def test_vipps_dispatch_waits_for_the_payment_response(self):
         client = self.client()
         client._sleep = mock.Mock()
