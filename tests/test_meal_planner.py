@@ -38,7 +38,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -2810,11 +2810,14 @@ class MenyClientTests(unittest.TestCase):
         client._eval = evaluate
         client._invoke = invoke
         client._require_time = lambda value: events.append(("require_time", value))
+        client._wait_for_vipps_dispatch = lambda: events.append(("wait_for_vipps_dispatch",))
         client._click_checkout_submit(review, lambda: events.append(("dispatch_fence",)))
 
         kinds = [event[0] for event in events]
-        self.assertEqual(kinds, ["eval", "scrollintoview", "get", "eval", "mouse", "eval", "require_time", "dispatch_fence", "mouse", "mouse"])
+        self.assertEqual(kinds, ["eval", "scrollintoview", "get", "eval", "mouse", "eval", "require_time", "network", "dispatch_fence", "click", "wait_for_vipps_dispatch"])
         self.assertEqual(events[4], ("mouse", "move", "26", "41"))
+        self.assertEqual(events[7], ("network", "requests", "--clear"))
+        self.assertEqual(events[9], ("click", '[data-hermes-meal-planner-action="checkout-submit"]'))
         second_gate = events[5][1]
         self.assertIn("elementFromPoint(26, 41)", second_gate)
         self.assertIn("location.href ===", second_gate)
@@ -2824,6 +2827,50 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("Endre dato og tid", second_gate)
         self.assertIn("deliveryBinding", second_gate)
         self.assertNotIn("deliveryRoots", second_gate)
+
+    def test_vipps_dispatch_requires_one_successful_payment_post(self):
+        self.assertTrue(vipps_dispatch_acknowledged({"requests": [{
+            "method": "POST",
+            "status": 200,
+            "url": "https://platform-rest-prod.ngdata.no/api/orders/payment",
+        }]}))
+        for request in (
+            {"method": "GET", "status": 200, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"},
+            {"method": "POST", "status": 500, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"},
+            {"method": "POST", "status": 200, "url": "https://platform-rest-prod.ngdata.no/api/client-notifications/"},
+            {"method": "POST", "status": 200, "url": "https://analytics.example/payment"},
+        ):
+            with self.subTest(request=request):
+                self.assertFalse(vipps_dispatch_acknowledged({"requests": [request]}))
+        with self.assertRaisesRegex(HouseholdError, "request log changed"):
+            vipps_dispatch_acknowledged({"requests": {}})
+
+    def test_vipps_dispatch_waits_for_the_payment_response(self):
+        client = self.client()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(side_effect=[
+            {"requests": [{"method": "POST", "status": None, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"}]},
+            {"requests": [{"method": "POST", "status": 201, "url": "https://platform-rest-prod.ngdata.no/api/orders/payment"}]},
+        ])
+
+        client._wait_for_vipps_dispatch()
+
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("network", "requests"),
+            mock.call("network", "requests"),
+        ])
+        client._sleep.assert_called_once_with(0.25)
+
+    def test_vipps_dispatch_without_acknowledgement_is_uncertain(self):
+        client = self.client()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(return_value={"requests": []})
+
+        with self.assertRaisesRegex(HouseholdError, "uncertain.*do not retry"):
+            client._wait_for_vipps_dispatch()
+
+        self.assertEqual(client._invoke.call_count, 40)
+        self.assertEqual(client._sleep.call_count, 39)
 
     def test_checkout_submit_does_not_open_dispatch_fence_when_post_hover_gate_fails(self):
         client = self.client()

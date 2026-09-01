@@ -81,6 +81,7 @@ MENY_READ_TIMEOUT = 110
 MENY_CART_TIMEOUT = 240
 MENY_ORDER_TIMEOUT = 180
 MAX_CART_CLICKS = 2
+VIPPS_DISPATCH_HOSTS = {"meny.no", "platform-rest-prod.ngdata.no", "api.vipps.no"}
 
 
 class _BrowserTransportError(HouseholdError):
@@ -164,6 +165,28 @@ def normalize_delivery_slot_ref(value: Any) -> tuple[str, str]:
         f"{int(match['end_hour']):02d}:{match['end_minute']}"
     )
     return slot_id, suffix
+
+
+def vipps_dispatch_acknowledged(value: Any) -> bool:
+    """Return true only for a completed payment-dispatch request from the browser."""
+
+    if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
+        raise HouseholdError("MENY browser payment request log changed")
+    for request in value["requests"]:
+        if not isinstance(request, Mapping):
+            raise HouseholdError("MENY browser payment request log changed")
+        if str(request.get("method") or "").upper() != "POST":
+            continue
+        status = request.get("status")
+        if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status < 300:
+            continue
+        parsed = urlparse(str(request.get("url") or ""))
+        if parsed.scheme != "https" or parsed.hostname not in VIPPS_DISPATCH_HOSTS:
+            continue
+        if parsed.hostname == "platform-rest-prod.ngdata.no" and parsed.path.rstrip("/").casefold() == "/api/client-notifications":
+            continue
+        return True
+    return False
 
 
 def normalize_cart_snapshot(value: Any) -> dict[str, Any]:
@@ -1072,10 +1095,22 @@ __DELIVERY_BINDING__
         self._invoke("mouse", "move", str(x), str(y))
         if self._eval(render_gate(True, x, y)) != {"ready": True}:
             raise HouseholdError("MENY Vipps payment control changed or is obscured")
-        self._require_time(5)
+        self._require_time(15)
+        self._invoke("network", "requests", "--clear")
         before_dispatch()
-        self._invoke("mouse", "down")
-        self._invoke("mouse", "up")
+        self._invoke("click", selector)
+        self._wait_for_vipps_dispatch()
+
+    def _wait_for_vipps_dispatch(self) -> None:
+        for attempt in range(40):
+            if vipps_dispatch_acknowledged(self._invoke("network", "requests")):
+                return
+            if attempt < 39:
+                self._sleep(0.25)
+        raise HouseholdError(
+            "MENY did not acknowledge the Vipps payment request; "
+            "the outcome is uncertain and must be reconciled; do not retry"
+        )
 
     @staticmethod
     def _find_box(value: Any) -> dict[str, float] | None:
