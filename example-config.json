@@ -3,6 +3,7 @@
   "household": "My household",
   "provider": "meny",
   "confirmation_policy": "fresh",
+  "vipps_phone_number": null,
   "email_automation_profile": null,
   "profile_overrides": {}
 }

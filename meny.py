@@ -167,7 +167,7 @@ def normalize_delivery_slot_ref(value: Any) -> tuple[str, str]:
 
 
 def vipps_dispatch_acknowledged(value: Any) -> bool:
-    """Return true only for a completed payment-dispatch request from the browser."""
+    """Return true only when MENY has created the provider-side Vipps payment."""
 
     if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
         raise HouseholdError("MENY browser payment request log changed")
@@ -183,10 +183,8 @@ def vipps_dispatch_acknowledged(value: Any) -> bool:
         if parsed.scheme != "https":
             continue
         path = parsed.path.casefold()
-        if parsed.hostname == "api.vipps.no":
-            return True
         if parsed.hostname == "platform-rest-prod.ngdata.no" and path.startswith((
-            "/api/order/", "/api/payment/", "/api/vipps/", "/api/checkout/",
+            "/order/", "/api/order/", "/api/payment/", "/api/vipps/", "/api/checkout/",
         )):
             return True
         if parsed.hostname == "meny.no" and path.startswith((
@@ -355,6 +353,7 @@ class MenyClient:
         uid: int,
         gid: int,
         cdp: str | None = None,
+        vipps_phone_number: str | None = None,
     ):
         self.instance = instance
         self.binary = Path(binary)
@@ -365,6 +364,7 @@ class MenyClient:
         self.uid = uid
         self.gid = gid
         self.cdp = normalize_browser_cdp(cdp)
+        self.vipps_phone_number = vipps_phone_number
         self._cdp_primed = False
         self.session = f"hermes-meal-planner-meny-{instance}"
         self.lock = threading.Lock()
@@ -1070,6 +1070,8 @@ class MenyClient:
         self._invoke("mouse", "up")
 
     def _click_checkout_submit(self, review: Mapping[str, Any], before_dispatch: Any) -> None:
+        if self.vipps_phone_number is None:
+            raise HouseholdError("MENY checkout requires vipps_phone_number in the private household config")
         selector = '[data-hermes-meal-planner-action="checkout-submit"]'
         gate = r"""
 (() => {
@@ -1132,6 +1134,7 @@ __DELIVERY_BINDING__
     def _wait_for_vipps_dispatch(self) -> None:
         for attempt in range(40):
             if vipps_dispatch_acknowledged(self._invoke("network", "requests")):
+                self._complete_vipps_request()
                 return
             if attempt < 39:
                 self._sleep(0.25)
@@ -1139,6 +1142,80 @@ __DELIVERY_BINDING__
             "MENY did not acknowledge the Vipps payment request; "
             "the outcome is uncertain and must be reconciled; do not retry"
         )
+
+    def _complete_vipps_request(self) -> None:
+        form: dict[str, Any] = {}
+        for attempt in range(40):
+            form = self._eval(r"""
+(() => {
+  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
+  const identity = location.origin === 'https://api.vipps.no' && location.pathname === '/dwo-api-application/v1/deeplink/vippsgateway';
+  const text = norm(document.body.innerText);
+  const sent = identity && /We've sent a payment request to/i.test(text) && /Open Vipps/i.test(text);
+  const phones = [...document.querySelectorAll('input[type="tel"][name="phone-number"]')].filter(visible).filter(x => x.maxLength === 8 && x.autocomplete === 'tel-national');
+  const buttons = [...document.querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Next');
+  const remember = [...document.querySelectorAll('input[type="checkbox"]')].filter(visible);
+  const ready = identity && !sent && /Continue to pay with Vipps/i.test(text) && phones.length === 1 && buttons.length === 1 && remember.length === 1 && remember[0].checked === false;
+  if (ready) buttons[0].setAttribute('data-hermes-meal-planner-action', 'vipps-next');
+  return JSON.stringify({identity, ready, sent});
+})()
+""")
+            if form.get("identity") is True and (form.get("ready") is True or form.get("sent") is True):
+                break
+            if attempt < 39:
+                self._sleep(0.25)
+        if form.get("sent") is True:
+            return
+        if form.get("identity") is not True or form.get("ready") is not True:
+            raise HouseholdError("Vipps payment page did not finish rendering; the outcome is uncertain; do not retry")
+        try:
+            self._invoke("fill", 'input[name="phone-number"]', self.vipps_phone_number)
+        except HouseholdError as exc:
+            raise HouseholdError("Vipps mobile number could not be entered; the outcome is uncertain; do not retry") from exc
+        selector = '[data-hermes-meal-planner-action="vipps-next"]'
+        gate = r"""
+(() => {
+  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  const requireHit = __REQUIRE_HIT__;
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
+  const phone = document.querySelector('input[type="tel"][name="phone-number"]');
+  const remember = [...document.querySelectorAll('input[type="checkbox"]')].filter(visible);
+  const buttons = [...document.querySelectorAll('button')].filter(enabled).filter(x => (x.innerText || '').trim() === 'Next');
+  const exact = location.origin === 'https://api.vipps.no' && location.pathname === '/dwo-api-application/v1/deeplink/vippsgateway' && phone && phone.value.replace(/\D/g,'') === __PHONE__ && remember.length === 1 && remember[0].checked === false && buttons.length === 1;
+  const target = exact ? buttons[0] : null;
+  if (target) target.setAttribute('data-hermes-meal-planner-action', 'vipps-next');
+  const hit = requireHit ? document.elementFromPoint(__HIT_X__, __HIT_Y__) : target;
+  return JSON.stringify({ready:Boolean(target && hit && (hit === target || target.contains(hit)))});
+})()
+"""
+
+        def render(require_hit: bool, x: int = 0, y: int = 0) -> str:
+            return gate.replace("__REQUIRE_HIT__", "true" if require_hit else "false").replace("__HIT_X__", str(x)).replace("__HIT_Y__", str(y)).replace("__PHONE__", json.dumps(self.vipps_phone_number))
+
+        if self._eval(render(False)) != {"ready": True}:
+            raise HouseholdError("Vipps mobile request control changed; the outcome is uncertain; do not retry")
+        x, y = self._wait_for_checkout_hit(selector, render, "Vipps mobile request control changed or is obscured")
+        self._invoke("mouse", "move", str(x), str(y))
+        if self._eval(render(True, x, y)) != {"ready": True}:
+            raise HouseholdError("Vipps mobile request control changed or is obscured; the outcome is uncertain; do not retry")
+        self._invoke("mouse", "down")
+        self._invoke("mouse", "up")
+        for attempt in range(40):
+            sent = self._eval(r"""
+(() => {
+  const text = (document.body.innerText || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  return JSON.stringify({sent:location.origin === 'https://api.vipps.no' && location.pathname === '/dwo-api-application/v1/deeplink/vippsgateway' && /We've sent a payment request to/i.test(text) && /Open Vipps/i.test(text)});
+})()
+""")
+            if sent == {"sent": True}:
+                return
+            if attempt < 39:
+                self._sleep(0.25)
+        raise HouseholdError("Vipps did not confirm the mobile payment request; the outcome is uncertain; do not retry")
 
     @staticmethod
     def _find_box(value: Any) -> dict[str, float] | None:
@@ -1412,7 +1489,7 @@ __DELIVERY_BINDING__
             marked = self._eval(r"""
 (() => {
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
-  const wanted = WANTED;
+  const wanted = WANTED, expectedSuffix = EXPECTED_SUFFIX;
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
@@ -1425,14 +1502,19 @@ __DELIVERY_BINDING__
   if (buttons[0].getAttribute('aria-pressed') === 'true') {
     const slotPattern = /^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kroner,\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
     const selected = [...dialogs[0].querySelectorAll('button[aria-pressed="true"]')].filter(visible).filter(x => slotPattern.test(norm(x.getAttribute('aria-label') || x.innerText)));
-    if (selected.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length});
-    dismiss[0].setAttribute('data-hermes-meal-planner-action', 'delivery-dismiss');
-    return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true});
+    const keep = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
+      const parts = norm(x.getAttribute('aria-label') || x.innerText).match(/^Behold levering (?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(.+)$/i);
+      return parts && parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix;
+    });
+    if (selected.length !== 1 || keep.length > 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length});
+    const action = keep.length === 1 ? 'delivery-renew' : 'delivery-dismiss';
+    (keep[0] || dismiss[0]).setAttribute('data-hermes-meal-planner-action', action);
+    return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, renew_available:keep.length === 1});
   }
   buttons[0].setAttribute('data-hermes-meal-planner-action', 'delivery-slot');
   return JSON.stringify({ready:true, identity, authenticated:true, already_selected:false});
 })()
-""".replace("WANTED", json.dumps(slot_id, ensure_ascii=False)))
+""".replace("WANTED", json.dumps(slot_id, ensure_ascii=False)).replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
             if marked.get("identity") is not True:
                 raise HouseholdError("MENY delivery route changed")
             if marked.get("authenticated") is not True:
@@ -1443,12 +1525,15 @@ __DELIVERY_BINDING__
         else:
             raise HouseholdError("MENY delivery slot changed or is unavailable")
         if marked.get("already_selected") is True:
-            self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+            action = "delivery-renew" if marked.get("renew_available") is True else "delivery-dismiss"
+            self._invoke("click", f'[data-hermes-meal-planner-action="{action}"]')
             self._wait_delivery_picker_closed()
-            return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
-        self._invoke("click", '[data-hermes-meal-planner-action="delivery-slot"]')
-        for _ in range(20):
-            confirmation = self._eval(r"""
+            if marked.get("renew_available") is not True:
+                return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
+        else:
+            self._invoke("click", '[data-hermes-meal-planner-action="delivery-slot"]')
+            for _ in range(20):
+                confirmation = self._eval(r"""
 (() => {
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const wanted = WANTED;
@@ -1465,24 +1550,24 @@ __DELIVERY_BINDING__
   const buttons = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
     const label = norm(x.getAttribute('aria-label') || x.innerText);
     const parts = label.match(/^Bekreft levering (?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(.+)$/i);
-    return parts && parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix;
+    return label === 'Bekreft levering' || (parts && parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix);
   });
   if (allSelected.length !== 1 || selected.length !== 1 || buttons.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length, total_selected_count:allSelected.length});
   buttons[0].setAttribute('data-hermes-meal-planner-action', 'delivery-confirm');
   return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1});
 })()
 """.replace("WANTED", json.dumps(slot_id, ensure_ascii=False)).replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
-            if confirmation.get("identity") is not True:
-                raise HouseholdError("MENY delivery route changed")
-            if confirmation.get("authenticated") is not True:
-                raise HouseholdError("MENY login is required in the configured browser profile")
-            if confirmation.get("ready") is True:
-                break
-            self._sleep(0.25)
-        else:
-            raise HouseholdError("MENY delivery confirmation changed")
-        self._invoke("click", '[data-hermes-meal-planner-action="delivery-confirm"]')
-        self._wait_delivery_picker_closed()
+                if confirmation.get("identity") is not True:
+                    raise HouseholdError("MENY delivery route changed")
+                if confirmation.get("authenticated") is not True:
+                    raise HouseholdError("MENY login is required in the configured browser profile")
+                if confirmation.get("ready") is True:
+                    break
+                self._sleep(0.25)
+            else:
+                raise HouseholdError("MENY delivery confirmation changed")
+            self._invoke("click", '[data-hermes-meal-planner-action="delivery-confirm"]')
+            self._wait_delivery_picker_closed()
         self._open_delivery_picker()
         selected: dict[str, Any] = {}
         for _ in range(20):
@@ -1647,7 +1732,7 @@ __DELIVERY_BINDING__
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const main = [...document.querySelectorAll('main')].filter(visible);
   const url = new URL(location.href), orderId = url.pathname === '/kassen/bekreftelse' ? url.searchParams.get('orderid') : null;
-  const confirmed = main.length === 1 && /Takk for din bestilling|Bestillingen (?:er|ble) (?:mottatt|oppdatert)|Ordrebekreftelse/i.test(norm(main[0].innerText));
+  const confirmed = main.length === 1 && /Takk for (?:din )?bestilling(?:en)?|Bestillingen (?:er|ble) (?:mottatt|oppdatert)|Ordrebekreftelse/i.test(norm(main[0].innerText));
   return JSON.stringify({authenticated:authenticated.length === 1, order_id:confirmed && /^\d{1,20}$/.test(orderId || '') ? orderId : null});
 })()
 """)
@@ -1971,6 +2056,19 @@ __DELIVERY_BINDING__
         if payment.get("checked") is not True:
             self._click_checkout_control("vipps")
             self._sleep(0.25)
+        reservation = self._eval(r"""
+(() => {
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const main = [...document.querySelectorAll('main')].filter(visible);
+  const text = main.length === 1 ? norm(main[0].innerText) : '';
+  return JSON.stringify({ready:location.href === 'https://meny.no/kassen' && main.length === 1, lost:/Du har dessverre mistet din reservasjon/i.test(text)});
+})()
+""")
+        if reservation.get("ready") is not True:
+            raise HouseholdError("MENY checkout page changed")
+        if reservation.get("lost") is True:
+            raise HouseholdError("MENY delivery reservation expired; select the same delivery time again before checkout")
         payment_summary_script = r"""
 (() => {
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();

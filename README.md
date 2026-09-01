@@ -26,7 +26,9 @@ account. MENY checkout requires home delivery and Vipps: prepare verifies the
 unchanged cart, final reserved amount, delivery window and selected Vipps
 method; confirm starts one Vipps request; the user approves it on the phone;
 and reconcile verifies the exact new or updated MENY order. Anonymous MENY mode
-is not supported.
+is not supported. The private config's `vipps_phone_number` is entered only on
+Vipps's own handoff page; it is never returned by status, written to state or
+included in application logs.
 
 Before the payment click, each MENY line is bound to its exact product path.
 MENY's completed-order view omits those paths, so reconciliation uses the
@@ -92,7 +94,10 @@ hermes config set mcp_servers.oda-weekly.enabled false
 For MENY:
 
 ```sh
+read -r -s -p "Vipps mobile number (8 digits): " MEAL_PLANNER_VIPPS_PHONE_NUMBER
+export MEAL_PLANNER_VIPPS_PHONE_NUMBER
 ./install.sh --provider meny --household "My household"
+unset MEAL_PLANNER_VIPPS_PHONE_NUMBER
 ```
 
 The installer verifies Hermes's managed Python, `agent-browser`, non-snap
@@ -126,6 +131,11 @@ When a known pre-dispatch check stops checkout, the error states that no payment
 was dispatched. Under standing authorization, the agent may perform exactly one
 fresh submit for the same current request; this is distinct from retrying an
 uncertain dispatched action.
+
+If MENY reports that the selected delivery reservation has expired, list the
+same date and select the same window once to renew it before preparing checkout
+again. Selecting an already chosen window uses MENY's explicit keep-delivery
+control and verifies the renewed selection before payment.
 
 ## Provider login and startup
 

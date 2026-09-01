@@ -52,6 +52,9 @@ read after checkout returned an error. If checkout explicitly reports that no
 payment was dispatched and one fresh prepare is safe, a standing-authorized
 current request may use `submit` once more; do not describe the stopped attempt
 as sent. Never make more than that one pre-dispatch retry.
+If MENY says the delivery reservation expired, list the same date, select the
+same returned window once to renew it, and then retry the standing-authorized
+checkout once; this is a pre-dispatch recovery, not a payment retry.
 For recurring runs or recipe email,
 apply the exact cron or email action returned by the integration and do not
 invent a second scheduler, recipient, state store or duplicate-order check. A

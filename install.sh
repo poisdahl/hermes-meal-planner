@@ -8,7 +8,8 @@ Usage: ./install.sh --provider oda|meny --household NAME
 Installs one household into the standard non-root Hermes home. Set HERMES_HOME,
 HERMES_PYTHON, MEAL_PLANNER_AGENT_BROWSER, or MEAL_PLANNER_BROWSER_EXECUTABLE
 only when the standard locations do not apply. Set MEAL_PLANNER_NODE when an
-agent-browser wrapper needs a non-standard Node.js 24+ executable.
+agent-browser wrapper needs a non-standard Node.js 24+ executable. MENY also
+needs MEAL_PLANNER_VIPPS_PHONE_NUMBER, or an interactive private prompt.
 EOF
 }
 
@@ -42,6 +43,15 @@ if [[ "$provider" != "oda" && "$provider" != "meny" ]]; then
 fi
 if [[ -z "$household" || "$household" == *$'\n'* || "$household" == *$'\r'* ]]; then
   echo "--household must be a non-empty single-line name" >&2
+  exit 2
+fi
+vipps_phone_number="${MEAL_PLANNER_VIPPS_PHONE_NUMBER:-}"
+if [[ "$provider" == "meny" && -z "$vipps_phone_number" && -t 0 ]]; then
+  read -r -s -p "Vipps mobile number (8 digits): " vipps_phone_number
+  printf '\n'
+fi
+if [[ "$provider" == "meny" && ! "$vipps_phone_number" =~ ^[0-9]{8}$ ]]; then
+  echo "MENY requires an 8-digit MEAL_PLANNER_VIPPS_PHONE_NUMBER" >&2
   exit 2
 fi
 if ! command -v hermes >/dev/null 2>&1; then
@@ -167,9 +177,9 @@ mkdir -p "$private_root/state" "$private_root/browser/profile" "$browser_socket_
 chmod 700 "$private_root" "$private_root/state" "$private_root/browser" "$private_root/browser/profile" "$browser_socket_directory"
 
 if [[ -e "$config_path" ]]; then
-  "$python" -c 'from pathlib import Path; from service import config; import sys; value=config(Path(sys.argv[1])); value["provider"] == sys.argv[2] or sys.exit("existing config uses a different provider"); value["household"] == sys.argv[3] or sys.exit("existing config uses a different household")' "$config_path" "$provider" "$household"
+  "$python" -c 'from pathlib import Path; from service import config; import sys; value=config(Path(sys.argv[1])); value["provider"] == sys.argv[2] or sys.exit("existing config uses a different provider"); value["household"] == sys.argv[3] or sys.exit("existing config uses a different household"); value["provider"] != "meny" or value.get("vipps_phone_number") or sys.exit("existing MENY config is missing vipps_phone_number")' "$config_path" "$provider" "$household"
 else
-  PROVIDER="$provider" HOUSEHOLD="$household" "$python" - "$config_path" <<'PY'
+  PROVIDER="$provider" HOUSEHOLD="$household" VIPPS_PHONE_NUMBER="$vipps_phone_number" "$python" - "$config_path" <<'PY'
 import json
 import os
 from pathlib import Path
@@ -184,6 +194,8 @@ value = {
     "email_automation_profile": None,
     "profile_overrides": {},
 }
+if value["provider"] == "meny":
+    value["vipps_phone_number"] = os.environ["VIPPS_PHONE_NUMBER"]
 descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
     json.dump(value, handle, ensure_ascii=False, indent=2)

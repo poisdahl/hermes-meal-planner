@@ -1631,6 +1631,12 @@ def config(path: Path) -> dict[str, Any]:
     if confirmation_policy not in {"fresh", "standing"}:
         raise SystemExit("confirmation_policy must be fresh or standing")
     value["confirmation_policy"] = confirmation_policy
+    vipps_phone_number = value.get("vipps_phone_number")
+    if vipps_phone_number is not None and (
+        not isinstance(vipps_phone_number, str)
+        or re.fullmatch(r"[0-9]{8}", vipps_phone_number) is None
+    ):
+        raise SystemExit("vipps_phone_number must be an 8-digit Norwegian mobile number")
     profile = value.get("email_automation_profile")
     if profile is not None and (not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", profile)):
         raise SystemExit("invalid email automation profile")
@@ -1674,7 +1680,11 @@ def main() -> None:
             raise SystemExit("--tokens is required for provider oda")
         provider_client = OdaClient(args.tokens)
     else:
-        provider_client = MenyClient(**browser_arguments, cdp=args.browser_cdp)
+        provider_client = MenyClient(
+            **browser_arguments,
+            cdp=args.browser_cdp,
+            vipps_phone_number=settings.get("vipps_phone_number"),
+        )
     app = Application(
         StateStore(args.state, settings),
         provider_client,

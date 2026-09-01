@@ -315,6 +315,16 @@ class CoreTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "fresh or standing"):
                 config(path)
 
+    def test_household_config_accepts_only_an_eight_digit_private_vipps_number(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"household": "Test", "provider": "meny", "vipps_phone_number": "90000000"}), encoding="utf-8")
+            self.assertEqual(config(path)["vipps_phone_number"], "90000000")
+            for invalid in (90000000, "+4790000000", "9000 0000", "123"):
+                path.write_text(json.dumps({"household": "Test", "provider": "meny", "vipps_phone_number": invalid}), encoding="utf-8")
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(SystemExit, "8-digit"):
+                    config(path)
+
     def test_public_profile_defaults_to_seven_distinct_dinners_for_two(self):
         meals = DEFAULT_PROFILE["meals"]
         self.assertEqual(meals["people"], 2)
@@ -1223,6 +1233,7 @@ class MenyClientTests(unittest.TestCase):
             socket_directory="/private/socket",
             uid=1000,
             gid=1000,
+            vipps_phone_number="90000000",
         )
 
     def test_probe_requires_the_persistent_profile_to_be_logged_in(self):
@@ -1869,6 +1880,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("slotPattern.test", scripts[2])
         self.assertIn("allSelected.length !== 1", scripts[2])
         self.assertIn("parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix", scripts[2])
+        self.assertIn("label === 'Bekreft levering'", scripts[2])
         self.assertNotIn("startsWith('Bekreft levering ')", scripts[2])
         self.assertNotIn("endsWith(expectedSuffix)", scripts[2])
         client._sleep.assert_called_once_with(0.25)
@@ -1877,6 +1889,26 @@ class MenyClientTests(unittest.TestCase):
             mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
             mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
         ])
+
+    def test_already_selected_delivery_renews_an_expired_reservation_and_verifies_it(self):
+        client = self.client()
+        client._open_delivery_picker = mock.Mock()
+        client._eval = mock.Mock(side_effect=[
+            {"ready": True, "identity": True, "authenticated": True, "already_selected": True, "renew_available": True},
+            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
+        ])
+        client._invoke = mock.Mock(return_value={})
+        client._wait_delivery_picker_closed = mock.Mock()
+
+        result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+
+        self.assertEqual(result["selected"]["display"], "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        self.assertEqual(client._open_delivery_picker.call_count, 2)
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("click", '[data-hermes-meal-planner-action="delivery-renew"]'),
+            mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
+        ])
+        self.assertEqual(client._wait_delivery_picker_closed.call_count, 2)
 
     def test_already_selected_delivery_waits_until_the_dialog_is_closed(self):
         client = self.client()
@@ -2680,6 +2712,7 @@ class MenyClientTests(unittest.TestCase):
             step,
             {"unavailable": False, "dismiss": False},
             payment,
+            {"ready": True, "lost": False},
             disabled,
             {**disabled, "submit_enabled": True},
         ])
@@ -2693,7 +2726,7 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(review["summary"]["total"], 99.9)
         self.assertEqual(review["payment"], "vipps")
-        payment_summary_script = client._eval.call_args_list[3].args[0]
+        payment_summary_script = client._eval.call_args_list[4].args[0]
         self.assertIn("Endre dato og tid", payment_summary_script)
         self.assertIn("deliveryBinding", payment_summary_script)
         self.assertNotIn("new Set", payment_summary_script)
@@ -2704,6 +2737,37 @@ class MenyClientTests(unittest.TestCase):
             target_code=None,
         )
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.8), mock.call(0.6), mock.call(0.25)])
+
+    def test_checkout_review_stops_when_meny_reports_a_lost_delivery_reservation(self):
+        client = self.client()
+        client._verify_order_change = mock.Mock()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._click_checkout_control = mock.Mock()
+        client._eval = mock.Mock(side_effect=[
+            {
+                "ready": True,
+                "authenticated": True,
+                "step": 1,
+                "next_enabled": True,
+                "items": [{"product_id": MENY_PRODUCT, "identity": "Brokkoli 400g", "quantity": 1}],
+                "unavailable_items": [],
+                "active_order_change": False,
+            },
+            {"unavailable": False, "dismiss": False},
+            {"ready": True, "checked": True},
+            {"ready": True, "lost": True},
+        ])
+        cart = {
+            "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}],
+            "total": 19.9,
+            "delivery": {"display": "torsdag 3. sep. kl. 10:00-12:00"},
+        }
+
+        with self.assertRaisesRegex(HouseholdError, "reservation expired"):
+            client._review_checkout(cart)
+
+        self.assertEqual(client._eval.call_count, 4)
 
     def test_new_order_prompt_is_resolved_explicitly_and_bound_to_target_code(self):
         client = self.client()
@@ -2870,6 +2934,11 @@ class MenyClientTests(unittest.TestCase):
             "status": 200,
             "url": "https://platform-rest-prod.ngdata.no/api/order/payment",
         }]}))
+        self.assertTrue(vipps_dispatch_acknowledged({"requests": [{
+            "method": "POST",
+            "status": 200,
+            "url": "https://platform-rest-prod.ngdata.no/order/1300/7080000000000",
+        }]}))
         for request in (
             {"method": "GET", "status": 200, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"},
             {"method": "POST", "status": 500, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"},
@@ -2898,6 +2967,7 @@ class MenyClientTests(unittest.TestCase):
     def test_vipps_dispatch_waits_for_the_payment_response(self):
         client = self.client()
         client._sleep = mock.Mock()
+        client._complete_vipps_request = mock.Mock()
         client._invoke = mock.Mock(side_effect=[
             {"requests": [{"method": "POST", "status": None, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"}]},
             {"requests": [{"method": "POST", "status": 201, "url": "https://platform-rest-prod.ngdata.no/api/order/payment"}]},
@@ -2910,6 +2980,7 @@ class MenyClientTests(unittest.TestCase):
             mock.call("network", "requests"),
         ])
         client._sleep.assert_called_once_with(0.25)
+        client._complete_vipps_request.assert_called_once_with()
 
     def test_vipps_dispatch_without_acknowledgement_is_uncertain(self):
         client = self.client()
@@ -2921,6 +2992,55 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client._invoke.call_count, 40)
         self.assertEqual(client._sleep.call_count, 39)
+
+    def test_vipps_gateway_fills_the_private_number_and_waits_for_mobile_dispatch(self):
+        client = self.client()
+        client._sleep = mock.Mock()
+        client._eval = mock.Mock(side_effect=[
+            {"identity": True, "ready": True, "sent": False},
+            {"ready": True},
+            {"ready": True},
+            {"ready": True},
+            {"sent": True},
+        ])
+
+        def invoke(*arguments):
+            if arguments[:2] == ("get", "box"):
+                return {"box": {"x": 10, "y": 20, "width": 30, "height": 40}}
+            return {}
+
+        client._invoke = mock.Mock(side_effect=invoke)
+
+        client._complete_vipps_request()
+
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("fill", 'input[name="phone-number"]', "90000000"),
+            mock.call("scrollintoview", '[data-hermes-meal-planner-action="vipps-next"]'),
+            mock.call("get", "box", '[data-hermes-meal-planner-action="vipps-next"]'),
+            mock.call("mouse", "move", "25", "40"),
+            mock.call("mouse", "down"),
+            mock.call("mouse", "up"),
+        ])
+        self.assertTrue(all("Remember my number" not in str(call) for call in client._invoke.call_args_list))
+
+    def test_vipps_submit_requires_the_private_phone_before_the_meny_click(self):
+        client = self.client()
+        client.vipps_phone_number = None
+        client._invoke = mock.Mock()
+
+        with self.assertRaisesRegex(HouseholdError, "vipps_phone_number"):
+            client._click_checkout_submit({"summary": {"total": 1, "delivery": {"display": "delivery"}}}, mock.Mock())
+
+        client._invoke.assert_not_called()
+
+    def test_checkout_confirmation_accepts_the_live_meny_thank_you_heading(self):
+        client = self.client()
+        client._locked_operation = mock.MagicMock()
+        client._eval = mock.Mock(return_value={"authenticated": True, "order_id": "7631908"})
+
+        self.assertEqual(client.checkout_confirmation_order_id(), "7631908")
+        script = client._eval.call_args.args[0]
+        self.assertIn("(?:din )?bestilling(?:en)?", script)
 
     def test_checkout_submit_does_not_open_dispatch_fence_when_post_hover_gate_fails(self):
         client = self.client()
