@@ -278,11 +278,16 @@ def meny_order_card_status(value: Any) -> str:
     """Map the order card's explicit status line without reading delivery copy as status."""
 
     marker = " ".join(str(value or "").split()).casefold()
-    if marker in {"kansellert", "kansellert bestilling"}:
+    match = re.match(
+        r"^\S+\s+(kansellert bestilling|kansellert|levert|kan endres|bekreftet|mottatt)(?:\s|$)",
+        marker,
+    )
+    status = match[1] if match is not None else marker
+    if status in {"kansellert", "kansellert bestilling"}:
         return "cancelled"
-    if marker == "levert":
+    if status == "levert":
         return "delivered"
-    if marker in {"kan endres", "bekreftet", "mottatt"}:
+    if status in {"kan endres", "bekreftet", "mottatt"}:
         return "confirmed"
     return "unknown"
 
@@ -1984,7 +1989,8 @@ __DELIVERY_BINDING__
                     for value in result["orders"][:limit]:
                         order = dict(value)
                         if "status_marker" in order:
-                            order["status"] = meny_order_card_status(order.pop("status_marker"))
+                            marker = order.pop("status_marker")
+                            order["status"] = meny_order_card_status(marker or order.get("summary"))
                         orders.append(order)
                     return {"provider": "meny", "orders": orders}
                 if (

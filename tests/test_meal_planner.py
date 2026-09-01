@@ -2315,6 +2315,8 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(meny_order_card_status("KAN ENDRES"), "confirmed")
         self.assertEqual(meny_order_card_status("LEVERT"), "delivered")
         self.assertEqual(meny_order_card_status("KANSELLERT BESTILLING"), "cancelled")
+        self.assertEqual(meny_order_card_status("TEST KAN ENDRES Levert på døren"), "confirmed")
+        self.assertEqual(meny_order_card_status("TEST LEVERT Levert på døren"), "delivered")
         self.assertEqual(meny_order_card_status("Levert på døren"), "unknown")
 
     def test_order_list_maps_and_removes_the_private_dom_status_marker(self):
@@ -2335,7 +2337,7 @@ class MenyClientTests(unittest.TestCase):
             "orders": [{
                 "order_number": "99990001",
                 "id": "99990001",
-                "status_marker": "KAN ENDRES",
+                "status_marker": None,
                 "summary": "TEST KAN ENDRES Levert på døren Leveres torsdag",
             }],
         })
