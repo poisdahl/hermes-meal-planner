@@ -2,6 +2,7 @@
   "instance": "my-agent",
   "household": "My household",
   "provider": "meny",
+  "confirmation_policy": "fresh",
   "email_automation_profile": null,
   "profile_overrides": {}
 }

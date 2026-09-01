@@ -46,12 +46,12 @@ def rpc(operation: str, **arguments: Any) -> dict[str, Any]:
 server = MCPServer(
     "meal-planner",
     description="Products, recipes, cart, menus and settings for this household's configured grocery provider.",
-    instructions="Use the current household and configured provider only. Follow returned checkout instructions; checkout, existing-order payment and cancellation require one fresh explicit confirmation after prepare.",
-    version="1.3.0",
+    instructions="Use the current household and configured provider only. Follow the configured confirmation_policy. With fresh, prepare and ask once. With standing, a clear current request to order, pay or cancel may use submit or cancel_submit without asking again. A preview or prepare request never submits. Never retry an uncertain result; MENY still requires provider-enforced Vipps approval.",
+    version="1.4.0",
 )
 
 
-@server.tool(description="Show the local household name, masked integration state, schedule and guarded scheduled-checkout setting.")
+@server.tool(description="Show the local household name, masked integration state, confirmation policy, schedule and guarded scheduled-checkout setting.")
 def meal_planner_status() -> dict[str, Any]:
     return rpc("status")
 
@@ -88,8 +88,8 @@ def meal_planner_delivery(action: Literal["list", "select"] = "list", dates: lis
     return rpc("delivery", action=action, dates=dates, address_id=address_id, slot_id=slot_id, unattended=unattended)
 
 
-@server.tool(description="List/read orders; start or abort an exact existing-order change; or prepare, confirm and reconcile cancellation. After change_begin, use normal cart/delivery tools and protected checkout. Cancellation needs the fresh exact confirmation_id from cancel_prepare.")
-def meal_planner_orders(action: Literal["list", "get", "change_begin", "change_abort", "cancel_prepare", "cancel_confirm", "cancel_reconcile"] = "list", order_id: str | None = None, confirmation_id: str | None = None, limit: int = 10) -> dict[str, Any]:
+@server.tool(description="List/read orders; start or abort an exact existing-order change; or prepare, confirm, submit under configured standing authorization, and reconcile cancellation. After change_begin, use normal cart/delivery tools and protected checkout. Use cancel_submit only for a clear current cancellation request when confirmation_policy is standing.")
+def meal_planner_orders(action: Literal["list", "get", "change_begin", "change_abort", "cancel_prepare", "cancel_confirm", "cancel_submit", "cancel_reconcile"] = "list", order_id: str | None = None, confirmation_id: str | None = None, limit: int = 10) -> dict[str, Any]:
     return rpc("orders", action=action, order_id=order_id, confirmation_id=confirmation_id, limit=limit)
 
 
@@ -98,13 +98,13 @@ def meal_planner_menu(action: Literal["get", "save", "clear"] = "get", menu: dic
     return rpc("menu", action=action, menu=menu)
 
 
-@server.tool(description="Show/update/disable the weekly run and guarded scheduled-checkout settings. A scheduled run always stops for fresh user confirmation.")
+@server.tool(description="Show/update/disable the weekly run and guarded scheduled-checkout settings. A scheduled checkout stops for confirmation under fresh policy and may dispatch within its total/delivery guards under standing policy.")
 def meal_planner_schedule(action: Literal["show", "update", "disable", "set_cron_job"] = "show", changes: dict[str, Any] | None = None, cron_job_id: str | None = None) -> dict[str, Any]:
     return rpc("schedule", action=action, changes=changes or {}, cron_job_id=cron_job_id)
 
 
-@server.tool(description="Prepare, confirm or reconcile a new checkout or an active existing-order change, or prepare one due scheduled occurrence. Every path stops for fresh explicit confirmation before confirm; for MENY then wait for the user to approve Vipps and call reconcile. Never retry an uncertain result.")
-def meal_planner_checkout(action: Literal["prepare", "confirm", "reconcile", "auto"] = "prepare", occurrence: str | None = None, confirmation_id: str | None = None) -> dict[str, Any]:
+@server.tool(description="Prepare, confirm, submit under configured standing authorization, or reconcile a new checkout or active existing-order change; auto handles a due scheduled occurrence. Use submit only for a clear current order/pay/checkout request when confirmation_policy is standing. A preview or prepare request never submits. For MENY, wait for provider-enforced Vipps approval and then reconcile. Never retry an uncertain result.")
+def meal_planner_checkout(action: Literal["prepare", "confirm", "submit", "reconcile", "auto"] = "prepare", occurrence: str | None = None, confirmation_id: str | None = None) -> dict[str, Any]:
     return rpc("checkout", action=action, occurrence=occurrence, confirmation_id=confirmation_id)
 
 

@@ -396,6 +396,7 @@ class Application:
         self.store = store
         self.oda = provider_client
         self.provider = str(store.config.get("provider") or "oda").casefold()
+        self.confirmation_policy = str(store.config.get("confirmation_policy") or "fresh").casefold()
         self.browser = provider_client if self.provider == "meny" else browser
         self.browser_lock = threading.Lock()
         self.email_automation_profile = str(store.config.get("email_automation_profile") or "").strip()
@@ -467,7 +468,10 @@ class Application:
                     if pending_status not in UNRESOLVED_CHECKOUT_STATUSES:
                         safe = not state.get("pending_checkout") and not state.get("pending_cancellation") and not state.get("order_change")
                         self._refresh_integration(deadline, allow_recovery=safe)
-            return masked_status(self.store.read(), self.integration)
+            return {
+                **masked_status(self.store.read(), self.integration),
+                "confirmation_policy": self.confirmation_policy,
+            }
         if operation == "profile":
             return self._profile(request)
         if operation == "favorites":
@@ -800,7 +804,7 @@ class Application:
 
     def _orders(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "list")
-        cancellation_deadline = time.monotonic() + CANCELLATION_OPERATION_TIMEOUT if action in {"cancel_prepare", "cancel_confirm", "cancel_reconcile"} else None
+        cancellation_deadline = time.monotonic() + CANCELLATION_OPERATION_TIMEOUT if action in {"cancel_prepare", "cancel_confirm", "cancel_reconcile", "cancel_submit"} else None
         if action == "list":
             return self.oda.call("get_orders", {"page": 1, "size": int(request.get("limit", 10))}, deadline=request.get("_deadline"), allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("get_orders", {"page": 1, "size": int(request.get("limit", 10))})
         order_id = str(request.get("order_id") or "")
@@ -940,7 +944,20 @@ class Application:
                     if canonical(state.get("pending_cancellation")) != canonical(baseline):
                         raise HouseholdError("cancellation state changed while preparing the summary")
                     state["pending_cancellation"] = {"order_id": order_id, "confirmation_id": confirmation_id, "before": current, "browser": browser, "expires_at": (now() + timedelta(minutes=30)).isoformat(), "status": "awaiting_confirmation"}
-                return {"available": True, "confirmation_id": confirmation_id, "order": current["order"], "tracking": current["tracking"], "consequence": browser.get("consequence"), "next": "Ask once for explicit confirmation of this exact order, then pass this confirmation_id unchanged."}
+                return {
+                    "available": True,
+                    "confirmation_id": confirmation_id,
+                    "confirmation_policy": self.confirmation_policy,
+                    "confirmation_required": self.confirmation_policy == "fresh",
+                    "order": current["order"],
+                    "tracking": current["tracking"],
+                    "consequence": browser.get("consequence"),
+                    "next": (
+                        "Ask once for explicit confirmation of this exact order, then pass this confirmation_id unchanged."
+                        if self.confirmation_policy == "fresh"
+                        else "Standing authorization is configured. If the current request explicitly asks to cancel this order, call cancel_confirm now with this confirmation_id; do not ask again."
+                    ),
+                }
         if action == "cancel_confirm":
             return self._cancel(
                 action,
@@ -948,6 +965,19 @@ class Application:
                 order_id=order_id,
                 confirmation_id=str(request.get("confirmation_id") or ""),
             )
+        if action == "cancel_submit":
+            if self.confirmation_policy != "standing":
+                raise HouseholdError("standing authorization is not configured; prepare cancellation and ask for confirmation")
+            prepared = self._orders({"action": "cancel_prepare", "order_id": order_id})
+            if prepared.get("available") is not True:
+                return prepared
+            result = self._cancel(
+                "cancel_confirm",
+                cancellation_deadline,
+                order_id=order_id,
+                confirmation_id=str(prepared.get("confirmation_id") or ""),
+            )
+            return {**result, "authorized_summary": {"order": prepared.get("order"), "tracking": prepared.get("tracking"), "consequence": prepared.get("consequence")}}
         if action == "cancel_reconcile":
             return self._cancel(action, cancellation_deadline)
         raise HouseholdError("unknown order action")
@@ -1058,6 +1088,12 @@ class Application:
             return self._checkout_prepare(deadline)
         if action == "confirm":
             return self._checkout_confirm(deadline, str(request.get("confirmation_id") or ""))
+        if action == "submit":
+            if self.confirmation_policy != "standing":
+                raise HouseholdError("standing authorization is not configured; prepare checkout and ask for confirmation")
+            prepared = self._checkout_prepare(deadline)
+            result = self._checkout_confirm(deadline, prepared["confirmation_id"])
+            return {**result, "authorized_summary": prepared["summary"], "order_change": prepared.get("order_change")}
         if action == "reconcile":
             return self._checkout_reconcile(deadline)
         if action == "auto":
@@ -1091,6 +1127,16 @@ class Application:
                 with self.store.locked() as state:
                     state["occurrences"][occurrence]["status"] = "needs_input"
                 return {"completed": False, "reason": "delivery does not match preference", "summary": prepared["summary"]}
+            if self.confirmation_policy == "standing":
+                try:
+                    result = self._checkout_confirm(deadline, prepared["confirmation_id"])
+                except HouseholdError:
+                    with self.store.locked() as state:
+                        state["occurrences"][occurrence]["status"] = "needs_input"
+                    raise
+                with self.store.locked() as state:
+                    state["occurrences"][occurrence]["status"] = "completed" if result.get("confirmed") is True else "needs_input"
+                return {**result, "completed": result.get("confirmed") is True, "authorized_summary": prepared["summary"]}
             with self.store.locked() as state:
                 state["occurrences"][occurrence]["status"] = "awaiting_confirmation"
             return {
@@ -1188,12 +1234,18 @@ class Application:
                 }
         return {
             "confirmation_id": confirmation_id,
+            "confirmation_policy": self.confirmation_policy,
+            "confirmation_required": self.confirmation_policy == "fresh",
             "summary": {
                 **deepcopy(summary),
                 **({"payment": payment_display} if self.provider == "oda" else {}),
             },
             "order_change": {"order_id": order_change["order_id"], "kind": order_change.get("kind")} if order_change else None,
-            "next": "Ask once for an explicit final confirmation of this unchanged cart, total, delivery and target order, then pass this confirmation_id unchanged.",
+            "next": (
+                "Ask once for an explicit final confirmation of this unchanged cart, total, delivery and target order, then pass this confirmation_id unchanged."
+                if self.confirmation_policy == "fresh"
+                else "Standing authorization is configured. If the current request explicitly asks to order, pay or check out, call checkout confirm now with this confirmation_id; do not ask again."
+            ),
         }
 
     def _checkout_confirm(self, deadline: float | None = None, confirmation_id: str = "") -> dict[str, Any]:
@@ -1573,6 +1625,10 @@ def config(path: Path) -> dict[str, Any]:
     if provider not in {"oda", "meny"}:
         raise SystemExit("provider must be oda or meny")
     value["provider"] = provider
+    confirmation_policy = str(value.get("confirmation_policy") or "fresh").casefold()
+    if confirmation_policy not in {"fresh", "standing"}:
+        raise SystemExit("confirmation_policy must be fresh or standing")
+    value["confirmation_policy"] = confirmation_policy
     profile = value.get("email_automation_profile")
     if profile is not None and (not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", profile)):
         raise SystemExit("invalid email automation profile")

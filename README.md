@@ -16,7 +16,7 @@ through Hermes Agent or with `profile_overrides` in your private configuration.
 | Favorites, recurring items and menus | Local | Local |
 | Delivery, orders and cancellation | Yes | Yes |
 | Add goods / move an existing order | Yes | Yes |
-| Protected checkout | Prepare, confirm, reconcile | Vipps prepare, confirm, mobile approval, reconcile |
+| Protected checkout | Fresh or standing authorization, reconcile | Fresh or standing authorization, Vipps mobile approval, reconcile |
 
 MENY does not document a public customer API or MCP service. Its adapter uses
 the logged-in website's visible controls and exact `meny.no` product paths
@@ -106,6 +106,16 @@ set `HERMES_PYTHON`, `MEAL_PLANNER_AGENT_BROWSER` or
 `MEAL_PLANNER_BROWSER_EXECUTABLE` while running the installer; their resolved
 values are saved in the private systemd unit.
 
+New installations use `"confirmation_policy": "fresh"`: Hermes prepares the
+exact checkout or cancellation summary and asks once before dispatch. An owner
+who wants a standing authorization can set the private config to
+`"confirmation_policy": "standing"` and restart the service. A clear current
+request to order, pay, check out or cancel then proceeds without another Hermes
+confirmation, including when the freshly prepared amount changes. Requests to
+preview or prepare remain read-only. This setting does not bypass a provider,
+Vipps, bank, device or platform approval, and an uncertain result is never
+retried automatically.
+
 ## Provider login and startup
 
 Before starting the service, run the exact provider-login command printed by
@@ -170,8 +180,8 @@ requests, in a safe order, are:
 - “Save this product as a favorite” or “Add this every two weeks,” using an
   exact product returned by search.
 - “Schedule a weekly Thursday draft,” or explicitly configure a guarded
-  scheduled-checkout maximum and delivery preference. The due run still stops
-  for fresh confirmation of its exact summary.
+  scheduled-checkout maximum and delivery preference. The due run follows the
+  configured confirmation policy after its amount and delivery guards pass.
 - “Search for broccoli,” “Find a salmon recipe,” “Show my cart,” and “Add one
   of that exact broccoli to this week's order.”
 - “List delivery windows,” select one exact window, then list, inspect or track
@@ -179,10 +189,11 @@ requests, in a safe order, are:
 - “Add one of that product to order …” or move that order's delivery. The agent
   begins the exact order change before using the ordinary cart or delivery
   tool.
-- “Prepare checkout” or “Prepare cancellation for order …”. Review the returned
-  cart, amount, delivery and consequence, then confirm the fresh summary in the
-  next message. MENY then waits for one Vipps approval and reconciles; an
-  expired or uncertain result is never blindly retried.
+- “Prepare checkout” or “Prepare cancellation for order …” only prepares a
+  summary. Under `fresh`, review it and confirm in the next message. Under
+  `standing`, a direct “order/pay/check out/cancel” request submits without a
+  second Hermes question. MENY then waits for one Vipps approval and
+  reconciliation; an expired or uncertain result is never blindly retried.
 - “Send a test recipe email for order …” or run the returned delivery-day
   action. Test email never consumes the due job, and due email is marked sent
   only after successful delivery.
@@ -202,13 +213,15 @@ account.
 
 The service stores one private JSON state file with atomic writes and a local
 Unix socket. Reversible cart changes follow clear user requests. Checkout,
-payment-bearing changes to one exact existing order, and cancellation use a
-freshly prepared summary and one exact confirmation ID; an uncertain final
-action is reconciled and never retried automatically. Adding goods preserves
+payment-bearing changes to one exact existing order, and cancellation always
+bind the action to one freshly prepared summary. The `fresh` policy also
+requires its exact confirmation ID; the `standing` policy lets the same clear
+request authorize immediate submission. An uncertain final action is
+reconciled and never retried automatically. Adding goods preserves
 the existing order identity. Moving a delivery window is kept separate from an
 Oda addition cart so the target cannot become ambiguous. A scheduled checkout
-never dispatches payment without a fresh user confirmation, and MENY also
-requires the user's Vipps approval.
+dispatches only after its configured total and delivery guards, and only under
+standing authorization; MENY always requires the user's Vipps approval.
 
 Hermes cron owns weekly wakeups and delivery-day email wakeups; this package
 only stores settings and returns the next cron or email action. The email flow

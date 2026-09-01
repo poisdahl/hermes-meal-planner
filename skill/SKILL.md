@@ -35,13 +35,17 @@ that exact order change first,
 then use the ordinary cart or delivery tool and protected checkout. Do not
 reproduce integration rules or maintain household data in the skill or chat.
 
-Ordinary reversible changes can follow a clear request. Checkout, payment for
-an existing-order change, and cancellation require a fresh explicit confirmation
-of the exact summary returned by the integration. Ask once, act only on the next
-clearly confirming message while that summary is unchanged, and pass the exact
-`confirmation_id` returned by prepare. MENY then waits for the user to approve
-the exact Vipps request before reconciliation. Never submit or retry while that
-approval or any result is uncertain; use the integration's reconciliation path.
+Ordinary reversible changes can follow a clear request. Follow the
+`confirmation_policy` returned by status or prepare. Under `fresh`, checkout,
+payment for an existing-order change, and cancellation require one explicit
+confirmation of the exact prepared summary; pass its unchanged `confirmation_id`
+only after the next clearly confirming message. Under `standing`, a clear current
+request to order, pay, check out or cancel is already authorized: use checkout
+`submit` or order `cancel_submit` and do not ask again, including when the freshly
+prepared amount differs. A request only to preview or prepare never submits.
+MENY still waits for the user to approve the provider-enforced Vipps request
+before reconciliation. Never submit or retry while that approval or any result
+is uncertain; use the integration's reconciliation path.
 For recurring runs or recipe email,
 apply the exact cron or email action returned by the integration and do not
 invent a second scheduler, recipient, state store or duplicate-order check. A

@@ -180,6 +180,7 @@ value = {
     "instance": "my-agent",
     "household": os.environ["HOUSEHOLD"],
     "provider": os.environ["PROVIDER"],
+    "confirmation_policy": "fresh",
     "email_automation_profile": None,
     "profile_overrides": {},
 }

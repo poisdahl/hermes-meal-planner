@@ -307,9 +307,13 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(json.dumps({"household": "Test"}), encoding="utf-8")
-            self.assertEqual(config(path)["provider"], "oda")
-            path.write_text(json.dumps({"household": "Test", "provider": "MENY"}), encoding="utf-8")
+            self.assertEqual(config(path), {"household": "Test", "provider": "oda", "confirmation_policy": "fresh"})
+            path.write_text(json.dumps({"household": "Test", "provider": "MENY", "confirmation_policy": "STANDING"}), encoding="utf-8")
             self.assertEqual(config(path)["provider"], "meny")
+            self.assertEqual(config(path)["confirmation_policy"], "standing")
+            path.write_text(json.dumps({"household": "Test", "confirmation_policy": "never"}), encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "fresh or standing"):
+                config(path)
 
     def test_public_profile_defaults_to_seven_distinct_dinners_for_two(self):
         meals = DEFAULT_PROFILE["meals"]
@@ -3073,6 +3077,9 @@ class FlowTests(unittest.TestCase):
         self.app.handle({"operation": "cart", "action": "change", "operations": [{"productId": 10, "quantity": 1}]})
         self.assertEqual([call[0] for call in self.oda.calls[-2:]], ["product_search", "manipulate_cart"])
 
+    def test_status_exposes_the_fresh_confirmation_default(self):
+        self.assertEqual(self.app.handle({"operation": "status"})["confirmation_policy"], "fresh")
+
     def test_menu_clear_discards_only_an_expired_pre_dispatch_checkout(self):
         current = datetime(2026, 9, 1, tzinfo=timezone.utc)
         with self.store.locked() as state:
@@ -3197,6 +3204,28 @@ class FlowTests(unittest.TestCase):
                     "changes": {"enabled": True, "maximum_total": 1000, "delivery": {"weekday": "Saturday"}, "auto_checkout": True},
                 })
             self.assertFalse(store.read()["schedule"]["auto_checkout"])
+
+    def test_standing_authorization_submits_meny_without_a_second_agent_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny", "confirmation_policy": "standing"})
+            provider = FakeMeny()
+            app = Application(store, provider, self.browser)
+
+            result = app.handle({"operation": "checkout", "action": "submit"})
+
+            self.assertTrue(result["awaiting_user_payment"])
+            self.assertEqual(result["authorized_summary"]["total"], 40.0)
+            self.assertEqual(provider.checkout_clicks, 1)
+            self.assertEqual(store.read()["pending_checkout"]["status"], "awaiting_user_payment")
+
+    def test_fresh_policy_rejects_direct_submit_before_provider_calls(self):
+        self.oda.calls.clear()
+
+        with self.assertRaisesRegex(HouseholdError, "standing authorization is not configured"):
+            self.app.handle({"operation": "checkout", "action": "submit"})
+
+        self.assertEqual(self.oda.calls, [])
+        self.assertEqual(self.browser.checkout_clicks, 0)
 
     def test_expired_checkout_confirmation_is_removed_before_any_provider_call(self):
         started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
@@ -3778,6 +3807,8 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(prepared["summary"]["total"], 35.0)
         self.assertEqual(prepared["summary"]["delivery"]["address"], "Eksempelveien 1")
         self.assertEqual(prepared["summary"]["payment"], "•••• 1234")
+        self.assertTrue(prepared["confirmation_required"])
+        self.assertEqual(prepared["confirmation_policy"], "fresh")
         self.assertEqual(self.browser.review_deadlines, [250.0])
         with mock.patch("service.time.monotonic", return_value=20.0):
             result = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
@@ -3815,6 +3846,21 @@ class FlowTests(unittest.TestCase):
 
         self.assertTrue(result["confirmed"])
         self.assertEqual(self.browser.checkout_clicks, 1)
+
+    def test_standing_authorization_submits_oda_with_the_fresh_amount(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "confirmation_policy": "standing"})
+            oda = FakeOda()
+            browser = FakeBrowser()
+            browser.oda = oda
+            app = Application(store, oda, browser)
+
+            result = app.handle({"operation": "checkout", "action": "submit"})
+
+            self.assertTrue(result["confirmed"])
+            self.assertEqual(result["authorized_summary"]["total"], 35.0)
+            self.assertEqual(browser.checkout_clicks, 1)
+            self.assertIsNone(store.read()["pending_checkout"])
         self.assertIsNone(self.store.read()["pending_checkout"])
 
     def test_checkout_reconcile_rejects_ambiguous_compact_delivery_hours(self):
@@ -3990,6 +4036,21 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(result["cancelled"])
         self.assertEqual(self.browser.cancel_clicks, 1)
         self.assertEqual(self.store.read()["email_jobs"][0]["status"], "cancelled")
+
+    def test_standing_authorization_cancels_without_a_second_agent_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "confirmation_policy": "standing"})
+            oda = FakeOda()
+            browser = FakeBrowser()
+            browser.oda = oda
+            app = Application(store, oda, browser)
+
+            result = app.handle({"operation": "orders", "action": "cancel_submit", "order_id": "old"})
+
+            self.assertTrue(result["cancelled"])
+            self.assertEqual(result["authorized_summary"]["tracking"]["status"], "paid_and_modifiable")
+            self.assertEqual(browser.cancel_clicks, 1)
+            self.assertIsNone(store.read()["pending_cancellation"])
 
     def test_stale_cancellation_confirmation_cannot_cancel_a_newer_prepare(self):
         first = self.app.handle({"operation": "orders", "action": "cancel_prepare", "order_id": "order-a"})
@@ -4284,6 +4345,28 @@ class FlowTests(unittest.TestCase):
             self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
         self.assertEqual(self.browser.checkout_clicks, 0)
         self.assertEqual(self.store.read()["occurrences"]["2026-W36"]["status"], "awaiting_confirmation")
+
+    def test_auto_checkout_dispatches_inside_guards_under_standing_authorization(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "confirmation_policy": "standing"})
+            oda = FakeOda()
+            browser = FakeBrowser()
+            browser.oda = oda
+            app = Application(store, oda, browser)
+            app.handle({"operation": "schedule", "action": "update", "changes": {"enabled": True, "maximum_total": 100.0, "delivery": {"weekday": "Saturday"}, "auto_checkout": True}})
+            app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+            with (
+                mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)),
+                mock.patch("service.time.monotonic", return_value=10.0),
+            ):
+                result = app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+            self.assertTrue(result["completed"])
+            self.assertTrue(result["confirmed"])
+            self.assertEqual(result["authorized_summary"]["total"], 35.0)
+            self.assertEqual(browser.checkout_clicks, 1)
+            self.assertEqual(store.read()["occurrences"]["2026-W36"]["status"], "completed")
 
     def test_auto_prepare_failure_needs_input_instead_of_staying_started(self):
         self.app.handle({"operation": "schedule", "action": "update", "changes": {"enabled": True, "maximum_total": 100.0, "delivery": {"weekday": "Saturday"}, "auto_checkout": True}})
