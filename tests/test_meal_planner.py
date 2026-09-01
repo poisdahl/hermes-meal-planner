@@ -2247,6 +2247,39 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(result["orders"], [{"order_number": "99990001"}])
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.5), mock.call(0.25)])
 
+    def test_order_list_reloads_one_ready_cached_page_without_a_fresh_search(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        cached = {"ready": True, "authenticated": True, "orders": [{"order_number": "99990001"}]}
+        completed = {"requests": [{
+            "method": "GET",
+            "status": 200,
+            "url": "https://platform-rest-prod.ngdata.no/api/order/search/store/user",
+        }]}
+        client._invoke = mock.Mock(side_effect=[
+            {},
+            *([{"requests": []}] * 4),
+            {},
+            {},
+            completed,
+        ])
+        client._eval = mock.Mock(return_value=cached)
+
+        result = client._get_orders(10)
+
+        self.assertEqual(result["orders"], [{"order_number": "99990001"}])
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("network", "requests", "--clear"),
+            *([mock.call("network", "requests", "--filter", "/api/order/search/")] * 4),
+            mock.call("network", "requests", "--clear"),
+            mock.call("reload"),
+            mock.call("network", "requests", "--filter", "/api/order/search/"),
+        ])
+        self.assertEqual(client._sleep.call_args_list, [
+            mock.call(0.25), mock.call(0.25), mock.call(0.25), mock.call(0.5), mock.call(0.5),
+        ])
+
     def test_cart_read_polls_a_transient_missing_cart_control(self):
         client = self.client()
         valid = {

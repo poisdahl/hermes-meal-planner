@@ -1837,23 +1837,37 @@ __DELIVERY_BINDING__
 """
         result: dict[str, Any] = {}
         search_completed = False
-        for attempt in range(40):
-            if not search_completed:
-                search_completed = meny_order_search_completed(
-                    self._invoke("network", "requests", "--filter", "/api/order/search/")
-                )
-                if search_completed:
-                    self._sleep(0.5)
-            result = self._eval(script)
-            if result.get("authenticated") is True and search_completed and result.get("ready") is True and isinstance(result.get("orders"), list):
-                break
-            if attempt < 39:
-                self._sleep(0.25)
-        else:
-            if result.get("authenticated") is not True:
-                raise HouseholdError("MENY login is required in the configured browser profile")
-            raise HouseholdError("MENY orders did not finish rendering")
-        return {"provider": "meny", "orders": result["orders"][:limit]}
+        for phase in range(2):
+            for attempt in range(40):
+                if not search_completed:
+                    search_completed = meny_order_search_completed(
+                        self._invoke("network", "requests", "--filter", "/api/order/search/")
+                    )
+                    if search_completed:
+                        self._sleep(0.5)
+                result = self._eval(script)
+                if result.get("authenticated") is True and search_completed and result.get("ready") is True and isinstance(result.get("orders"), list):
+                    return {"provider": "meny", "orders": result["orders"][:limit]}
+                if (
+                    phase == 0
+                    and attempt >= 3
+                    and not search_completed
+                    and result.get("authenticated") is True
+                    and result.get("ready") is True
+                    and isinstance(result.get("orders"), list)
+                ):
+                    break
+                if attempt < 39:
+                    self._sleep(0.25)
+            if phase == 0 and not search_completed and result.get("authenticated") is True:
+                self._invoke("network", "requests", "--clear")
+                self._invoke("reload")
+                self._sleep(0.5)
+                continue
+            break
+        if result.get("authenticated") is not True:
+            raise HouseholdError("MENY login is required in the configured browser profile")
+        raise HouseholdError("MENY orders did not finish rendering")
 
     def _get_order(self, order_id: str) -> dict[str, Any]:
         path = f"/profil/nettbutikk/bestilling/{order_id}"
