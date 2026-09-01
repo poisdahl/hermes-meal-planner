@@ -413,6 +413,7 @@ class MenyClient:
         self.deadline: float | None = None
         self.recovery_allowed = False
         self._recovery_consumed = False
+        self._shell_target: str | None = None
 
     def probe(self, *, deadline: float | None = None, allow_recovery: bool = False) -> dict[str, Any]:
         with self._locked_operation(MENY_READ_TIMEOUT, deadline, allow_recovery=allow_recovery):
@@ -435,14 +436,12 @@ class MenyClient:
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   return JSON.stringify({
-    ready: location.origin === 'https://meny.no' && Boolean(document.querySelector('main')),
+    ready: location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash && Boolean(document.querySelector('main')),
     authenticated: authenticated.length === 1
   });
 })()
 """)
-            if result.get("ready") is not True:
-                raise HouseholdError("MENY website is unavailable")
-            if result.get("authenticated") is True:
+            if result.get("ready") is True and result.get("authenticated") is True:
                 return
             self._sleep(0.25)
         if result.get("ready") is not True:
@@ -2400,6 +2399,13 @@ __DELIVERY_BINDING__
         parsed = urlparse(url)
         if parsed.scheme != "https" or parsed.netloc != "meny.no":
             raise HouseholdError("MENY browser URL is invalid")
+        self._shell_target = url
+        if self.cdp is not None and self._cdp_primed:
+            try:
+                if self._site_shell_ready():
+                    return
+            except HouseholdError:
+                pass
         data = self._invoke("open", url)
         actual = urlparse(str(data.get("url") or ""))
         if actual.scheme != "https" or actual.netloc != "meny.no" or actual.path.rstrip("/") != parsed.path.rstrip("/"):
@@ -2453,10 +2459,21 @@ __DELIVERY_BINDING__
         raise HouseholdError("MENY website did not finish rendering")
 
     def _site_shell_ready(self) -> bool:
+        expected = None
+        if self._shell_target is not None:
+            parsed = urlparse(self._shell_target)
+            expected = {
+                "origin": f"{parsed.scheme}://{parsed.netloc}",
+                "pathname": parsed.path or "/",
+                "search": f"?{parsed.query}" if parsed.query else "",
+                "hash": f"#{parsed.fragment}" if parsed.fragment else "",
+            }
         result = self._eval(r"""
 (() => {
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const expected = __EXPECTED__;
+  const target = expected === null || (location.origin === expected.origin && location.pathname === expected.pathname && location.search === expected.search && location.hash === expected.hash);
   const account = [...document.querySelectorAll('header button')].filter(visible).filter(button => {
     const label = norm(button.getAttribute('aria-label') || button.innerText);
     return label.startsWith('Brukermeny') || label === 'Logg inn';
@@ -2464,11 +2481,11 @@ __DELIVERY_BINDING__
   const propsKey = account.length === 1 && Object.keys(account[0]).find(key => key.startsWith('__reactProps$'));
   const props = propsKey && account[0][propsKey];
   return JSON.stringify({
-    dom_ready: location.origin === 'https://meny.no' && Boolean(document.querySelector('main')) && account.length === 1,
+    dom_ready: target && location.origin === 'https://meny.no' && Boolean(document.querySelector('main')) && account.length === 1,
     hydrated: Boolean(props && typeof props.onClick === 'function')
   });
 })()
-""")
+""".replace("__EXPECTED__", json.dumps(expected)))
         return result.get("dom_ready") is True and result.get("hydrated") is True
 
     @contextmanager

@@ -1267,11 +1267,12 @@ class MenyClientTests(unittest.TestCase):
         client._open = mock.Mock()
         client._sleep = mock.Mock()
         client._eval = mock.Mock(side_effect=[
-            {"ready": True, "authenticated": False},
+            {"ready": False, "authenticated": False},
             {"ready": True, "authenticated": True},
         ])
         client._require_login()
         client._sleep.assert_called_once_with(0.25)
+        self.assertIn("location.pathname === '/varer'", client._eval.call_args_list[0].args[0])
 
     def test_login_check_allows_a_slow_authenticated_shell_to_hydrate(self):
         client = self.client()
@@ -1587,6 +1588,28 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(events, ["open", "reload", "ready"])
         self.assertTrue(client._cdp_primed)
 
+    def test_primed_cdp_navigation_does_not_reload_the_same_ready_target(self):
+        client = MenyClient(
+            instance="test",
+            binary="agent-browser",
+            executable="/usr/bin/chromium",
+            profile="/private/profile",
+            home="/private/home",
+            socket_directory="/private/socket",
+            uid=1000,
+            gid=1000,
+            cdp="http://127.0.0.1:9224",
+        )
+        client._cdp_primed = True
+        client._site_shell_ready = mock.Mock(return_value=True)
+        client._invoke = mock.Mock()
+
+        client._open("https://meny.no/varer")
+
+        self.assertEqual(client._shell_target, "https://meny.no/varer")
+        client._site_shell_ready.assert_called_once_with()
+        client._invoke.assert_not_called()
+
     def test_readiness_evaluation_failure_gets_one_bounded_reload(self):
         client = self.client()
         client._invoke = mock.Mock(side_effect=[{"url": "https://meny.no/varer"}, {}])
@@ -1625,7 +1648,7 @@ class MenyClientTests(unittest.TestCase):
         client.recovery_allowed = True
         client._invoke = mock.Mock(side_effect=lambda command, *_args: {"url": "https://meny.no/varer"} if command == "open" else {})
         client._invoke_once = mock.Mock(return_value={"url": "https://meny.no/varer"})
-        client._site_shell_ready = mock.Mock(side_effect=[False] * 61 + [True])
+        client._site_shell_ready = mock.Mock(side_effect=[False] * 62 + [True])
         client._recover_cdp_tab = mock.Mock(return_value=True)
         client._sleep = mock.Mock()
 
@@ -1635,7 +1658,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertTrue(client._recovery_consumed)
         client._invoke_once.assert_called_once_with("open", "https://meny.no/varer")
         self.assertEqual([call.args[0] for call in client._invoke.call_args_list], ["open", "reload", "reload", "reload", "reload"])
-        self.assertEqual(client._site_shell_ready.call_count, 62)
+        self.assertEqual(client._site_shell_ready.call_count, 63)
         self.assertTrue(client._cdp_primed)
 
     def test_protected_cdp_navigation_does_not_replace_an_unhydrated_target(self):
@@ -1661,10 +1684,11 @@ class MenyClientTests(unittest.TestCase):
             client._open("https://meny.no/varer")
 
         client._recover_cdp_tab.assert_not_called()
-        self.assertEqual(client._site_shell_ready.call_count, 61)
+        self.assertEqual(client._site_shell_ready.call_count, 62)
 
     def test_visible_ssr_shell_is_not_ready_until_react_handler_is_hydrated(self):
         client = self.client()
+        client._shell_target = "https://meny.no/varer"
         client._eval = mock.Mock(return_value={"dom_ready": True, "hydrated": False})
         self.assertFalse(client._site_shell_ready())
         client._eval.return_value = {"dom_ready": True, "hydrated": True}
@@ -1672,6 +1696,7 @@ class MenyClientTests(unittest.TestCase):
         script = client._eval.call_args.args[0]
         self.assertIn("__reactProps$", script)
         self.assertIn("typeof props.onClick === 'function'", script)
+        self.assertIn('"pathname": "/varer"', script)
 
     def test_cart_change_uses_exact_catalog_path_and_delta(self):
         client = self.client()
