@@ -2433,9 +2433,10 @@ __DELIVERY_BINDING__
         if parsed.scheme != "https" or parsed.netloc != "meny.no":
             raise HouseholdError("MENY browser URL is invalid")
         self._shell_target = url
-        if self.cdp is not None and self._cdp_primed:
+        if self.cdp is not None:
             try:
                 if self._site_shell_ready():
+                    self._cdp_primed = True
                     return
             except HouseholdError:
                 pass
@@ -2444,31 +2445,26 @@ __DELIVERY_BINDING__
         if actual.scheme != "https" or actual.netloc != "meny.no" or actual.path.rstrip("/") != parsed.path.rstrip("/"):
             raise HouseholdError("MENY browser left the requested page")
         self._sleep(0.5)
-        force_reload = self.cdp is not None and not self._cdp_primed
-        def wait_for_shell(force: bool) -> bool:
-            if not force:
-                try:
-                    if self._site_shell_ready():
-                        return True
-                except HouseholdError:
-                    pass
-            # A newly started Chromium can finish navigation before MENY's
-            # Next.js shell has loaded every dynamic chunk. The authenticated
-            # site can require a second bounded reload after account state
-            # settles. Reloading changes no cookies, storage, cart or account.
-            for _reload in range(3):
-                self._invoke("reload")
-                for _ in range(20):
-                    self._sleep(0.5)
+        def wait_for_shell() -> bool:
+            # First let the requested route finish its own navigation. A
+            # premature reload can otherwise cancel a still-loading route.
+            # If MENY's Next.js shell remains unhydrated, try at most three
+            # bounded reloads; these change no cookies, cart or account data.
+            for attempt in range(4):
+                if attempt:
+                    self._invoke("reload")
+                for poll in range(20):
                     try:
                         if self._site_shell_ready():
                             self._cdp_primed = True
                             return True
                     except HouseholdError:
                         pass
+                    if poll < 19:
+                        self._sleep(0.5)
             return False
 
-        if wait_for_shell(force_reload):
+        if wait_for_shell():
             return
         # A hydrated target can later hang while Chromium and the persisted
         # authenticated profile remain healthy. Reads may replace that one
@@ -2485,7 +2481,7 @@ __DELIVERY_BINDING__
                     if actual.scheme != "https" or actual.netloc != "meny.no" or actual.path.rstrip("/") != parsed.path.rstrip("/"):
                         raise HouseholdError("MENY browser left the requested page")
                     self._sleep(0.5)
-                    if wait_for_shell(True):
+                    if wait_for_shell():
                         return
                 finally:
                     self.recovery_allowed = previous_recovery

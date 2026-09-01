@@ -1568,7 +1568,7 @@ class MenyClientTests(unittest.TestCase):
             second.chmod(0o755)
             self.assertIsNone(client._browser_daemon_executable())
 
-    def test_first_cdp_navigation_reloads_before_readiness_evaluation(self):
+    def test_first_cdp_navigation_waits_for_the_requested_target_before_reload(self):
         client = MenyClient(
             instance="test",
             binary="agent-browser",
@@ -1582,10 +1582,11 @@ class MenyClientTests(unittest.TestCase):
         )
         events = []
         client._invoke = mock.Mock(side_effect=lambda command, *args: events.append(command) or ({"url": "https://meny.no/varer"} if command == "open" else {}))
-        client._site_shell_ready = mock.Mock(side_effect=lambda: events.append("ready") or True)
+        readiness = iter([False, True])
+        client._site_shell_ready = mock.Mock(side_effect=lambda: events.append("ready") or next(readiness))
         client._sleep = mock.Mock()
         client._open("https://meny.no/varer")
-        self.assertEqual(events, ["open", "reload", "ready"])
+        self.assertEqual(events, ["ready", "open", "ready"])
         self.assertTrue(client._cdp_primed)
 
     def test_primed_cdp_navigation_does_not_reload_the_same_ready_target(self):
@@ -1610,16 +1611,16 @@ class MenyClientTests(unittest.TestCase):
         client._site_shell_ready.assert_called_once_with()
         client._invoke.assert_not_called()
 
-    def test_readiness_evaluation_failure_gets_one_bounded_reload(self):
+    def test_readiness_evaluation_failure_can_settle_before_a_reload(self):
         client = self.client()
         client._invoke = mock.Mock(side_effect=[{"url": "https://meny.no/varer"}, {}])
         client._site_shell_ready = mock.Mock(side_effect=[HouseholdError("evaluation timed out"), True])
         client._sleep = mock.Mock()
         client._open("https://meny.no/varer")
-        self.assertEqual(client._invoke.call_args_list, [mock.call("open", "https://meny.no/varer"), mock.call("reload")])
+        self.assertEqual(client._invoke.call_args_list, [mock.call("open", "https://meny.no/varer")])
         self.assertEqual(client._site_shell_ready.call_count, 2)
 
-    def test_authenticated_shell_can_recover_on_a_second_bounded_reload(self):
+    def test_authenticated_shell_can_recover_after_one_bounded_reload(self):
         client = self.client()
         client._invoke = mock.Mock(side_effect=[{"url": "https://meny.no/varer"}, {}, {}])
         client._site_shell_ready = mock.Mock(side_effect=[False] * 21 + [True])
@@ -1627,7 +1628,6 @@ class MenyClientTests(unittest.TestCase):
         client._open("https://meny.no/varer")
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("open", "https://meny.no/varer"),
-            mock.call("reload"),
             mock.call("reload"),
         ])
         self.assertEqual(client._site_shell_ready.call_count, 22)
@@ -1648,7 +1648,7 @@ class MenyClientTests(unittest.TestCase):
         client.recovery_allowed = True
         client._invoke = mock.Mock(side_effect=lambda command, *_args: {"url": "https://meny.no/varer"} if command == "open" else {})
         client._invoke_once = mock.Mock(return_value={"url": "https://meny.no/varer"})
-        client._site_shell_ready = mock.Mock(side_effect=[False] * 62 + [True])
+        client._site_shell_ready = mock.Mock(side_effect=[False] * 81 + [True])
         client._recover_cdp_tab = mock.Mock(return_value=True)
         client._sleep = mock.Mock()
 
@@ -1657,8 +1657,8 @@ class MenyClientTests(unittest.TestCase):
         client._recover_cdp_tab.assert_called_once_with()
         self.assertTrue(client._recovery_consumed)
         client._invoke_once.assert_called_once_with("open", "https://meny.no/varer")
-        self.assertEqual([call.args[0] for call in client._invoke.call_args_list], ["open", "reload", "reload", "reload", "reload"])
-        self.assertEqual(client._site_shell_ready.call_count, 63)
+        self.assertEqual([call.args[0] for call in client._invoke.call_args_list], ["open", "reload", "reload", "reload"])
+        self.assertEqual(client._site_shell_ready.call_count, 82)
         self.assertTrue(client._cdp_primed)
 
     def test_protected_cdp_navigation_does_not_replace_an_unhydrated_target(self):
@@ -1684,7 +1684,7 @@ class MenyClientTests(unittest.TestCase):
             client._open("https://meny.no/varer")
 
         client._recover_cdp_tab.assert_not_called()
-        self.assertEqual(client._site_shell_ready.call_count, 62)
+        self.assertEqual(client._site_shell_ready.call_count, 81)
 
     def test_visible_ssr_shell_is_not_ready_until_react_handler_is_hydrated(self):
         client = self.client()
