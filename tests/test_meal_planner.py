@@ -1941,6 +1941,8 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("allSelected.length !== 1", scripts[2])
         self.assertIn("parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix", scripts[2])
         self.assertIn("label === 'Bekreft levering'", scripts[2])
+        self.assertIn("label.match(/^Behold levering", scripts[2])
+        self.assertIn("confirm.length + keep.length !== 1", scripts[2])
         self.assertNotIn("startsWith('Bekreft levering ')", scripts[2])
         self.assertNotIn("endsWith(expectedSuffix)", scripts[2])
         client._sleep.assert_called_once_with(0.25)

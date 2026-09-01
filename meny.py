@@ -1659,14 +1659,19 @@ __DELIVERY_BINDING__
   const slotPattern = /^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kroner,\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
   const allSelected = [...dialogs[0].querySelectorAll('button[aria-pressed="true"]')].filter(visible).filter(x => slotPattern.test(norm(x.getAttribute('aria-label') || x.innerText)));
   const selected = allSelected.filter(x => norm(x.getAttribute('aria-label') || x.innerText) === wanted);
-  const buttons = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
+  const confirm = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
     const label = norm(x.getAttribute('aria-label') || x.innerText);
     const parts = label.match(/^Bekreft levering (?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(.+)$/i);
     return label === 'Bekreft levering' || (parts && parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix);
   });
-  if (allSelected.length !== 1 || selected.length !== 1 || buttons.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length, total_selected_count:allSelected.length});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'delivery-confirm');
-  return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1});
+  const keep = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
+    const label = norm(x.getAttribute('aria-label') || x.innerText);
+    const parts = label.match(/^Behold levering (?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(.+)$/i);
+    return parts && parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix;
+  });
+  if (allSelected.length !== 1 || selected.length !== 1 || confirm.length + keep.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length, total_selected_count:allSelected.length});
+  (confirm[0] || keep[0]).setAttribute('data-hermes-meal-planner-action', 'delivery-confirm');
+  return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1, keeping_existing:keep.length === 1});
 })()
 """.replace("WANTED", json.dumps(slot_id, ensure_ascii=False)).replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
                 if confirmation.get("identity") is not True:
