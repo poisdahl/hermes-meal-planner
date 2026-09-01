@@ -25,8 +25,10 @@ and treat returned capabilities and next actions as authoritative. If a likely
 ingredient search is empty, try one shorter common product synonym and use only
 products actually returned. Pass each returned `product_id` unchanged into cart
 or list tools; it may be numeric or a full provider path, so never shorten it.
-To add goods
-to an existing order or move its delivery, start that exact order change first,
+For a favorite or recurring add, pass search's `product_id` and `name` through
+the tool's top-level `product_id` and `product_name` arguments; do not construct
+an item object. To add goods to an existing order or move its delivery, start
+that exact order change first,
 then use the ordinary cart or delivery tool and protected checkout. Do not
 reproduce integration rules or maintain household data in the skill or chat.
 

@@ -60,14 +60,16 @@ def meal_planner_profile(action: Literal["show", "update", "reset", "set_email"]
     return rpc("profile", action=action, changes=changes or {}, paths=paths, email=email)
 
 
-@server.tool(description="List, add or remove local favorites. Favorites are never automatically added to the cart.")
-def meal_planner_favorites(action: Literal["list", "add", "remove"] = "list", item: dict[str, Any] | None = None, product_id: str | None = None) -> dict[str, Any]:
-    return rpc("favorites", action=action, item=item or {}, product_id=product_id)
+@server.tool(description="List, add or remove local favorites. For add, pass the exact product_id and product name returned by search as top-level arguments. Favorites never change the cart.")
+def meal_planner_favorites(action: Literal["list", "add", "remove"] = "list", product_id: str | None = None, product_name: str | None = None, quantity: int = 1) -> dict[str, Any]:
+    item = {"product_id": product_id, "product_name": product_name, "quantity": quantity} if action == "add" else {}
+    return rpc("favorites", action=action, item=item, product_id=product_id)
 
 
-@server.tool(description="List, add, remove or calculate due fixed items. Intervals support every N weeks or months.")
-def meal_planner_recurring(action: Literal["list", "add", "remove", "due"] = "list", item: dict[str, Any] | None = None, product_id: str | None = None, date: str | None = None) -> dict[str, Any]:
-    return rpc("recurring", action=action, item=item or {}, product_id=product_id, date=date)
+@server.tool(description="List, add, remove or calculate due fixed items. For add, pass search's exact product_id and name plus a schedule with every, unit weeks/months and optional anchor.")
+def meal_planner_recurring(action: Literal["list", "add", "remove", "due"] = "list", product_id: str | None = None, product_name: str | None = None, quantity: int = 1, schedule: dict[str, Any] | None = None, date: str | None = None) -> dict[str, Any]:
+    item = {"product_id": product_id, "product_name": product_name, "quantity": quantity, "schedule": schedule} if action == "add" else {}
+    return rpc("recurring", action=action, item=item, product_id=product_id, date=date)
 
 
 @server.tool(description="Search real products or recipes at the configured provider, or read its often-bought signal when available. This tool does not write.")

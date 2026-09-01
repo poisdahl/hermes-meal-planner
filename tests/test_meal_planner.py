@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -241,6 +242,44 @@ class FakeMeny(FakeOda):
 
 
 class CoreTests(unittest.TestCase):
+    def test_mcp_saved_item_tools_build_the_internal_item_shape(self):
+        class FakeMCPServer:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def tool(self, **_kwargs):
+                return lambda function: function
+
+        mcp = types.ModuleType("mcp")
+        mcp_server_package = types.ModuleType("mcp.server")
+        mcp_server_module = types.ModuleType("mcp.server.mcpserver")
+        mcp_server_module.MCPServer = FakeMCPServer
+        spec = importlib.util.spec_from_file_location("meal_planner_mcp_server_test", CORE / "mcp_server.py")
+        module = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {
+            "mcp": mcp,
+            "mcp.server": mcp_server_package,
+            "mcp.server.mcpserver": mcp_server_module,
+        }):
+            spec.loader.exec_module(module)
+        module.rpc = mock.Mock(return_value={})
+        module.meal_planner_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
+        module.rpc.assert_called_with(
+            "favorites",
+            action="add",
+            item={"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 2},
+            product_id=MENY_PRODUCT,
+        )
+        schedule = {"unit": "weeks", "every": 2, "anchor": "2026-W36"}
+        module.meal_planner_recurring("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=1, schedule=schedule)
+        module.rpc.assert_called_with(
+            "recurring",
+            action="add",
+            item={"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1, "schedule": schedule},
+            product_id=MENY_PRODUCT,
+            date=None,
+        )
+
     def test_unix_socket_is_assigned_to_the_configured_group(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "service.sock"
