@@ -264,6 +264,7 @@ class CoreTests(unittest.TestCase):
             spec.loader.exec_module(module)
         self.assertEqual(module.rpc_timeout("cart", {"action": "change"}), 300)
         self.assertEqual(module.rpc_timeout("cart", {"action": "get"}), 120)
+        self.assertEqual(module.rpc_timeout("delivery", {"action": "list"}), 300)
         module.rpc = mock.Mock(return_value={})
         module.meal_planner_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
         module.rpc.assert_called_with(
@@ -2965,6 +2966,16 @@ class FlowTests(unittest.TestCase):
             app = Application(store, provider, self.browser)
             with mock.patch("service.time.monotonic", return_value=10.0):
                 app.handle({"operation": "orders", "action": "list"})
+            self.assertEqual(provider.call.call_args.kwargs["deadline"], 190.0)
+
+    def test_meny_delivery_reads_use_the_full_order_deadline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            provider.call = mock.Mock(wraps=provider.call)
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.time.monotonic", return_value=10.0):
+                app.handle({"operation": "delivery", "action": "list"})
             self.assertEqual(provider.call.call_args.kwargs["deadline"], 190.0)
 
     def test_cart_change_accepts_intuitive_action_and_snake_case_product_id(self):

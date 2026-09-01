@@ -486,7 +486,7 @@ class Application:
             or (operation == "email" and action == "due")
         )
         if meny_read:
-            timeout = MENY_ORDER_TIMEOUT if operation == "orders" else MENY_READ_TIMEOUT
+            timeout = MENY_ORDER_TIMEOUT if operation in {"delivery", "orders"} else MENY_READ_TIMEOUT
             deadline = time.monotonic() + timeout
             with self._browser_operation(deadline):
                 state = self.store.read()
@@ -1530,7 +1530,10 @@ class Server:
                 response = {"ok": True, "result": self.app.handle(request)}
             except (HouseholdError, json.JSONDecodeError) as exc:
                 response = {"ok": False, "error": str(exc)}
-            connection.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode())
+            try:
+                connection.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode())
+            except (BrokenPipeError, ConnectionResetError):
+                return
 
 
 def config(path: Path) -> dict[str, Any]:

@@ -375,7 +375,7 @@ class MenyClient:
         }
         if tool not in supported:
             raise HouseholdError("MENY operation is not supported")
-        timeout = MENY_CART_TIMEOUT if tool == "manipulate_cart" else MENY_ORDER_TIMEOUT if tool in {"get_orders", "get_order", "order_tracking", "select_delivery_slot"} else MENY_READ_TIMEOUT
+        timeout = MENY_CART_TIMEOUT if tool == "manipulate_cart" else MENY_ORDER_TIMEOUT if tool in {"get_delivery_slots", "select_delivery_slot", "get_orders", "get_order", "order_tracking"} else MENY_READ_TIMEOUT
         with self._locked_operation(timeout, deadline, allow_recovery=allow_recovery):
             self._require_login()
             if tool == "product_search":

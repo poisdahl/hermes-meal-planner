@@ -18,8 +18,8 @@ SOCKET = Path(os.environ.get("MEAL_PLANNER_SOCKET", "/run/meal-planner/service.s
 def rpc_timeout(operation: str, arguments: dict[str, Any]) -> int:
     order_operation = operation == "orders"
     cart_change = operation == "cart" and arguments.get("action") != "get"
-    protected_delivery = operation == "delivery" and arguments.get("action") == "select"
-    return 300 if operation == "checkout" or order_operation or cart_change or protected_delivery else 120
+    delivery_operation = operation == "delivery"
+    return 300 if operation == "checkout" or order_operation or cart_change or delivery_operation else 120
 
 
 def rpc(operation: str, **arguments: Any) -> dict[str, Any]:
