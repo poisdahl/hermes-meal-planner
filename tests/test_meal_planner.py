@@ -39,7 +39,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, _DeliveryReservationError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -3147,10 +3147,13 @@ class MenyClientTests(unittest.TestCase):
             "end": "08:00",
             "selected": True,
         }]})
-        client._select_delivery_slot = mock.Mock(return_value={
-            "provider": "meny",
-            "selected": {"slot_id": "3. september klokka 07:00 til 08:00"},
-        })
+        client._select_delivery_slot = mock.Mock(side_effect=[
+            _DeliveryReservationError("temporary MENY reservation failure"),
+            {
+                "provider": "meny",
+                "selected": {"slot_id": "3. september klokka 07:00 til 08:00"},
+            },
+        ])
         step = {
             "ready": True,
             "authenticated": True,
@@ -3187,7 +3190,32 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(review["summary"]["delivery"]["display"], "torsdag 3. september Kl. 07:00-08:00")
         client._delivery_slots.assert_called_once_with()
-        client._select_delivery_slot.assert_called_once_with("3. september klokka 07:00 til 08:00")
+        self.assertEqual(client._select_delivery_slot.call_args_list, [
+            mock.call("3. september klokka 07:00 til 08:00"),
+            mock.call("3. september klokka 07:00 til 08:00"),
+        ])
+
+    def test_checkout_review_stops_after_two_delivery_reservation_failures(self):
+        client = self.client()
+        client._delivery_slots = mock.Mock(return_value={"slots": [{
+            "slot_id": "3. september klokka 07:00 til 08:00",
+            "date": "2026-09-03",
+            "start": "07:00",
+            "end": "08:00",
+            "selected": True,
+        }]})
+        client._select_delivery_slot = mock.Mock(side_effect=_DeliveryReservationError("MENY reservation failed"))
+        cart = {
+            "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 13.9}],
+            "count": 1,
+            "total": 13.9,
+            "delivery": None,
+        }
+
+        with self.assertRaisesRegex(_DeliveryReservationError, "reservation failed"):
+            client._review_checkout(cart)
+
+        self.assertEqual(client._select_delivery_slot.call_count, 2)
 
     def test_checkout_review_stops_when_meny_reports_a_lost_delivery_reservation(self):
         client = self.client()

@@ -93,6 +93,10 @@ class _BrowserTransportError(HouseholdError):
     pass
 
 
+class _DeliveryReservationError(HouseholdError):
+    pass
+
+
 def normalize_browser_cdp(value: Any) -> str | None:
     if value is None or not str(value).strip():
         return None
@@ -1729,7 +1733,7 @@ __DELIVERY_BINDING__
                 return
             if attempt < 119:
                 self._sleep(0.25)
-        raise HouseholdError(
+        raise _DeliveryReservationError(
             "MENY did not acknowledge the delivery reservation; inspect the selected slot before retrying"
         )
 
@@ -2268,7 +2272,10 @@ __DELIVERY_BINDING__
         if expected.get("delivery") is None:
             selected_delivery = meny_selected_delivery(self._delivery_slots().get("slots"))
             if selected_delivery is not None:
-                self._select_delivery_slot(selected_delivery["slot_id"])
+                try:
+                    self._select_delivery_slot(selected_delivery["slot_id"])
+                except _DeliveryReservationError:
+                    self._select_delivery_slot(selected_delivery["slot_id"])
             expected["delivery"] = selected_delivery
         if expected.get("delivery") is None:
             raise HouseholdError("select a MENY delivery slot before checkout")
