@@ -3536,6 +3536,22 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(provider.checkout_clicks, 1)
             self.assertEqual(store.read()["pending_checkout"]["status"], "awaiting_user_payment")
 
+    def test_standing_submit_reuses_one_fresh_prepared_meny_checkout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny", "confirmation_policy": "standing"})
+            provider = FakeMeny()
+            provider.call = mock.Mock(wraps=provider.call)
+            app = Application(store, provider, self.browser)
+            prepared = app.handle({"operation": "checkout", "action": "prepare"})
+            provider.call.reset_mock()
+
+            result = app.handle({"operation": "checkout", "action": "submit"})
+
+            self.assertTrue(result["awaiting_user_payment"])
+            self.assertEqual(result["authorized_summary"], prepared["summary"])
+            self.assertEqual([call.args[0] for call in provider.call.call_args_list], ["get_cart"])
+            self.assertEqual(provider.checkout_clicks, 1)
+
     def test_fresh_policy_rejects_direct_submit_before_provider_calls(self):
         self.oda.calls.clear()
 

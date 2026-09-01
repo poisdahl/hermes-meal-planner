@@ -1108,7 +1108,16 @@ class Application:
         if action == "submit":
             if self.confirmation_policy != "standing":
                 raise HouseholdError("standing authorization is not configured; prepare checkout and ask for confirmation")
-            prepared = self._checkout_prepare(deadline)
+            with self.store.locked() as state:
+                pending = deepcopy(state.get("pending_checkout"))
+            if pending and pending.get("status") == "awaiting_confirmation" and not expired_awaiting_confirmation(pending):
+                prepared = {
+                    "confirmation_id": pending["confirmation_id"],
+                    "summary": deepcopy(pending["summary"]),
+                    "order_change": deepcopy(pending.get("order_change")),
+                }
+            else:
+                prepared = self._checkout_prepare(deadline)
             result = self._checkout_confirm(deadline, prepared["confirmation_id"])
             return {**result, "authorized_summary": prepared["summary"], "order_change": prepared.get("order_change")}
         if action == "reconcile":
