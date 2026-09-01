@@ -3643,6 +3643,14 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("https://api.vipps.no", script)
         self.assertIn("/dwo-api-application/v1/deeplink/vippsgateway", script)
 
+    def test_checkout_confirmation_treats_a_fresh_browser_tab_as_unconfirmed(self):
+        client = self.client()
+        client._locked_operation = mock.MagicMock()
+        client._eval = mock.Mock(return_value={"authenticated": False, "blank": True, "vipps_gateway": False, "order_id": None})
+
+        self.assertIsNone(client.checkout_confirmation_order_id())
+        self.assertIn("about:blank", client._eval.call_args.args[0])
+
     def test_checkout_submit_does_not_open_dispatch_fence_when_post_hover_gate_fails(self):
         client = self.client()
         review = {"summary": {"total": 1234.56, "delivery": {"display": "delivery"}}, "target_order_code": None}

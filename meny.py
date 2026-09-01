@@ -2030,13 +2030,14 @@ __DELIVERY_BINDING__
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const main = [...document.querySelectorAll('main')].filter(visible);
   const url = new URL(location.href), orderId = url.pathname === '/kassen/bekreftelse' ? url.searchParams.get('orderid') : null;
+  const blank = url.href === 'about:blank';
   const vippsGateway = url.origin === 'https://api.vipps.no' && url.pathname === '/dwo-api-application/v1/deeplink/vippsgateway';
   const confirmed = main.length === 1 && /Takk for (?:din )?bestilling(?:en)?|Bestillingen (?:er|ble) (?:mottatt|oppdatert)|Ordrebekreftelse/i.test(norm(main[0].innerText));
-  return JSON.stringify({authenticated:authenticated.length === 1, vipps_gateway:vippsGateway, order_id:confirmed && /^\d{1,20}$/.test(orderId || '') ? orderId : null});
+  return JSON.stringify({authenticated:authenticated.length === 1, blank, vipps_gateway:vippsGateway, order_id:confirmed && /^\d{1,20}$/.test(orderId || '') ? orderId : null});
 })()
 """)
             if result.get("authenticated") is not True:
-                if result.get("vipps_gateway") is True and result.get("order_id") is None:
+                if (result.get("blank") is True or result.get("vipps_gateway") is True) and result.get("order_id") is None:
                     return None
                 raise HouseholdError("MENY login is required in the configured browser profile")
             order_id = result.get("order_id")
