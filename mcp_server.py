@@ -51,7 +51,7 @@ server = MCPServer(
 )
 
 
-@server.tool(description="Show the local household name, masked integration state, confirmation policy, schedule and guarded scheduled-checkout setting.")
+@server.tool(description="Show the local household name, masked integration state, confirmation policy, schedule, and explicit pending checkout/cancellation/order-change status.")
 def meal_planner_status() -> dict[str, Any]:
     return rpc("status")
 

@@ -292,6 +292,9 @@ def masked_status(state: Mapping[str, Any], integration: Mapping[str, Any]) -> d
         "favorites": len(state["favorites"]),
         "recurring_items": len(state["recurring_items"]),
         "menu_phase": (state.get("menu") or {}).get("phase"),
+        "pending_checkout_status": (state.get("pending_checkout") or {}).get("status"),
+        "pending_cancellation_status": (state.get("pending_cancellation") or {}).get("status"),
+        "order_change_status": (state.get("order_change") or {}).get("status"),
     }
 
 

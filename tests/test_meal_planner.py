@@ -3080,7 +3080,17 @@ class FlowTests(unittest.TestCase):
         self.assertEqual([call[0] for call in self.oda.calls[-2:]], ["product_search", "manipulate_cart"])
 
     def test_status_exposes_the_fresh_confirmation_default(self):
-        self.assertEqual(self.app.handle({"operation": "status"})["confirmation_policy"], "fresh")
+        status = self.app.handle({"operation": "status"})
+        self.assertEqual(status["confirmation_policy"], "fresh")
+        self.assertIsNone(status["pending_checkout_status"])
+        self.assertIsNone(status["pending_cancellation_status"])
+        self.assertIsNone(status["order_change_status"])
+
+        with self.store.locked() as state:
+            state["pending_checkout"] = {"status": "uncertain", "private": "not returned"}
+        status = self.app.handle({"operation": "status"})
+        self.assertEqual(status["pending_checkout_status"], "uncertain")
+        self.assertNotIn("private", status)
 
     def test_menu_clear_discards_only_an_expired_pre_dispatch_checkout(self):
         current = datetime(2026, 9, 1, tzinfo=timezone.utc)

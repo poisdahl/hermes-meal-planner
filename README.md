@@ -169,6 +169,10 @@ unattended server, enable the user's systemd
 lingering according to the distribution's policy so user services start before
 interactive login.
 
+Status reports pending checkout, cancellation and order-change status
+explicitly without exposing their private payloads, so an uncertain protected
+operation cannot be mistaken for an idle household.
+
 The socket is mode `0660`, assigned to the configured group, and placed under
 the private meal-planner directory by the installer. Config, OAuth tokens,
 state and browser profiles stay outside Git. Use `service.py --help` only for
