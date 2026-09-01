@@ -1286,8 +1286,8 @@ class MenyClientTests(unittest.TestCase):
         client._eval = mock.Mock(return_value={"ready": True, "authenticated": False})
         with self.assertRaisesRegex(HouseholdError, "login is required"):
             client.probe()
-        self.assertEqual(client._eval.call_count, 60)
-        self.assertEqual(client._sleep.call_count, 60)
+        self.assertEqual(client._eval.call_count, 120)
+        self.assertEqual(client._sleep.call_count, 120)
         client._eval.return_value = {"ready": True, "authenticated": True}
         probe = client.probe()
         self.assertEqual(probe["provider"], "meny")
@@ -1310,14 +1310,14 @@ class MenyClientTests(unittest.TestCase):
         client._open = mock.Mock()
         client._sleep = mock.Mock()
         client._eval = mock.Mock(side_effect=[
-            *([{"ready": True, "authenticated": False}] * 32),
+            *([{"ready": True, "authenticated": False}] * 72),
             {"ready": True, "authenticated": True},
         ])
 
         client._require_login()
 
-        self.assertEqual(client._eval.call_count, 33)
-        self.assertEqual(client._sleep.call_count, 32)
+        self.assertEqual(client._eval.call_count, 73)
+        self.assertEqual(client._sleep.call_count, 72)
 
     def test_cdp_is_restricted_to_an_explicit_loopback_endpoint(self):
         self.assertEqual(normalize_browser_cdp("http://127.0.0.1:9224"), "http://127.0.0.1:9224")
