@@ -1850,6 +1850,23 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("Brukermeny", scripts[-1])
         self.assertIn("dialogs.length !== 0", scripts[1])
 
+    def test_delivery_picker_tolerates_a_slow_native_dialog(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._prepare_search = mock.Mock()
+        client._sleep = mock.Mock()
+        client._eval = mock.Mock(side_effect=[
+            {"ready": True, "identity": True, "authenticated": True},
+            *([{"ready": False, "identity": True, "authenticated": True}] * 20),
+            {"ready": True, "identity": True, "authenticated": True},
+        ])
+        client._invoke = mock.Mock(return_value={})
+
+        client._open_delivery_picker()
+
+        self.assertEqual(client._sleep.call_count, 20)
+        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-open"]')
+
     def test_delivery_picker_stops_before_click_on_route_or_login_loss(self):
         for state, message in (
             ({"ready": False, "identity": False, "authenticated": True}, "route changed"),

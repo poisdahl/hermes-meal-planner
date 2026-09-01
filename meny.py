@@ -1498,7 +1498,7 @@ __DELIVERY_BINDING__
         else:
             raise HouseholdError("MENY delivery picker is unavailable")
         self._invoke("click", '[data-hermes-meal-planner-action="delivery-open"]')
-        for _ in range(20):
+        for _ in range(60):
             ready = self._eval(r"""
 (() => {
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
