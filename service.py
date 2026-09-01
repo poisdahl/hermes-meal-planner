@@ -1499,8 +1499,12 @@ class Application:
         expired_unpaid = False
         candidate_matches = order is not None and meny_order_matches_checkout(order, pending["summary"])
         undispatched_retryable = payment_not_dispatched and confirmation_order_id is None and not candidates
-        if self.provider == "meny" and pending.get("status") == "awaiting_user_payment" and not confirmed and confirmation_order_id is None and len(candidates) <= 1 and not candidate_matches:
-            expiry = pending.get("payment_expires_at") or pending.get("expires_at")
+        payment_expiry = pending.get("payment_expires_at")
+        expirable_payment = pending.get("status") == "awaiting_user_payment" or (
+            pending.get("status") == "uncertain" and payment_expiry is not None
+        )
+        if self.provider == "meny" and expirable_payment and not confirmed and confirmation_order_id is None and len(candidates) <= 1 and not candidate_matches:
+            expiry = payment_expiry or pending.get("expires_at")
             try:
                 expires_at = datetime.fromisoformat(str(expiry or ""))
             except ValueError:

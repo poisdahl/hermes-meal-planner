@@ -4074,6 +4074,14 @@ class FlowTests(unittest.TestCase):
                 started + timedelta(minutes=11),
             )
 
+            with mock.patch("service.now", return_value=started + timedelta(minutes=1)):
+                waiting = app.handle({"operation": "checkout", "action": "reconcile"})
+
+            self.assertFalse(waiting["confirmed"])
+            self.assertFalse(waiting["expired"])
+            self.assertFalse(waiting["retry_allowed"])
+            self.assertEqual(store.read()["pending_checkout"]["status"], "uncertain")
+
             with mock.patch("service.now", return_value=started + timedelta(minutes=12)):
                 reconciled = app.handle({"operation": "checkout", "action": "reconcile"})
 
