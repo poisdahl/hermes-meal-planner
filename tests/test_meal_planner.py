@@ -3838,7 +3838,7 @@ class FlowTests(unittest.TestCase):
                 prepared = app.handle({"operation": "checkout", "action": "prepare"})
             self.assertEqual(prepared["summary"]["payment"], "vipps")
             prepare_calls = provider.call.call_args_list[:]
-            self.assertEqual([call.args[0] for call in prepare_calls], ["get_cart", "get_orders"])
+            self.assertEqual([call.args[0] for call in prepare_calls], ["get_cart", "get_orders", "get_cart"])
             self.assertTrue(all(call.kwargs.get("deadline") == 610.0 for call in prepare_calls))
             self.assertTrue(all(call.kwargs.get("allow_recovery") is True for call in prepare_calls))
             self.assertEqual(provider.checkout_review_recovery, [True])
@@ -3891,6 +3891,28 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(result["authorized_summary"]["total"], 40.0)
             self.assertEqual(provider.checkout_clicks, 1)
             self.assertEqual(store.read()["pending_checkout"]["status"], "awaiting_user_payment")
+
+    def test_meny_prepare_stores_the_cart_after_delivery_reservation_side_effects(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            original_review = provider.review_checkout
+
+            def review_and_apply_delivery(cart, **kwargs):
+                review = original_review(cart, **kwargs)
+                provider.cart["subtotal"] = 39.0
+                provider.cart["total"] = 39.0
+                return review
+
+            provider.review_checkout = review_and_apply_delivery
+            app = Application(store, provider, self.browser)
+
+            prepared = app.handle({"operation": "checkout", "action": "prepare"})
+
+            pending = store.read()["pending_checkout"]
+            self.assertEqual(prepared["summary"]["total"], 40.0)
+            self.assertEqual(pending["cart"]["total"], 39.0)
+            self.assertEqual([call[0] for call in provider.calls], ["get_cart", "get_orders", "get_cart"])
 
     def test_standing_submit_reuses_one_fresh_prepared_meny_checkout(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -4721,6 +4743,20 @@ class FlowTests(unittest.TestCase):
         with self.assertRaises(CheckoutPreconditionError):
             self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
         self.assertIsNone(self.store.read()["pending_checkout"])
+
+    def test_changed_cart_clears_an_unsubmitted_checkout_confirmation(self):
+        prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
+        self.oda.cart["subtotal"] = 36.0
+
+        with self.assertRaisesRegex(HouseholdError, "cart or delivery changed"):
+            self.app.handle({
+                "operation": "checkout",
+                "action": "confirm",
+                "confirmation_id": prepared["confirmation_id"],
+            })
+
+        self.assertIsNone(self.store.read()["pending_checkout"])
+        self.assertEqual(self.browser.checkout_clicks, 0)
 
     def test_checkout_expiration_is_rechecked_at_the_final_click(self):
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})

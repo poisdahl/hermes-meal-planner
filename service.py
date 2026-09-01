@@ -1249,6 +1249,24 @@ class Application:
                 if not isinstance(reviewed_summary, Mapping):
                     raise HouseholdError("MENY checkout returned no verified summary")
                 summary = deepcopy(dict(reviewed_summary))
+                refreshed_cart = self.oda.call(
+                    "get_cart",
+                    {},
+                    deadline=deadline,
+                    allow_recovery=allow_recovery,
+                )
+                refreshed_summary = cart_summary(refreshed_cart)
+                reviewed_lines = sorted(
+                    (str(item["product_id"]), int(item["quantity"]))
+                    for item in summary["items"]
+                )
+                refreshed_lines = sorted(
+                    (str(item["product_id"]), int(item["quantity"]))
+                    for item in refreshed_summary["items"]
+                )
+                if refreshed_summary["count"] != summary["count"] or refreshed_lines != reviewed_lines:
+                    raise HouseholdError("MENY cart items changed after the delivery reservation")
+                cart = refreshed_cart
             payment_display = None
             if self.provider == "oda":
                 payment_display = str((review.get("summary") or {}).get("payment") or review.get("payment_display") or "")
@@ -1303,6 +1321,9 @@ class Application:
         pending_change = pending.get("order_change") or {}
         expected_cart = cart_summary(pending["cart"]) if self.provider == "meny" or pending_change.get("requested_delivery") else pending["summary"]
         if canonical(cart_summary(cart)) != canonical(expected_cart):
+            with self.store.locked() as state:
+                if canonical(state.get("pending_checkout")) == canonical(pending):
+                    state["pending_checkout"] = None
             raise HouseholdError("cart or delivery changed; show a new summary")
         with self.store.locked() as state:
             if canonical(state.get("order_change")) != canonical(pending.get("order_change")):
