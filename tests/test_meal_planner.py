@@ -39,7 +39,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, meny_order_search_completed, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, _BrowserTransportError, meny_delivery_window_identity, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -2011,6 +2011,35 @@ class MenyClientTests(unittest.TestCase):
             mock.call(0.25),
         ])
         client._invoke.assert_not_called()
+        self.assertIn("location.pathname === '/varer'", client._eval.call_args_list[0].args[0])
+        self.assertIn("location.pathname === '/varer'", client._eval.call_args_list[-1].args[0])
+
+    def test_selected_delivery_normalizes_the_picker_slot_for_checkout(self):
+        slots = [{
+            "slot_id": "fra 0 kr fra 0 kroner, 3. september klokka 07:00 til 08:00",
+            "date": "2026-09-03",
+            "start": "07:00",
+            "end": "08:00",
+            "selected": True,
+        }]
+
+        self.assertEqual(meny_selected_delivery(slots), {
+            "slot_id": slots[0]["slot_id"],
+            "display": "torsdag 3. september kl. 07:00-08:00",
+        })
+        self.assertIsNone(meny_selected_delivery([{**slots[0], "selected": False}]))
+        with self.assertRaisesRegex(HouseholdError, "ambiguous"):
+            meny_selected_delivery([
+                slots[0],
+                {
+                    **slots[0],
+                    "slot_id": "3. september klokka 09:00 til 10:00",
+                    "start": "09:00",
+                    "end": "10:00",
+                },
+            ])
+        with self.assertRaisesRegex(HouseholdError, "invalid"):
+            meny_selected_delivery([{**slots[0], "date": "2026-09-04"}])
 
     def test_cart_read_opens_the_visible_cart_and_returns_provider_shape(self):
         client = self.client()
@@ -2686,7 +2715,7 @@ class MenyClientTests(unittest.TestCase):
         }
         client._eval = mock.Mock(side_effect=[settling, ready])
         client._invoke = mock.Mock()
-        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}], "total": 19.9}
+        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}], "total": 19.9, "delivery": {"display": "torsdag 3. sep. kl. 07:00-08:00"}}
         with self.assertRaisesRegex(HouseholdError, "items changed"):
             client._review_checkout(cart)
         client._invoke.assert_not_called()
@@ -2708,7 +2737,7 @@ class MenyClientTests(unittest.TestCase):
             "active_order_change": False,
         })
         client._invoke = mock.Mock()
-        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 13.9}], "total": 72.9}
+        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 13.9}], "total": 72.9, "delivery": {"display": "torsdag 3. sep. kl. 07:00-08:00"}}
 
         with self.assertRaisesRegex(HouseholdError, "286,10 kr"):
             client._review_checkout(cart)
@@ -2731,7 +2760,7 @@ class MenyClientTests(unittest.TestCase):
             "active_order_change": False,
         })
         client._invoke = mock.Mock()
-        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}], "total": 19.9}
+        cart = {"items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 19.9}], "total": 19.9, "delivery": {"display": "torsdag 3. sep. kl. 07:00-08:00"}}
 
         with self.assertRaisesRegex(HouseholdError, "unavailable items: Brokkoli 400g"):
             client._review_checkout(cart)
@@ -2796,6 +2825,56 @@ class MenyClientTests(unittest.TestCase):
             target_code=None,
         )
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.8), mock.call(0.6), mock.call(0.25)])
+
+    def test_checkout_review_uses_one_provider_selected_slot_when_cart_summary_omits_it(self):
+        client = self.client()
+        client._verify_order_change = mock.Mock()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._click_checkout_control = mock.Mock()
+        client._delivery_slots = mock.Mock(return_value={"slots": [{
+            "slot_id": "3. september klokka 07:00 til 08:00",
+            "date": "2026-09-03",
+            "start": "07:00",
+            "end": "08:00",
+            "selected": True,
+        }]})
+        step = {
+            "ready": True,
+            "authenticated": True,
+            "step": 1,
+            "next_enabled": True,
+            "items": [{"product_id": MENY_PRODUCT, "identity": "Brokkoli 400g", "quantity": 1}],
+            "unavailable_items": [],
+            "active_order_change": False,
+        }
+        client._eval = mock.Mock(side_effect=[
+            step,
+            {"unavailable": False, "dismiss": False},
+            {"ready": True, "checked": True},
+            {"ready": True, "lost": False},
+            {
+                "ready": True,
+                "authenticated": True,
+                "vipps_checked": True,
+                "home_delivery": True,
+                "submit_enabled": True,
+                "total": 415.7,
+                "delivery": "torsdag 3. september Kl. 07:00-08:00",
+                "submit_controls": 1,
+            },
+        ])
+        cart = {
+            "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 13.9}],
+            "count": 1,
+            "total": 13.9,
+            "delivery": None,
+        }
+
+        review = client._review_checkout(cart)
+
+        self.assertEqual(review["summary"]["delivery"]["display"], "torsdag 3. september Kl. 07:00-08:00")
+        client._delivery_slots.assert_called_once_with()
 
     def test_checkout_review_stops_when_meny_reports_a_lost_delivery_reservation(self):
         client = self.client()

@@ -59,6 +59,11 @@ MENY_MONTH_NUMBERS = {
     "nov": 11,
     "des": 12,
 }
+MENY_WEEKDAY_NAMES = ("mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lørdag", "søndag")
+MENY_MONTH_NAMES = (
+    "januar", "februar", "mars", "april", "mai", "juni",
+    "juli", "august", "september", "oktober", "november", "desember",
+)
 CHECKOUT_DELIVERY_BINDING_JS = r"""
   const deliveryPattern = /^(?:man(?:dag)?|tir(?:sdag)?|ons(?:dag)?|tor(?:sdag)?|fre(?:dag)?|lør(?:dag)?|søn(?:dag)?)\s+(?:[1-9]|[12]\d|3[01])\.\s+(?:jan(?:uar)?|feb(?:ruar)?|mar(?:s)?|apr(?:il)?|mai|jun(?:i)?|jul(?:i)?|aug(?:ust)?|sep(?:tember)?|okt(?:ober)?|nov(?:ember)?|des(?:ember)?)\.?\s+kl\.\s+(?:[01]\d|2[0-3]):[0-5]\d[-–](?:[01]\d|2[0-3]):[0-5]\d$/i;
   const deliveryHeadings = [...root.querySelectorAll('h2,h3')].filter(visible).filter(x => norm(x.innerText) === 'Dato og tid');
@@ -149,6 +154,43 @@ def meny_delivery_window_identity(value: Any) -> tuple[str, int, str, str, str]:
         match["start"],
         match["end"],
     )
+
+
+def meny_selected_delivery(value: Any) -> dict[str, Any] | None:
+    """Return one provider-selected slot as a checkout-comparable delivery window."""
+
+    if not isinstance(value, list):
+        raise HouseholdError("MENY delivery slots are invalid")
+    selected = [slot for slot in value if isinstance(slot, Mapping) and slot.get("selected") is True]
+    if not selected:
+        return None
+    if len(selected) != 1:
+        raise HouseholdError("MENY selected delivery slot is ambiguous")
+    slot = selected[0]
+    slot_id = str(slot.get("slot_id") or "").strip()
+    match = DELIVERY_SLOT.fullmatch(slot_id)
+    try:
+        slot_date = date.fromisoformat(str(slot.get("date") or ""))
+    except ValueError as exc:
+        raise HouseholdError("MENY selected delivery slot is invalid") from exc
+    start = str(slot.get("start") or "")
+    end = str(slot.get("end") or "")
+    month = match["month"].casefold() if match is not None else ""
+    if (
+        match is None
+        or slot_date.day != int(match["day"])
+        or slot_date.month != MENY_MONTH_NUMBERS.get(month[:3])
+        or start != f"{int(match['start_hour']):02d}:{match['start_minute']}"
+        or end != f"{int(match['end_hour']):02d}:{match['end_minute']}"
+        or start >= end
+    ):
+        raise HouseholdError("MENY selected delivery slot is invalid")
+    display = (
+        f"{MENY_WEEKDAY_NAMES[slot_date.weekday()]} {slot_date.day}. "
+        f"{MENY_MONTH_NAMES[slot_date.month - 1]} kl. {start}-{end}"
+    )
+    meny_delivery_window_identity(display)
+    return {"slot_id": slot_id, "display": display}
 
 
 def normalize_delivery_slot_ref(value: Any) -> tuple[str, str]:
@@ -1763,11 +1805,12 @@ __DELIVERY_BINDING__
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const carts = [...document.querySelectorAll('[aria-label="Handlevogn"]')].filter(visible);
-  if (carts.length === 1) return JSON.stringify({ready:true, open:true, authenticated:authenticated.length === 1});
+  if (identity && carts.length === 1) return JSON.stringify({ready:true, open:true, authenticated:authenticated.length === 1});
   const open = [...document.querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.getAttribute('aria-label')) === 'Åpne handlevognen');
-  if (carts.length !== 0 || open.length !== 1) return JSON.stringify({ready:false, open:false, authenticated:authenticated.length === 1});
+  if (!identity || carts.length !== 0 || open.length !== 1) return JSON.stringify({ready:false, open:false, authenticated:authenticated.length === 1});
   open[0].setAttribute('data-hermes-meal-planner-action', 'verify-cart-open');
   return JSON.stringify({ready:true, open:false, authenticated:authenticated.length === 1});
 })()
@@ -1791,9 +1834,10 @@ __DELIVERY_BINDING__
   const expected = CODE;
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const carts = [...document.querySelectorAll('[aria-label="Handlevogn"]')].filter(visible);
-  if (authenticated.length !== 1 || carts.length !== 1) return JSON.stringify({ready:false, authenticated:authenticated.length === 1});
+  if (!identity || authenticated.length !== 1 || carts.length !== 1) return JSON.stringify({ready:false, authenticated:authenticated.length === 1});
   const text = norm(carts[0].innerText);
   const aborts = [...carts[0].querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Avbryt endring');
   const activeCodes = [...text.matchAll(/Du endrer bestilling\s+([A-Za-z0-9-]+)/gi)].map(x => x[1]);
@@ -1927,6 +1971,10 @@ __DELIVERY_BINDING__
         expected = cart_summary(cart)
         if not expected["items"]:
             raise HouseholdError("cart is empty")
+        if expected.get("delivery") is None:
+            expected["delivery"] = meny_selected_delivery(self._delivery_slots().get("slots"))
+        if expected.get("delivery") is None:
+            raise HouseholdError("select a MENY delivery slot before checkout")
         target_order_id = str(order_change.get("order_id") or "") if order_change else ""
         target_code = str(order_change.get("code") or "") if order_change else ""
         self._verify_order_change(target_order_id or None, target_code or None)
