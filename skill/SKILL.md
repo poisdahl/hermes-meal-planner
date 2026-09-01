@@ -25,6 +25,9 @@ and treat returned capabilities and next actions as authoritative. If a likely
 ingredient search is empty, try one shorter common product synonym and use only
 products actually returned. Pass each returned `product_id` unchanged into cart
 or list tools; it may be numeric or a full provider path, so never shorten it.
+MENY has one household browser, so call provider-facing tools sequentially and
+never start two MENY catalog, cart, delivery, order or checkout calls in
+parallel. Each call then gets its own bounded browser window.
 For a favorite or recurring add, pass search's `product_id` and `name` through
 the tool's top-level `product_id` and `product_name` arguments; do not construct
 an item object. To add goods to an existing order or move its delivery, start
