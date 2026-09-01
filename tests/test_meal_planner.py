@@ -1697,6 +1697,8 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("__reactProps$", script)
         self.assertIn("typeof props.onClick === 'function'", script)
         self.assertIn('"pathname": "/varer"', script)
+        self.assertIn("expected?.pathname === '/sok'", script)
+        self.assertIn("['products','recipes'].includes(expanded[0])", script)
 
     def test_cart_change_uses_exact_catalog_path_and_delta(self):
         client = self.client()

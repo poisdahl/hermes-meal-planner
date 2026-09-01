@@ -2502,7 +2502,14 @@ __DELIVERY_BINDING__
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const expected = __EXPECTED__;
-  const target = expected === null || (location.origin === expected.origin && location.pathname === expected.pathname && location.search === expected.search && location.hash === expected.hash);
+  let searchReady = expected === null || location.search === expected.search;
+  if (!searchReady && expected?.pathname === '/sok') {
+    const wanted = new URLSearchParams(expected.search), actual = new URLSearchParams(location.search);
+    const wantedQuery = wanted.getAll('query'), actualQuery = actual.getAll('query'), expanded = actual.getAll('expanded');
+    searchReady = [...wanted.keys()].every(key => key === 'query') && [...actual.keys()].every(key => key === 'query' || key === 'expanded') &&
+      wantedQuery.length === 1 && actualQuery.length === 1 && actualQuery[0] === wantedQuery[0] && expanded.length === 1 && ['products','recipes'].includes(expanded[0]);
+  }
+  const target = expected === null || (location.origin === expected.origin && location.pathname === expected.pathname && searchReady && location.hash === expected.hash);
   const account = [...document.querySelectorAll('header button')].filter(visible).filter(button => {
     const label = norm(button.getAttribute('aria-label') || button.innerText);
     return label.startsWith('Brukermeny') || label === 'Logg inn';
