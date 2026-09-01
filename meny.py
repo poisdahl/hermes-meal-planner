@@ -274,6 +274,52 @@ def meny_order_search_completed(value: Any) -> bool:
     return False
 
 
+def meny_order_detail_request_id(value: Any, order_id: str) -> str | None:
+    """Return the completed provider request for one exact MENY order."""
+
+    if not isinstance(value, Mapping) or not isinstance(value.get("requests"), list):
+        raise HouseholdError("MENY browser order request log changed")
+    for request in reversed(value["requests"]):
+        if not isinstance(request, Mapping):
+            raise HouseholdError("MENY browser order request log changed")
+        status = request.get("status")
+        parsed = urlparse(str(request.get("url") or ""))
+        path = parsed.path.casefold()
+        request_id = request.get("requestId")
+        if (
+            str(request.get("method") or "").upper() == "GET"
+            and not isinstance(status, bool)
+            and isinstance(status, int)
+            and 200 <= status < 300
+            and parsed.scheme == "https"
+            and parsed.hostname == "platform-rest-prod.ngdata.no"
+            and path.startswith("/api/order/")
+            and not path.startswith("/api/order/search/")
+            and order_id in parsed.path.split("/")
+            and isinstance(request_id, str)
+            and request_id
+        ):
+            return request_id
+    return None
+
+
+def meny_order_provider_status(value: Any) -> str | None:
+    """Read the provider status hidden behind MENY's sometimes-stale order DOM."""
+
+    if not isinstance(value, Mapping) or not isinstance(value.get("responseBody"), str):
+        raise HouseholdError("MENY browser order response changed")
+    try:
+        payload = json.loads(value["responseBody"])
+    except json.JSONDecodeError as exc:
+        raise HouseholdError("MENY browser order response changed") from exc
+    if not isinstance(payload, Mapping):
+        raise HouseholdError("MENY browser order response changed")
+    description = str(payload.get("statusDescription") or "").strip().casefold()
+    if description in {"deleted", "cancelled", "canceled"}:
+        return "cancelled"
+    return None
+
+
 def meny_delivery_reservation_acknowledged(value: Any) -> bool:
     """Require both the delivery reservation and household selection writes."""
 
@@ -1943,7 +1989,26 @@ __DELIVERY_BINDING__
 
     def _get_order(self, order_id: str) -> dict[str, Any]:
         path = f"/profil/nettbutikk/bestilling/{order_id}"
+        self._invoke("network", "requests", "--clear")
         self._open(BASE_URL + path)
+        request_id = None
+        for phase in range(2):
+            for attempt in range(4):
+                request_id = meny_order_detail_request_id(
+                    self._invoke("network", "requests", "--filter", "/api/order/"),
+                    order_id,
+                )
+                if request_id is not None:
+                    break
+                if attempt < 3:
+                    self._sleep(0.25)
+            if request_id is not None:
+                break
+            if phase == 0:
+                self._invoke("reload")
+                self._sleep(0.5)
+        if request_id is None:
+            raise HouseholdError("MENY order status did not refresh")
         self._sleep(1.5)
         script = r"""
 (() => {
@@ -2008,13 +2073,14 @@ __DELIVERY_BINDING__
             self._sleep(0.25)
         else:
             raise HouseholdError("MENY order details changed or are unavailable")
+        provider_status = meny_order_provider_status(self._invoke("network", "request", request_id))
         return {
             "provider": "meny",
             "orderNumber": order_id,
             "order_number": order_id,
             "id": order_id,
             "code": result.get("code"),
-            "status": result["status"],
+            "status": provider_status or result["status"],
             "grossAmount": result["total"],
             "deliverySlotDisplay": result["delivery"],
             "productQuantityCount": result["item_count"],

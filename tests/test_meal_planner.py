@@ -2208,19 +2208,79 @@ class MenyClientTests(unittest.TestCase):
         }
         scripts = []
         client._eval = mock.Mock(side_effect=lambda script: scripts.append(script) or [waiting, expandable, ready][len(scripts) - 1])
-        client._invoke = mock.Mock(return_value={})
+        completed = {"requests": [{
+            "requestId": "order-detail-1",
+            "method": "GET",
+            "status": 200,
+            "url": "https://platform-rest-prod.ngdata.no/api/order/store/user/99990001",
+        }]}
+        client._invoke = mock.Mock(side_effect=lambda *arguments: (
+            completed if arguments[:2] == ("network", "requests") else
+            {"responseBody": json.dumps({"status": 40, "statusDescription": "DELIVERED"})}
+            if arguments[:2] == ("network", "request") else {}
+        ))
 
         order = client._get_order("99990001")
 
         self.assertEqual(order["status"], "delivered")
         self.assertEqual(order["grossAmount"], 123.45)
         self.assertEqual(order["deliverySlotDisplay"], "31. august 2026")
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="order-items"]')
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("network", "requests", "--clear"),
+            mock.call("network", "requests", "--filter", "/api/order/"),
+            mock.call("click", '[data-hermes-meal-planner-action="order-items"]'),
+            mock.call("network", "request", "order-detail-1"),
+        ])
         self.assertEqual(client._sleep.call_args_list, [mock.call(1.5), mock.call(0.25), mock.call(0.25)])
         self.assertIn("valueAfter('Betalt beløp (kort)')", scripts[-1])
         self.assertIn(r"/^Bestilling\s+\S+/i", scripts[-1])
         self.assertIn("deliveredDatePattern", scripts[-1])
         self.assertIn("deliveredDates.length === 1 ? 'delivered'", scripts[-1])
+
+    def test_order_details_reload_a_cached_page_and_use_deleted_provider_status(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        ready = {
+            "ready": True,
+            "expand": False,
+            "authenticated": True,
+            "order_number": "99990001",
+            "code": "TEST-CODE-1",
+            "status": "confirmed",
+            "total": 123.45,
+            "delivery": "2. september 2026",
+            "item_count": 1,
+            "products": [{"identity": "Testprodukt", "name": "Testprodukt", "quantity": 1}],
+        }
+        completed = {"requests": [{
+            "requestId": "order-detail-2",
+            "method": "GET",
+            "status": 200,
+            "url": "https://platform-rest-prod.ngdata.no/api/order/store/user/99990001",
+        }]}
+        client._eval = mock.Mock(return_value=ready)
+        client._invoke = mock.Mock(side_effect=[
+            {},
+            *([{"requests": []}] * 4),
+            {},
+            completed,
+            {"responseBody": json.dumps({"status": 99, "statusDescription": "DELETED"})},
+        ])
+
+        order = client._get_order("99990001")
+
+        self.assertEqual(order["status"], "cancelled")
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("network", "requests", "--clear"),
+            *([mock.call("network", "requests", "--filter", "/api/order/")] * 4),
+            mock.call("reload"),
+            mock.call("network", "requests", "--filter", "/api/order/"),
+            mock.call("network", "request", "order-detail-2"),
+        ])
+        self.assertEqual(client._sleep.call_args_list, [
+            mock.call(0.25), mock.call(0.25), mock.call(0.25), mock.call(0.5), mock.call(1.5),
+        ])
 
     def test_order_list_waits_for_the_completed_order_search_before_reading_dom(self):
         client = self.client()
