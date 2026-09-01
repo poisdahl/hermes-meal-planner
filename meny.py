@@ -1162,6 +1162,7 @@ class MenyClient:
   const home = [...root.querySelectorAll('input[type="radio"], [role="radio"]')].filter(visible).filter(x => /^Levert på døren(?:\s|$)/i.test(norm(x.getAttribute('aria-label') || x.closest('label')?.innerText || x.parentElement?.innerText)));
   const homeChecked = home.length === 1 && (home[0].checked === true || home[0].getAttribute('aria-checked') === 'true');
   const buttons = [...root.querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Til betaling');
+  const blockingDialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"]')].filter(visible);
   const totalLabels = leaf('*').filter(x => norm(x.innerText) === 'Totalsum');
   const totals = [];
   for (const label of totalLabels) {
@@ -1172,7 +1173,7 @@ class MenyClient:
     }
   }
 __DELIVERY_BINDING__
-  const exact = checked && homeChecked && targetReady && buttons.length === 1 && totalLabels.length === 1 && totals.length === 1 && Math.round(totals[0]*100) === __TOTAL__ && deliveryBinding?.root && deliveryBinding.display === __DELIVERY__ && location.href === __URL__;
+  const exact = checked && homeChecked && targetReady && buttons.length === 1 && blockingDialogs.length === 0 && totalLabels.length === 1 && totals.length === 1 && Math.round(totals[0]*100) === __TOTAL__ && deliveryBinding?.root && deliveryBinding.display === __DELIVERY__ && location.href === __URL__;
   if (!exact) return JSON.stringify({ready:false});
   const target = buttons[0];
   target.setAttribute('data-hermes-meal-planner-action', 'checkout-submit');
@@ -1200,10 +1201,19 @@ __DELIVERY_BINDING__
         self._invoke("mouse", "down")
         self._invoke("mouse", "up")
         self._wait_for_vipps_dispatch(
-            lambda: self._eval(render_gate(False)) == {"ready": True}
+            lambda: self._eval(render_gate(False)) == {"ready": True},
+            lambda: self._eval(r"""
+(() => {
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
+  const dialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"]')].filter(visible).filter(x => norm(x.innerText) === 'Du har dessverre mistet din reservasjon. Velg tidspunkt på nytt for å kunne betale.');
+  return JSON.stringify({reservation_expired:location.href === 'https://meny.no/kassen' && authenticated.length === 1 && dialogs.length === 1});
+})()
+"""),
         )
 
-    def _wait_for_vipps_dispatch(self, exact_checkout: Any = None) -> None:
+    def _wait_for_vipps_dispatch(self, exact_checkout: Any = None, known_failure: Any = None) -> None:
         requests: Any = {"requests": []}
         for attempt in range(40):
             requests = self._invoke("network", "requests")
@@ -1212,12 +1222,17 @@ __DELIVERY_BINDING__
                 return
             if attempt < 39:
                 self._sleep(0.25)
-        if exact_checkout is not None and not vipps_dispatch_attempted(requests) and exact_checkout():
-            final_requests = self._invoke("network", "requests")
-            if not vipps_dispatch_attempted(final_requests) and exact_checkout():
+        if not vipps_dispatch_attempted(requests):
+            if known_failure is not None and known_failure() == {"reservation_expired": True}:
                 raise CheckoutPreconditionError(
-                    "MENY did not dispatch the Vipps payment request; one fresh prepare is safe"
+                    "MENY delivery reservation expired before payment; select the same delivery time again"
                 )
+            if exact_checkout is not None and exact_checkout():
+                final_requests = self._invoke("network", "requests")
+                if not vipps_dispatch_attempted(final_requests) and exact_checkout():
+                    raise CheckoutPreconditionError(
+                        "MENY did not dispatch the Vipps payment request; one fresh prepare is safe"
+                    )
         raise HouseholdError(
             "MENY did not acknowledge the Vipps payment request; "
             "the outcome is uncertain and must be reconciled; do not retry"
@@ -1864,6 +1879,7 @@ __DELIVERY_BINDING__
   const home = [...root.querySelectorAll('input[type="radio"], [role="radio"]')].filter(visible).filter(x => /^Levert på døren(?:\s|$)/i.test(norm(x.getAttribute('aria-label') || x.closest('label')?.innerText || x.parentElement?.innerText)));
   const homeChecked = home.length === 1 && (home[0].checked === true || home[0].getAttribute('aria-checked') === 'true');
   const buttons = [...root.querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Til betaling');
+  const blockingDialogs = [...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"]')].filter(visible);
   const totalLabels = leaf('*').filter(x => norm(x.innerText) === 'Totalsum');
   const totals = [];
   for (const label of totalLabels) {
@@ -1874,7 +1890,7 @@ __DELIVERY_BINDING__
     }
   }
 __DELIVERY_BINDING__
-  const exact = checked && homeChecked && targetReady && buttons.length === 1 && totalLabels.length === 1 && totals.length === 1 && Math.round(totals[0]*100) === __TOTAL__ && deliveryBinding?.root && deliveryBinding.display === __DELIVERY__ && location.href === __URL__;
+  const exact = checked && homeChecked && targetReady && buttons.length === 1 && blockingDialogs.length === 0 && totalLabels.length === 1 && totals.length === 1 && Math.round(totals[0]*100) === __TOTAL__ && deliveryBinding?.root && deliveryBinding.display === __DELIVERY__ && location.href === __URL__;
   return JSON.stringify({ready:Boolean(exact)});
 })()
 """.replace("__DELIVERY_BINDING__", CHECKOUT_DELIVERY_BINDING_JS).replace("__CODE__", json.dumps(review.get("target_order_code"))).replace("__TOTAL__", str(int(round(float(review["summary"]["total"]) * 100)))).replace("__DELIVERY__", json.dumps(review["summary"]["delivery"]["display"], ensure_ascii=False)).replace("__URL__", json.dumps(CHECKOUT_URL)))
@@ -2068,7 +2084,10 @@ __DELIVERY_BINDING__
         if not expected["items"]:
             raise HouseholdError("cart is empty")
         if expected.get("delivery") is None:
-            expected["delivery"] = meny_selected_delivery(self._delivery_slots().get("slots"))
+            selected_delivery = meny_selected_delivery(self._delivery_slots().get("slots"))
+            if selected_delivery is not None:
+                self._select_delivery_slot(selected_delivery["slot_id"])
+            expected["delivery"] = selected_delivery
         if expected.get("delivery") is None:
             raise HouseholdError("select a MENY delivery slot before checkout")
         target_order_id = str(order_change.get("order_id") or "") if order_change else ""

@@ -2883,6 +2883,10 @@ class MenyClientTests(unittest.TestCase):
             "end": "08:00",
             "selected": True,
         }]})
+        client._select_delivery_slot = mock.Mock(return_value={
+            "provider": "meny",
+            "selected": {"slot_id": "3. september klokka 07:00 til 08:00"},
+        })
         step = {
             "ready": True,
             "authenticated": True,
@@ -2919,6 +2923,7 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(review["summary"]["delivery"]["display"], "torsdag 3. september Kl. 07:00-08:00")
         client._delivery_slots.assert_called_once_with()
+        client._select_delivery_slot.assert_called_once_with("3. september klokka 07:00 til 08:00")
 
     def test_checkout_review_stops_when_meny_reports_a_lost_delivery_reservation(self):
         client = self.client()
@@ -3196,6 +3201,20 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client._invoke.call_count, 41)
         self.assertEqual(exact_checkout.call_count, 2)
+
+    def test_vipps_dispatch_reports_the_exact_lost_reservation_without_retry_lock(self):
+        client = self.client()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(return_value={"requests": []})
+        exact_checkout = mock.Mock(return_value=False)
+        known_failure = mock.Mock(return_value={"reservation_expired": True})
+
+        with self.assertRaisesRegex(CheckoutPreconditionError, "reservation expired.*same delivery time"):
+            client._wait_for_vipps_dispatch(exact_checkout, known_failure)
+
+        self.assertEqual(client._invoke.call_count, 40)
+        known_failure.assert_called_once_with()
+        exact_checkout.assert_not_called()
 
     def test_checkout_payment_not_dispatched_requires_exact_page_and_two_empty_logs(self):
         client = self.client()
