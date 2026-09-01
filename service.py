@@ -1108,8 +1108,9 @@ class Application:
             baseline = deepcopy(state.get("pending_checkout"))
             if baseline and baseline.get("status") in UNRESOLVED_CHECKOUT_STATUSES:
                 raise HouseholdError("reconcile the pending checkout before preparing another")
-        with self.store.locked() as state:
             order_change = deepcopy(state.get("order_change"))
+            pending_cancellation = deepcopy(state.get("pending_cancellation"))
+        allow_recovery = self.provider == "meny" and not order_change and not pending_cancellation
         if order_change:
             if order_change.get("provider") != self.provider or order_change.get("status") != "editing":
                 raise HouseholdError("the order change is not ready for checkout; abort or recover it first")
@@ -1117,7 +1118,7 @@ class Application:
             fresh_target = self._orders({"action": "get", "order_id": order_change["order_id"]})
             if canonical(fresh_target) != canonical(order_change["before"]):
                 raise HouseholdError("the target Oda order changed; begin the order change again")
-        cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {})
+        cart = self.oda.call("get_cart", {}, deadline=deadline, allow_recovery=allow_recovery) if self.provider == "meny" else self.oda.call("get_cart", {})
         summary = cart_summary(cart)
         delivery_change = bool(order_change and order_change.get("requested_delivery"))
         if self.provider == "oda" and not delivery_change:
@@ -1128,7 +1129,7 @@ class Application:
             if not isinstance(address, str) or not address.strip():
                 raise HouseholdError("select a delivery address before checkout")
             summary["delivery"]["address"] = unicodedata.normalize("NFC", " ".join(address.split()))
-        before = self.oda.call("get_orders", {"page": 1, "size": 20}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_orders", {"page": 1, "size": 20})
+        before = self.oda.call("get_orders", {"page": 1, "size": 20}, deadline=deadline, allow_recovery=allow_recovery) if self.provider == "meny" else self.oda.call("get_orders", {"page": 1, "size": 20})
         with self._browser_operation(deadline):
             state = self.store.read()
             if (state.get("pending_cancellation") or {}).get("status") in {"clicking", "uncertain"}:
@@ -1156,6 +1157,7 @@ class Application:
                     cart,
                     order_change=order_change if self.provider == "meny" else None,
                     deadline=deadline,
+                    allow_recovery=allow_recovery,
                 ) if self.provider == "meny" else self.browser.review_checkout(cart, deadline=deadline)
             if self.provider == "meny":
                 reviewed_summary = review.get("summary")
@@ -1202,6 +1204,9 @@ class Application:
         if confirmation_id != pending.get("confirmation_id"):
             raise HouseholdError("checkout confirmation does not match the prepared summary")
         if now() >= datetime.fromisoformat(pending["expires_at"]):
+            with self.store.locked() as state:
+                if canonical(state.get("pending_checkout")) == canonical(pending):
+                    state["pending_checkout"] = None
             raise HouseholdError("checkout confirmation expired")
         cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {})
         pending_change = pending.get("order_change") or {}

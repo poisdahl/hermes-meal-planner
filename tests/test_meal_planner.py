@@ -179,6 +179,7 @@ class FakeMeny(FakeOda):
         self.change_release = None
         self.cancellation_review_deadlines = []
         self.cancellation_submit_deadlines = []
+        self.checkout_review_recovery = []
 
     def probe(self, **_kwargs):
         return {"protocol_version": "browser-v1", "server": {"name": "MENY website"}, "tool_count": 11}
@@ -207,7 +208,8 @@ class FakeMeny(FakeOda):
             before_click()
         self.tracking = "cancelled"
 
-    def review_checkout(self, cart, *, order_change=None, deadline=None):
+    def review_checkout(self, cart, *, order_change=None, deadline=None, allow_recovery=False):
+        self.checkout_review_recovery.append(allow_recovery)
         return {
             "page_digest": "d" * 64,
             "summary": {
@@ -2972,6 +2974,16 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("deliveryBinding", client._eval.call_args.args[0])
         self.assertNotIn("deliveryRoots", client._eval.call_args.args[0])
 
+    def test_meny_checkout_review_enables_recovery_only_for_pre_dispatch_work(self):
+        client = self.client()
+        client._review_checkout = mock.Mock(return_value={"ready": True})
+        operation = mock.MagicMock()
+        client._locked_operation = operation
+
+        self.assertEqual(client.review_checkout({}, allow_recovery=True), {"ready": True})
+
+        operation.assert_called_once_with(180, None, allow_recovery=True)
+
     def test_vipps_mouse_failure_after_dispatch_fence_is_uncertain(self):
         client = self.client()
         review = {
@@ -3147,6 +3159,8 @@ class FlowTests(unittest.TestCase):
             prepare_calls = provider.call.call_args_list[:]
             self.assertEqual([call.args[0] for call in prepare_calls], ["get_cart", "get_orders"])
             self.assertTrue(all(call.kwargs.get("deadline") == 250.0 for call in prepare_calls))
+            self.assertTrue(all(call.kwargs.get("allow_recovery") is True for call in prepare_calls))
+            self.assertEqual(provider.checkout_review_recovery, [True])
             with mock.patch("service.time.monotonic", return_value=20.0):
                 result = app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
             self.assertTrue(result["awaiting_user_payment"])
@@ -3183,6 +3197,28 @@ class FlowTests(unittest.TestCase):
                     "changes": {"enabled": True, "maximum_total": 1000, "delivery": {"weekday": "Saturday"}, "auto_checkout": True},
                 })
             self.assertFalse(store.read()["schedule"]["auto_checkout"])
+
+    def test_expired_checkout_confirmation_is_removed_before_any_provider_call(self):
+        started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            provider.call = mock.Mock(wraps=provider.call)
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.now", return_value=started):
+                prepared = app.handle({"operation": "checkout", "action": "prepare"})
+            provider.call.reset_mock()
+
+            with mock.patch("service.now", return_value=started + timedelta(minutes=21)):
+                with self.assertRaisesRegex(HouseholdError, "confirmation expired"):
+                    app.handle({
+                        "operation": "checkout",
+                        "action": "confirm",
+                        "confirmation_id": prepared["confirmation_id"],
+                    })
+
+            self.assertIsNone(store.read()["pending_checkout"])
+            provider.call.assert_not_called()
 
     def test_expired_unapproved_vipps_releases_the_checkout_for_a_fresh_prepare(self):
         started = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)

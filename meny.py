@@ -1817,8 +1817,8 @@ __DELIVERY_BINDING__
             order = self._get_order(order_id)
             return {"provider": "meny", "order_id": order_id, "aborted": True, "order": order}
 
-    def review_checkout(self, cart: Mapping[str, Any], *, order_change: Mapping[str, Any] | None = None, deadline: float | None = None) -> dict[str, Any]:
-        with self._locked_operation(MENY_ORDER_TIMEOUT, deadline):
+    def review_checkout(self, cart: Mapping[str, Any], *, order_change: Mapping[str, Any] | None = None, deadline: float | None = None, allow_recovery: bool = False) -> dict[str, Any]:
+        with self._locked_operation(MENY_ORDER_TIMEOUT, deadline, allow_recovery=allow_recovery):
             return self._review_checkout(cart, order_change=order_change)
 
     def _review_checkout(self, cart: Mapping[str, Any], *, order_change: Mapping[str, Any] | None = None) -> dict[str, Any]:
