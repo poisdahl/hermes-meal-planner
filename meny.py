@@ -2361,7 +2361,7 @@ __DELIVERY_BINDING__
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
-  const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible).filter(x => /Vil du avbryte endringen\?/i.test(norm(x.innerText)));
+  const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Vil du avbryte endringen\?/i.test(norm(x.innerText)));
   if (dialogs.length !== 1) return JSON.stringify({ready:false});
   const buttons = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.innerText) === 'Avbryt endring');
   if (buttons.length !== 1) return JSON.stringify({ready:false});

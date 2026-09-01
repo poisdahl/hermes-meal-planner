@@ -2347,6 +2347,24 @@ class MenyClientTests(unittest.TestCase):
             mock.call("click", '[data-hermes-meal-planner-action="change-confirm"]'),
         ])
 
+    def test_order_change_abort_accepts_the_native_confirmation_dialog(self):
+        client = self.client()
+        client._verify_order_change = mock.Mock()
+        client._get_order = mock.Mock(return_value={"status": "confirmed"})
+        client._sleep = mock.Mock()
+        scripts = []
+        client._eval = mock.Mock(side_effect=lambda script: scripts.append(script) or {"ready": True})
+        client._invoke = mock.Mock(return_value={})
+
+        result = client.abort_order_change("99990001", "TEST-CODE")
+
+        self.assertTrue(result["aborted"])
+        self.assertIn("dialog,[role=\"dialog\"]", scripts[1])
+        self.assertEqual(client._invoke.call_args_list, [
+            mock.call("click", '[data-hermes-meal-planner-action="change-abort-open"]'),
+            mock.call("click", '[data-hermes-meal-planner-action="change-abort-final"]'),
+        ])
+
     def test_order_list_maps_and_removes_the_private_dom_status_marker(self):
         client = self.client()
         client._open = mock.Mock()
