@@ -2038,7 +2038,7 @@ __DELIVERY_BINDING__
             # Next.js shell has loaded every dynamic chunk. The authenticated
             # site can require a second bounded reload after account state
             # settles. Reloading changes no cookies, storage, cart or account.
-            for _reload in range(2):
+            for _reload in range(3):
                 self._invoke("reload")
                 for _ in range(20):
                     self._sleep(0.5)

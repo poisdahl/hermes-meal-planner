@@ -1581,7 +1581,7 @@ class MenyClientTests(unittest.TestCase):
         client.recovery_allowed = True
         client._invoke = mock.Mock(side_effect=lambda command, *_args: {"url": "https://meny.no/varer"} if command == "open" else {})
         client._invoke_once = mock.Mock(return_value={"url": "https://meny.no/varer"})
-        client._site_shell_ready = mock.Mock(side_effect=[False] * 41 + [True])
+        client._site_shell_ready = mock.Mock(side_effect=[False] * 61 + [True])
         client._recover_cdp_tab = mock.Mock(return_value=True)
         client._sleep = mock.Mock()
 
@@ -1590,8 +1590,8 @@ class MenyClientTests(unittest.TestCase):
         client._recover_cdp_tab.assert_called_once_with()
         self.assertTrue(client._recovery_consumed)
         client._invoke_once.assert_called_once_with("open", "https://meny.no/varer")
-        self.assertEqual([call.args[0] for call in client._invoke.call_args_list], ["open", "reload", "reload", "reload"])
-        self.assertEqual(client._site_shell_ready.call_count, 42)
+        self.assertEqual([call.args[0] for call in client._invoke.call_args_list], ["open", "reload", "reload", "reload", "reload"])
+        self.assertEqual(client._site_shell_ready.call_count, 62)
         self.assertTrue(client._cdp_primed)
 
     def test_protected_cdp_navigation_does_not_replace_an_unhydrated_target(self):
@@ -1617,7 +1617,7 @@ class MenyClientTests(unittest.TestCase):
             client._open("https://meny.no/varer")
 
         client._recover_cdp_tab.assert_not_called()
-        self.assertEqual(client._site_shell_ready.call_count, 41)
+        self.assertEqual(client._site_shell_ready.call_count, 61)
 
     def test_visible_ssr_shell_is_not_ready_until_react_handler_is_hydrated(self):
         client = self.client()
