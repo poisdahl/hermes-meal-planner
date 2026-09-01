@@ -2231,6 +2231,36 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._read_cart()["total"], 0.0)
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.5), mock.call(0.25)])
 
+    def test_cart_read_tolerates_a_slow_opening_panel_snapshot(self):
+        client = self.client()
+        waiting = {"ready": False, "authenticated": True, "root_count": 0}
+        valid = {
+            "ready": True,
+            "authenticated": True,
+            "root_count": 1,
+            "item_root_count": 0,
+            "control_count": 0,
+            "empty": True,
+            "total_count": 0,
+            "subtotal_count": 0,
+            "subtotal": None,
+            "delivery_count": 0,
+            "delivery": None,
+            "items": [],
+            "count": 0,
+            "total": 0,
+        }
+        client._eval = mock.Mock(side_effect=[
+            {"open": False, "ready": True, "authenticated": True, "root_count": 0, "open_count": 1},
+            *([waiting] * 20),
+            valid,
+        ])
+        client._invoke = mock.Mock(return_value={})
+        client._sleep = mock.Mock()
+
+        self.assertEqual(client._read_cart()["total"], 0.0)
+        self.assertEqual(client._sleep.call_count, 21)
+
     def test_cart_snapshot_rejects_ambiguous_or_incomplete_dom(self):
         valid = {
             "ready": True,

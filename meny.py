@@ -1364,7 +1364,7 @@ __DELIVERY_BINDING__
             self._invoke("click", '[data-hermes-meal-planner-action="open-cart"]')
             self._sleep(0.5)
         result: dict[str, Any] = {}
-        for _ in range(20):
+        for _ in range(60):
             result = self._eval(r"""
 (() => {
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
