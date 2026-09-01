@@ -196,7 +196,13 @@ class FakeMeny(FakeOda):
             self.change_entered.set()
         if self.change_release and not self.change_release.wait(2):
             raise HouseholdError("test MENY change timed out")
-        return {"provider": "meny", "order_id": order_id, "code": "TEST-CODE-1", "editing": True}
+        return {
+            "provider": "meny",
+            "order_id": order_id,
+            "code": "TEST-CODE-1",
+            "order": deepcopy(next(item for item in self.orders if str(item.get("orderNumber")) == str(order_id))),
+            "editing": True,
+        }
 
     def abort_order_change(self, order_id, code=None, *, deadline=None):
         return {"provider": "meny", "order_id": order_id, "code": code, "aborted": True}
@@ -4550,8 +4556,7 @@ class FlowTests(unittest.TestCase):
             with mock.patch("service.time.monotonic", return_value=10.0):
                 app.handle({"operation": "orders", "action": "change_begin", "order_id": "99990001"})
             protected_calls = [call for call in provider.call.call_args_list if call.args[0] in {"get_order", "order_tracking"}]
-            self.assertEqual([call.args[0] for call in protected_calls], ["get_order"])
-            self.assertTrue(all(call.kwargs.get("deadline") == 250.0 for call in protected_calls))
+            self.assertEqual(protected_calls, [])
             self.assertEqual(provider.begin_order_change.call_args.kwargs["deadline"], 250.0)
 
     def test_meny_cancellation_propagates_each_absolute_deadline_to_all_reads(self):

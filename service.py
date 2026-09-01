@@ -873,17 +873,24 @@ class Application:
                         raise HouseholdError("finish the pending protected operation before changing an order")
                     state["order_change"] = deepcopy(reservation)
             try:
-                current = self._orders({"action": "get", "order_id": order_id, "_deadline": deadline})
-                status = str((current.get("tracking") or {}).get("status") or "").casefold()
-                if self.provider == "oda" and status != "paid_and_modifiable":
-                    raise HouseholdError("Oda order is not currently modifiable")
                 if self.provider == "meny":
                     with self._browser_operation(deadline):
                         started = self.browser.begin_order_change(order_id, deadline=deadline)
                     code = str(started.get("code") or "").strip()
                     if not code:
                         raise HouseholdError("MENY order change identity is unavailable")
+                    order = started.get("order")
+                    if not isinstance(order, Mapping):
+                        raise HouseholdError("MENY order change did not return the verified order")
+                    current = {
+                        "order": dict(order),
+                        "tracking": {"order_id": order_id, "status": str(order.get("status") or "unknown")},
+                    }
                 else:
+                    current = self._orders({"action": "get", "order_id": order_id})
+                    status = str((current.get("tracking") or {}).get("status") or "").casefold()
+                    if status != "paid_and_modifiable":
+                        raise HouseholdError("Oda order is not currently modifiable")
                     cart = cart_summary(self.oda.call("get_cart", {}))
                     if cart["items"]:
                         raise HouseholdError("empty the Oda cart before starting an addition to an existing order")
