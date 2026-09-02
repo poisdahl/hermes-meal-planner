@@ -138,8 +138,8 @@ def meal_planner_checkout(action: Literal["prepare", "confirm", "submit", "recon
 
 
 @server.tool(description="Schedule/status/check/test/claim/mark the one recipe email associated with a confirmed order. automation_plan lists every legacy or changed cron that must be replaced with the safe two-phase prompt; call ack_automation only after that exact external cron update succeeds. Due returns only a short pre-dispatch claim. Call begin_send with its token immediately before sender invocation; only begin_send returns dispatch=true plus the exact payload. Mark sent only after success. Release only after a definite no-send failure. Test never consumes the job.")
-def meal_planner_email(action: Literal["status", "schedule", "automation_plan", "ack_automation", "due", "test", "begin_send", "mark_sent", "release"] = "status", order_id: str | None = None, delivery_date: str | None = None, claim_token: str | None = None, automation_key: str | None = None, automation_digest: str | None = None, protocol: int | None = None) -> dict[str, Any]:
-    return rpc("email", action=action, order_id=order_id, delivery_date=delivery_date, claim_token=claim_token, automation_key=automation_key, automation_digest=automation_digest, protocol=protocol)
+def meal_planner_email(action: Literal["status", "schedule", "automation_plan", "ack_automation", "due", "test", "begin_send", "mark_sent", "release"] = "status", provider: Literal["oda", "meny"] | None = None, order_id: str | None = None, delivery_date: str | None = None, claim_token: str | None = None, automation_key: str | None = None, automation_digest: str | None = None, protocol: int | None = None) -> dict[str, Any]:
+    return rpc("email", action=action, provider=provider, order_id=order_id, delivery_date=delivery_date, claim_token=claim_token, automation_key=automation_key, automation_digest=automation_digest, protocol=protocol)
 
 
 if __name__ == "__main__":

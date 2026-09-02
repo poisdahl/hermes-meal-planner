@@ -304,12 +304,12 @@ class CoreTests(unittest.TestCase):
         )
         module.meal_planner_email(
             "ack_automation", order_id="order-1", delivery_date="2026-09-05",
-            automation_key="meal-planner-email-0123456789abcdef", automation_digest="a" * 64, protocol=2,
+            automation_key="meal-planner-email-0123456789abcdef", automation_digest="a" * 64, protocol=3,
         )
         module.rpc.assert_called_with(
             "email", action="ack_automation", order_id="order-1", delivery_date="2026-09-05",
-            claim_token=None, automation_key="meal-planner-email-0123456789abcdef",
-            automation_digest="a" * 64, protocol=2,
+            provider=None, claim_token=None, automation_key="meal-planner-email-0123456789abcdef",
+            automation_digest="a" * 64, protocol=3,
         )
 
     def test_cart_summary_rejects_huge_provider_quantity_as_a_bounded_error(self):
@@ -5306,7 +5306,7 @@ class FlowTests(unittest.TestCase):
 
     def test_cancellation_stops_pending_email(self):
         with self.store.locked() as state:
-            state["email_jobs"] = [{"order_id": "old", "delivery_date": "2026-09-05", "status": "pending", "sent_at": None}]
+            state["email_jobs"] = [{"provider": "oda", "order_id": "old", "delivery_date": "2026-09-05", "status": "pending", "sent_at": None}]
         prepared = self.app.handle({"operation": "orders", "action": "cancel_prepare", "order_id": "old"})
         result = self.app.handle({"operation": "orders", "action": "cancel_confirm", "order_id": "old", "confirmation_id": prepared["confirmation_id"]})
         self.assertTrue(result["cancelled"])
@@ -5500,6 +5500,7 @@ class FlowTests(unittest.TestCase):
         delivery = date.today().isoformat()
         scheduled = self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
         repeated = self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
+        self.app.handle({"operation": "email", **scheduled["automation_ack"]})
         self.assertEqual(len(self.store.read()["email_jobs"]), 1)
         self.assertTrue(scheduled["scheduled"])
         self.assertFalse(repeated["scheduled"])
@@ -5525,6 +5526,7 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(result["reason"], "delivery moved")
         self.assertEqual(result["delivery_date"], moved)
         self.assertIn(moved, result["cron_prompt"])
+        self.app.handle({"operation": "email", **result["automation_ack"]})
         self.oda.tracking = "cancelled"
         result = self.app.handle({"operation": "email", "action": "due", "order_id": "old"})
         self.assertEqual(result, {"send": False, "reason": "order cancelled"})
@@ -5548,6 +5550,7 @@ class FlowTests(unittest.TestCase):
             state["menu"] = menu
             state["email_jobs"] = [{
                 "order_id": "old", "delivery_date": "2026-09-05", "status": "pending", "sent_at": None,
+                "provider": "oda",
                 "recipient_snapshot": "owner@example.test", "menu_snapshot": deepcopy(menu),
             }]
 
@@ -5570,7 +5573,7 @@ class FlowTests(unittest.TestCase):
         with self.store.locked() as state:
             state["email_recipient"] = "owner@example.test"
             state["menu"] = {"order_id": "other", "week": "2026-W36", "dishes": []}
-            state["email_jobs"] = [{"order_id": "old", "delivery_date": delivery, "status": "pending", "sent_at": None}]
+            state["email_jobs"] = [{"provider": "oda", "order_id": "old", "delivery_date": delivery, "status": "pending", "sent_at": None}]
         self.oda.order_delivery = delivery
         before = deepcopy(self.store.read()["email_jobs"])
 
@@ -5599,7 +5602,8 @@ class FlowTests(unittest.TestCase):
             state["menu"] = {"order_id": "old", "week": "2026-W36", "dishes": [{"name": "A", "ingredients": ["x"], "steps": ["y"]}]}
             state["email_jobs"] = [{
                 "order_id": "old", "delivery_date": delivery, "status": "pending", "sent_at": None,
-                "recipient_snapshot": "owner@example.test", "menu_snapshot": deepcopy(state["menu"]),
+                "provider": "oda",
+                "recipient_snapshot": "owner@example.test", "menu_snapshot": deepcopy(state["menu"]), "automation_protocol": 3,
             }]
         self.oda.order_delivery = delivery
 
@@ -5629,7 +5633,8 @@ class FlowTests(unittest.TestCase):
             state["menu"] = deepcopy(menu)
             state["order_snapshots"]["old"] = deepcopy(menu)
             state["schedule"]["timezone"] = "Europe/Oslo"
-        self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
+        scheduled = self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
+        self.app.handle({"operation": "email", **scheduled["automation_ack"]})
         self.oda.order_delivery = delivery
         with mock.patch("service.now", return_value=datetime(2026, 9, 3, 22, 30, tzinfo=timezone.utc)):
             due = self.app.handle({"operation": "email", "action": "due", "order_id": "old"})
@@ -5642,7 +5647,8 @@ class FlowTests(unittest.TestCase):
             state["email_recipient"] = "owner@example.test"
             state["menu"] = deepcopy(menu)
             state["order_snapshots"]["old"] = deepcopy(menu)
-        self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
+        scheduled = self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
+        self.app.handle({"operation": "email", **scheduled["automation_ack"]})
         self.oda.orders = [{"order_number": "old"}]
         with self.assertRaisesRegex(HouseholdError, "does not establish"):
             self.app.handle({"operation": "email", "action": "due", "order_id": "old"})
@@ -5668,7 +5674,8 @@ class FlowTests(unittest.TestCase):
             state["email_recipient"] = "owner@example.test"
             state["menu"] = deepcopy(menu)
             state["order_snapshots"]["old"] = deepcopy(menu)
-        self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
+        scheduled = self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": delivery})
+        self.app.handle({"operation": "email", **scheduled["automation_ack"]})
         original_call = self.oda.call
 
         def swapped_order(tool, arguments, **kwargs):

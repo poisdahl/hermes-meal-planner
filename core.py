@@ -114,7 +114,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 2,
+        "version": 3,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -132,6 +132,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "recipe_usage_requests": {},
         "order_snapshots": {},
         "order_snapshot_times": {},
+        "order_snapshot_providers": {},
         "protected_results": {},
         "protected_requests": {},
     }
@@ -261,7 +262,7 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 2:
+    if version > 3:
         raise HouseholdError("household state is newer than this meal planner")
     if version == 1:
         profile = state.get("profile")
@@ -304,10 +305,37 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
             if isinstance(recipient, str) and recipient:
                 job.setdefault("recipient_snapshot", recipient)
         state["version"] = 2
+    if state["version"] == 2:
+        bound_provider = str(state.get("provider") or config.get("provider") or "").casefold()
+        email_jobs = state.get("email_jobs")
+        order_snapshots = state.get("order_snapshots")
+        if not isinstance(email_jobs, list) or not isinstance(order_snapshots, dict):
+            raise HouseholdError("household recipe lifecycle state is invalid")
+        for job in email_jobs:
+            if isinstance(job, dict):
+                job.setdefault("provider", bound_provider)
+        snapshot_providers = state.setdefault("order_snapshot_providers", {})
+        if not isinstance(snapshot_providers, dict):
+            raise HouseholdError("household order snapshot providers are invalid")
+        for order_id, snapshot in order_snapshots.items():
+            matching_providers = {
+                job.get("provider")
+                for job in email_jobs
+                if isinstance(job, dict)
+                and job.get("order_id") == order_id
+                and isinstance(job.get("provider"), str)
+                and job.get("provider") in {"oda", "meny"}
+                and job.get("menu_snapshot") == snapshot
+            }
+            snapshot_providers.setdefault(
+                order_id, next(iter(matching_providers)) if len(matching_providers) == 1 else bound_provider,
+            )
+        state["version"] = 3
     state.setdefault("recipe_usage", {})
     state.setdefault("recipe_usage_requests", {})
     state.setdefault("order_snapshots", {})
     state.setdefault("order_snapshot_times", {})
+    state.setdefault("order_snapshot_providers", {})
     state.setdefault("protected_results", {})
     state.setdefault("protected_requests", {})
     recipient = state.get("email_recipient")
@@ -316,6 +344,9 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     for job in state.get("email_jobs", []):
         if not isinstance(job, dict):
             continue
+        job_provider = job.get("provider")
+        if not isinstance(job_provider, str) or job_provider not in {"oda", "meny"}:
+            job["status"] = "invalid"
         if not isinstance(job.get("order_id"), str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", job["order_id"]) is None:
             job["status"] = "invalid"
         if not valid_email_address(job.get("recipient_snapshot")):
@@ -339,8 +370,13 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     cooldown = recipe_profile.get("repeat_cooldown_weeks")
     if isinstance(cooldown, bool) or not isinstance(cooldown, int) or not 0 <= cooldown <= 260:
         raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
-    if not isinstance(state["recipe_usage"], dict) or not isinstance(state["recipe_usage_requests"], dict) or not isinstance(state["order_snapshots"], dict) or not isinstance(state["order_snapshot_times"], dict) or not isinstance(state["protected_results"], dict) or not isinstance(state["protected_requests"], dict):
+    if not isinstance(state["recipe_usage"], dict) or not isinstance(state["recipe_usage_requests"], dict) or not isinstance(state["order_snapshots"], dict) or not isinstance(state["order_snapshot_times"], dict) or not isinstance(state["order_snapshot_providers"], dict) or not isinstance(state["protected_results"], dict) or not isinstance(state["protected_requests"], dict):
         raise HouseholdError("household recipe lifecycle state is invalid")
+    if any(
+        not isinstance(provider, str) or provider not in {"oda", "meny"}
+        for provider in state["order_snapshot_providers"].values()
+    ):
+        raise HouseholdError("household order snapshot providers are invalid")
 
 
 class StateStore:
@@ -355,8 +391,13 @@ class StateStore:
             _atomic_json(self.path, initial_state(self.config))
         configured_provider = str(self.config.get("provider") or "oda").casefold()
         with self.locked() as state:
-            if state.get("version", 1) == 1:
-                backup = self.directory / "state-v1.backup.json"
+            source_version = state.get("version", 1)
+            if (
+                not isinstance(source_version, bool)
+                and isinstance(source_version, int)
+                and source_version in {1, 2}
+            ):
+                backup = self.directory / f"state-v{source_version}.backup.json"
                 if not backup.exists():
                     _atomic_json(backup, state)
             _migrate_state(state, self.config)

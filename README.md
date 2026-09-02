@@ -338,10 +338,15 @@ requests, in a safe order, are:
 New, moved and upgraded delivery-day jobs expose
 `automation_update_required`. Apply the exact `cron_prompt` to that one Hermes
 automation, then call the returned `automation_ack`; acknowledgement records
-protocol 2 only after the external update succeeds. After an upgrade, call
+protocol 3 only after the external update succeeds. After an upgrade, call
 email `automation_plan`, replace every listed legacy prompt, and acknowledge
 each result. Until then the old prompt safely declines to send rather than
 using an unbound payload.
+
+Each job snapshots its provider as well as its menu and recipient. A MENY
+instance can therefore finish an older Oda delivery email when its normal Oda
+token directory is still available, without changing the household's active
+provider or sharing provider state.
 
 Email delivery requires an existing Hermes email account/tool; a vanilla
 Hermes install has none. Without one, the integration can safely prepare the
