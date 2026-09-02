@@ -2,7 +2,7 @@
 
 Hermes Meal Planner adds weekly meal planning and grocery ordering to Hermes
 Agent for a single household. It stores a private searchable recipe bank,
-household preferences, weekly menus, favorites, and recurring items locally,
+household preferences, weekly menus, product favorites, and recurring items locally,
 discovers recipes through that bank, Oda, MENY, TheMealDB and Wikibooks
 Cookbook, and uses either Oda or MENY for product search, cart management,
 delivery, and orders. By default, it plans
@@ -15,7 +15,7 @@ through Hermes Agent or with `profile_overrides` in your private configuration.
 |---|---:|---:|
 | Product and recipe search | MCP | Logged-in browser |
 | Read, change and active-menu sync cart | MCP | Logged-in browser |
-| Favorites, recurring items and menus | Local | Local |
+| Product favorites, recurring items and menus | Local | Local |
 | Delivery, orders and cancellation | Yes | Yes |
 | Add goods / move an existing order | Yes | Yes |
 | Protected checkout | Fresh or standing authorization, reconcile | Fresh or standing authorization, Vipps mobile approval, reconcile |
@@ -113,6 +113,17 @@ an existing household/provider config. If the machine uses non-standard paths,
 set `HERMES_PYTHON`, `MEAL_PLANNER_AGENT_BROWSER` or
 `MEAL_PLANNER_BROWSER_EXECUTABLE` while running the installer; their resolved
 values are saved in the private service definition.
+
+Clean installations create household state v6 with only the
+`product_favorites` list and expose the
+`meal_planner_product_favorites` tool. When rerun for an existing installation,
+the installer stops only the meal-planner service, creates the non-overwriting
+private `state-v5.backup.json`, migrates the product list atomically, refreshes
+the installed skill and MCP registration, restarts the service, and verifies
+both status and the new tool schema. This also starts an existing installation
+that was stopped before the update. If migration fails, the old state and its
+backup remain usable and the service stays stopped. Roll back by restoring the
+v5 backup before running v5 code; v5 code must not read a v6 state file.
 
 New installations use `"confirmation_policy": "fresh"`: Hermes prepares the
 exact checkout or cancellation summary and asks once before dispatch. An owner
@@ -268,7 +279,7 @@ an advanced manual layout with separate service and agent users.
 
 State is bound to the provider selected at first initialization. Do not switch
 an existing private state directory in place: pending checkout, cancellation,
-order-change, schedule, favorite and recurring records are provider-specific.
+order-change, schedule, product-favorite and recurring records are provider-specific.
 Use a separate private installation and MCP registration for another provider.
 
 ## Private recipe bank
@@ -380,6 +391,11 @@ requests, in a safe order, are:
   recipes still inside the cooldown unless the user asks to see repeats.
 - “Save this product as a favorite” or “Add this every two weeks,” using an
   exact product returned by search.
+- “List favorite products” uses the local product-favorites tool and never
+  changes the cart. Recipe favorites are unsupported until a separate recipe
+  capability is installed; never store a recipe through the product tool. If
+  one displayed product and one displayed recipe have the same name and the
+  request is genuinely ambiguous, ask one short clarification.
 - “Schedule a weekly Thursday draft,” or explicitly configure a guarded
   scheduled-checkout maximum and delivery preference. The due run follows the
   configured confirmation policy after its amount and delivery guards pass.

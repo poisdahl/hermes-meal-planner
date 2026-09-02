@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import struct
 import sys
 import tempfile
@@ -308,14 +309,23 @@ class MutableFakeMeny(MutableCartMixin, FakeMeny):
         return super().call(tool, arguments, **kwargs)
 
 
-class CoreTests(unittest.TestCase):
+class CoreTestsBase:
+    @staticmethod
+    def write_state(directory, state):
+        path = Path(directory) / "state.json"
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return path
+
     def test_mcp_saved_item_tools_build_the_internal_item_shape(self):
         class FakeMCPServer:
             def __init__(self, *_args, **_kwargs):
-                pass
+                self.tools = {}
 
-            def tool(self, **_kwargs):
-                return lambda function: function
+            def tool(self, **metadata):
+                def register(function):
+                    self.tools[function.__name__] = metadata
+                    return function
+                return register
 
         mcp = types.ModuleType("mcp")
         mcp_server_package = types.ModuleType("mcp.server")
@@ -334,9 +344,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(module.rpc_timeout("delivery", {"action": "list"}), 300)
         self.assertEqual(module.rpc_timeout("checkout", {"action": "submit"}), 660)
         module.rpc = mock.Mock(return_value={})
-        module.meal_planner_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
+        self.assertIn("meal_planner_product_favorites", module.server.tools)
+        self.assertNotIn("meal_planner_favorites", module.server.tools)
+        module.meal_planner_product_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
         module.rpc.assert_called_with(
-            "favorites",
+            "product_favorites",
             action="add",
             item={"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 2},
             product_id=MENY_PRODUCT,
@@ -437,8 +449,8 @@ class CoreTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(HouseholdError):
                     normalize_product_ref(invalid)
-        favorites = put_item([], {"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1})
-        self.assertEqual(favorites[0]["product_id"], MENY_PRODUCT)
+        product_items = put_item([], {"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1})
+        self.assertEqual(product_items[0]["product_id"], MENY_PRODUCT)
         short_suffix = "/varer/frukt-gront/gronnsaker/kal/brokkoli/brokkoli-4349"
         saved = put_item([], {"product_id": short_suffix, "product_name": "Brokkoli", "quantity": 1})
         self.assertEqual(saved[0]["product_id"], short_suffix)
@@ -960,17 +972,150 @@ class CoreTests(unittest.TestCase):
             "history": [{"old": True}],
         }}
         state = migrate(CONFIG, planning, {"schedules": []})
-        self.assertEqual(len(state["favorites"]), 1)
+        self.assertEqual(state["version"], 6)
+        self.assertEqual(len(state["product_favorites"]), 1)
+        self.assertNotIn("favorites", state)
         self.assertEqual(len(state["recurring_items"]), 1)
         self.assertEqual(state["email_recipient"], "owner@example.test")
         self.assertIsNone(state["menu"])
         self.assertIsNone(state["pending_checkout"])
 
+    def test_clean_state_and_skill_expose_only_product_favorites(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+        self.assertEqual(state["version"], 6)
+        self.assertEqual(state["product_favorites"], [])
+        self.assertNotIn("favorites", state)
+        skill = (CORE / "skill" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("meal_planner_product_favorites", skill)
+        self.assertIn("Never route “favorite this recipe” to the product tool", skill)
+
+    def test_v5_migration_creates_one_private_backup_and_preserves_the_exact_product_list(self):
+        items = [
+            {"product_id": "20", "product_name": "Second", "quantity": 3, "product_url": "https://example.test/20"},
+            {"product_id": "3", "product_name": "First", "quantity": 1, "label": "keep exact"},
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state["version"] = 5
+            state["favorites"] = deepcopy(items)
+            del state["product_favorites"]
+            state_path = self.write_state(temp, state)
+
+            migrated = StateStore(Path(temp), CONFIG).read()
+            backup_path = Path(temp) / "state-v5.backup.json"
+            backup_before = backup_path.read_bytes()
+            state_before = state_path.read_bytes()
+            modified_before = state_path.stat().st_mtime_ns
+
+            self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(backup_before), state)
+            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["product_favorites"], items)
+            self.assertNotIn("favorites", migrated)
+
+            StateStore(Path(temp), CONFIG)
+            self.assertEqual(backup_path.read_bytes(), backup_before)
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(state_path.stat().st_mtime_ns, modified_before)
+
+    def test_v5_identical_dual_keys_canonicalize_and_conflicting_keys_fail_without_state_change(self):
+        items = [{"product_id": "1", "product_name": "A", "quantity": 2}]
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state.update({"version": 5, "favorites": deepcopy(items), "product_favorites": deepcopy(items)})
+            self.write_state(temp, state)
+            migrated = StateStore(Path(temp), CONFIG).read()
+            self.assertEqual(migrated["product_favorites"], items)
+            self.assertNotIn("favorites", migrated)
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state.update({
+                "version": 5,
+                "favorites": deepcopy(items),
+                "product_favorites": [{"product_id": "2", "product_name": "B", "quantity": 1}],
+            })
+            state_path = self.write_state(temp, state)
+            before = state_path.read_bytes()
+            with self.assertRaisesRegex(HouseholdError, "conflict"):
+                StateStore(Path(temp), CONFIG)
+            self.assertEqual(state_path.read_bytes(), before)
+            self.assertEqual(json.loads((Path(temp) / "state-v5.backup.json").read_text(encoding="utf-8")), state)
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state.update({
+                "version": 5,
+                "favorites": [{"product_id": "1", "product_name": "A", "quantity": 1, "label": True}],
+                "product_favorites": [{"product_id": "1", "product_name": "A", "quantity": 1, "label": 1}],
+            })
+            state_path = self.write_state(temp, state)
+            before = state_path.read_bytes()
+            with self.assertRaisesRegex(HouseholdError, "conflict"):
+                StateStore(Path(temp), CONFIG)
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_malformed_v6_old_key_fails_closed_and_older_states_continue_through_v6(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state["favorites"] = []
+            state_path = self.write_state(temp, state)
+            before = state_path.read_bytes()
+            with self.assertRaisesRegex(HouseholdError, "retired favorites key"):
+                StateStore(Path(temp), CONFIG)
+            self.assertEqual(state_path.read_bytes(), before)
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state["version"] = 4
+            state["favorites"] = [{"product_id": "1", "product_name": "A", "quantity": 1}]
+            del state["product_favorites"]
+            self.write_state(temp, state)
+            migrated = StateStore(Path(temp), CONFIG).read()
+            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["product_favorites"], state["favorites"])
+            self.assertTrue((Path(temp) / "state-v4.backup.json").exists())
+            self.assertTrue((Path(temp) / "state-v5.backup.json").exists())
+
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state["version"] = 7
+            self.write_state(temp, state)
+            with self.assertRaisesRegex(HouseholdError, "newer than"):
+                StateStore(Path(temp), CONFIG)
+
+    def test_legacy_import_cli_emits_only_the_canonical_product_favorite_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config.json"
+            planning_path = root / "planning.json"
+            config_path.write_text(json.dumps(CONFIG), encoding="utf-8")
+            planning_path.write_text(json.dumps({"documents": {
+                "favorites": {"items": [{"product_id": "1", "product_name": "A", "quantity": 1}]},
+            }}), encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable, str(CORE / "migrate.py"),
+                    "--config", str(config_path),
+                    "--old-planning", str(planning_path),
+                    "--output-directory", str(root / "output"),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+            report = json.loads(completed.stdout)
+            state = json.loads((root / "output" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["product_favorites_count"], 1)
+            self.assertNotIn("favorites", report)
+            self.assertEqual(state["version"], 6)
+            self.assertEqual(state["product_favorites"][0]["product_id"], "1")
+            self.assertNotIn("favorites", state)
+
     def test_profile_reset_does_not_touch_lists(self):
         with tempfile.TemporaryDirectory() as temp:
             store = StateStore(Path(temp), CONFIG)
             with store.locked() as state:
-                state["favorites"] = [{"product_id": "1", "product_name": "A", "quantity": 1}]
+                state["product_favorites"] = [{"product_id": "1", "product_name": "A", "quantity": 1}]
             store.update_profile({"meals": {"dishes": 4, "maximum_active_minutes": 40}, "cuisine": {"base_style": "Nordic"}, "products": {"priority": ["quality", "price"]}})
             store.reset_profile(["meals.dishes", "products.priority"])
             state = store.read()
@@ -978,16 +1123,16 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(state["profile"]["cuisine"]["base_style"], "Nordic")
             self.assertEqual(state["profile"]["meals"]["maximum_active_minutes"], 40)
             self.assertNotEqual(state["profile"]["products"]["priority"], ["quality", "price"])
-            self.assertEqual(len(state["favorites"]), 1)
+            self.assertEqual(len(state["product_favorites"]), 1)
 
     def test_separate_directories_isolate_households(self):
         with tempfile.TemporaryDirectory() as temp:
             a = StateStore(Path(temp) / "a", {**CONFIG, "household": "A"})
             b = StateStore(Path(temp) / "b", {**CONFIG, "household": "B"})
             with a.locked() as state:
-                state["favorites"] = [{"product_id": "1", "product_name": "A", "quantity": 1}]
-            self.assertEqual(len(a.read()["favorites"]), 1)
-            self.assertEqual(b.read()["favorites"], [])
+                state["product_favorites"] = [{"product_id": "1", "product_name": "A", "quantity": 1}]
+            self.assertEqual(len(a.read()["product_favorites"]), 1)
+            self.assertEqual(b.read()["product_favorites"], [])
 
     def test_state_is_bound_to_one_provider(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1003,6 +1148,247 @@ class CoreTests(unittest.TestCase):
                 del state["provider"]
             migrated = StateStore(Path(temp), CONFIG)
             self.assertEqual(migrated.read()["provider"], "oda")
+
+
+class CoreTests(CoreTestsBase, unittest.TestCase):
+    @staticmethod
+    def write_executable(path, content):
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+
+    def fake_install(self, root, *, conflicting=False, clean=False, active=True, platform="Linux"):
+        fake_bin = root / "bin"
+        fake_modules = root / "modules"
+        hermes_home = root / "hermes"
+        private_root = root / "private"
+        fake_bin.mkdir()
+        fake_modules.mkdir()
+        hermes_home.mkdir()
+        (hermes_home / "skills" / "meal-planner").mkdir(parents=True)
+        (hermes_home / "config.yaml").touch()
+        private_root.mkdir()
+
+        settings = {
+            **CONFIG,
+            "provider": "meny",
+            "vipps_phone_number": "90000000",
+            "confirmation_policy": "fresh",
+        }
+        config_path = private_root / "config.json"
+        state_path = private_root / "state" / "state.json"
+        state = None
+        product_items = []
+        if not clean:
+            config_path.write_text(json.dumps(settings), encoding="utf-8")
+            state_store = StateStore(private_root / "state", settings)
+            state = state_store.read()
+            product_items = [{"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 2}]
+            state["version"] = 5
+            state["favorites"] = deepcopy(product_items)
+            del state["product_favorites"]
+            if conflicting:
+                state["product_favorites"] = [{"product_id": "/varer/frukt-epler-1234", "product_name": "Eple", "quantity": 1}]
+            state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        systemctl_log = root / "systemctl.log"
+        python_log = root / "python.log"
+        hermes_log = root / "hermes.log"
+        python_wrapper = fake_bin / "python"
+        self.write_executable(python_wrapper, f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+arguments = sys.argv[1:]
+if arguments == [\"-c\", \"import mcp; import tools.mcp_oauth\"]:
+    raise SystemExit(0)
+if arguments and arguments[0] == \"-\":
+    source = sys.stdin.read()
+    if 'status = rpc(\"status\")' in source:
+        state_path = Path(os.environ[\"MEAL_PLANNER_HOME\"]) / \"state\" / \"state.json\"
+        state = json.loads(state_path.read_text(encoding=\"utf-8\"))
+        if state.get(\"version\") != 6 or \"product_favorites\" not in state or \"favorites\" in state:
+            raise SystemExit(1)
+        with open({str(python_log)!r}, \"a\", encoding=\"utf-8\") as handle:
+            handle.write(\"status-probe\\n\")
+        raise SystemExit(0)
+    completed = subprocess.run([{sys.executable!r}, *arguments], input=source, text=True)
+    raise SystemExit(completed.returncode)
+os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
+""")
+        (fake_modules / "yaml.py").write_text(
+            "import json\n\ndef safe_load(value):\n    return json.loads(value) if value.strip() else None\n",
+            encoding="utf-8",
+        )
+        self.write_executable(fake_bin / "uname", f"#!/bin/sh\nprintf '%s\\n' {platform}\n")
+        self.write_executable(fake_bin / "agent-browser", "#!/bin/sh\nexit 0\n")
+        self.write_executable(fake_bin / "chromium", "#!/bin/sh\nexit 0\n")
+        self.write_executable(fake_bin / "systemctl", f"""#!/bin/sh
+printf '%s\\n' \"$*\" >> {str(systemctl_log)!r}
+if [ \"$*\" = \"--user is-active --quiet hermes-meal-planner.service\" ] && [ \"${{FAKE_SERVICE_ACTIVE:-false}}\" != true ]; then
+  exit 3
+fi
+exit 0
+""")
+        self.write_executable(fake_bin / "launchctl", f"""#!/bin/sh
+printf '%s\\n' \"$*\" >> {str(systemctl_log)!r}
+if [ \"$1\" = print ] && [ \"${{FAKE_SERVICE_ACTIVE:-false}}\" != true ]; then
+  exit 3
+fi
+exit 0
+""")
+        self.write_executable(fake_bin / "plutil", "#!/bin/sh\nexit 0\n")
+        self.write_executable(fake_bin / "hermes", f"""#!{sys.executable}
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+arguments = sys.argv[1:]
+with open({str(hermes_log)!r}, "a", encoding="utf-8") as handle:
+    handle.write(" ".join(arguments) + "\\n")
+if arguments == ["mcp", "add", "--help"]:
+    print("--connect-timeout")
+elif arguments[:3] == ["mcp", "add", "meal_planner"]:
+    command = arguments[arguments.index("--command") + 1]
+    socket = arguments[arguments.index("--env") + 1].split("=", 1)[1]
+    script = arguments[arguments.index("--args") + 1]
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    raw = config_path.read_text(encoding="utf-8")
+    value = json.loads(raw) if raw.strip() else dict()
+    value.setdefault("mcp_servers", dict())["meal_planner"] = dict(
+        command=command,
+        args=[script],
+        env=dict([("MEAL_PLANNER_SOCKET", socket)]),
+        enabled=True,
+    )
+    config_path.write_text(json.dumps(value), encoding="utf-8")
+elif arguments == ["mcp", "test", "meal_planner"]:
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    value = json.loads(config_path.read_text(encoding="utf-8"))
+    script = value["mcp_servers"]["meal_planner"]["args"][0]
+    source = Path(script).read_text(encoding="utf-8")
+    for name in re.findall(r"^def (meal_planner_[A-Za-z0-9_]+)\\(", source, re.MULTILINE):
+        print(name)
+else:
+    raise SystemExit(1)
+""")
+
+        socket_path = private_root / "service.sock"
+        if not clean:
+            (hermes_home / "config.yaml").write_text(json.dumps({
+                "mcp_servers": {
+                    "meal_planner": {
+                        "command": str(python_wrapper),
+                        "args": [str(CORE / "mcp_server.py")],
+                        "env": {"MEAL_PLANNER_SOCKET": str(socket_path)},
+                        "enabled": True,
+                    },
+                },
+            }), encoding="utf-8")
+            (hermes_home / "skills" / "meal-planner" / "SKILL.md").write_text("old installed skill\n", encoding="utf-8")
+
+        environment = {
+            **os.environ,
+            "HOME": str(root / "home"),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "PYTHONPATH": str(fake_modules),
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_PYTHON": str(python_wrapper),
+            "MEAL_PLANNER_HOME": str(private_root),
+            "MEAL_PLANNER_AGENT_BROWSER": str(fake_bin / "agent-browser"),
+            "MEAL_PLANNER_BROWSER_EXECUTABLE": str(fake_bin / "chromium"),
+            "MEAL_PLANNER_VIPPS_PHONE_NUMBER": "90000000",
+            "FAKE_SERVICE_ACTIVE": "true" if active else "false",
+            "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_RUNTIME_DIR": str(root / "runtime"),
+        }
+        completed = subprocess.run(
+            ["/bin/bash", str(CORE / "install.sh"), "--provider", "meny", "--household", "Test"],
+            cwd=CORE, env=environment, capture_output=True, text=True,
+        )
+        return completed, state, product_items, state_path, systemctl_log, python_log, hermes_log, hermes_home, private_root
+
+    def test_active_upgrade_migrates_refreshes_restarts_and_verifies_the_new_schema(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            completed, old_state, product_items, state_path, systemctl_log, python_log, hermes_log, hermes_home, private_root = self.fake_install(root)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            migrated = json.loads(state_path.read_text(encoding="utf-8"))
+            backup = private_root / "state" / "state-v5.backup.json"
+            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["product_favorites"], product_items)
+            self.assertNotIn("favorites", migrated)
+            self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), old_state)
+            self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+            commands = systemctl_log.read_text(encoding="utf-8").splitlines()
+            self.assertLess(commands.index("--user stop hermes-meal-planner.service"), commands.index("--user start hermes-meal-planner.service"))
+            self.assertEqual([line for line in commands if " stop " in f" {line} "], ["--user stop hermes-meal-planner.service"])
+            self.assertEqual([line for line in commands if " start " in f" {line} "], ["--user start hermes-meal-planner.service"])
+            self.assertEqual(python_log.read_text(encoding="utf-8"), "status-probe\n")
+            self.assertIn("mcp test meal_planner", hermes_log.read_text(encoding="utf-8"))
+            installed_skill = (hermes_home / "skills" / "meal-planner" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("meal_planner_product_favorites", installed_skill)
+
+    def test_inactive_existing_linux_and_macos_installs_are_started_and_verified(self):
+        for platform in ("Linux", "Darwin"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                completed, _old_state, product_items, state_path, service_log, python_log, _hermes_log, _hermes_home, _private_root = self.fake_install(
+                    root, active=False, platform=platform,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                migrated = json.loads(state_path.read_text(encoding="utf-8"))
+                self.assertEqual(migrated["product_favorites"], product_items)
+                commands = service_log.read_text(encoding="utf-8").splitlines()
+                if platform == "Linux":
+                    self.assertNotIn("--user stop hermes-meal-planner.service", commands)
+                    self.assertIn("--user start hermes-meal-planner.service", commands)
+                else:
+                    self.assertFalse(any(command.startswith("bootout ") for command in commands))
+                    self.assertTrue(any(command.startswith("bootstrap gui/") for command in commands))
+                self.assertEqual(python_log.read_text(encoding="utf-8"), "status-probe\n")
+
+    def test_clean_install_creates_v6_skill_registration_and_new_tool_schema(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            completed, old_state, product_items, state_path, service_log, python_log, hermes_log, hermes_home, private_root = self.fake_install(
+                root, clean=True, active=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIsNone(old_state)
+            self.assertEqual(product_items, [])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["version"], 6)
+            self.assertEqual(state["product_favorites"], [])
+            self.assertNotIn("favorites", state)
+            self.assertFalse((private_root / "state" / "state-v5.backup.json").exists())
+            commands = service_log.read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("--user stop hermes-meal-planner.service", commands)
+            self.assertNotIn("--user start hermes-meal-planner.service", commands)
+            self.assertFalse(python_log.exists())
+            hermes_commands = hermes_log.read_text(encoding="utf-8")
+            self.assertIn("mcp add meal_planner", hermes_commands)
+            self.assertIn("mcp test meal_planner", hermes_commands)
+            installed_skill = (hermes_home / "skills" / "meal-planner" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("meal_planner_product_favorites", installed_skill)
+
+    def test_failed_v5_migration_leaves_state_and_backup_and_does_not_restart(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            completed, old_state, _product_items, state_path, systemctl_log, python_log, hermes_log, _hermes_home, private_root = self.fake_install(root, conflicting=True)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("conflict", completed.stderr)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), old_state)
+            self.assertEqual(json.loads((private_root / "state" / "state-v5.backup.json").read_text(encoding="utf-8")), old_state)
+            commands = systemctl_log.read_text(encoding="utf-8").splitlines()
+            self.assertIn("--user stop hermes-meal-planner.service", commands)
+            self.assertNotIn("--user start hermes-meal-planner.service", commands)
+            self.assertFalse(python_log.exists())
+            self.assertNotIn("mcp test meal_planner", hermes_log.read_text(encoding="utf-8"))
 
     def test_checkout_starts_from_the_exact_cart_page(self):
         browser = OdaBrowser.__new__(OdaBrowser)
@@ -4626,6 +5012,8 @@ class FlowTests(unittest.TestCase):
     def test_status_exposes_the_fresh_confirmation_default(self):
         status = self.app.handle({"operation": "status"})
         self.assertEqual(status["confirmation_policy"], "fresh")
+        self.assertEqual(status["product_favorites_count"], 0)
+        self.assertNotIn("favorites", status)
         self.assertIsNone(status["pending_checkout_status"])
         self.assertIsNone(status["pending_cancellation_status"])
         self.assertIsNone(status["order_change_status"])
@@ -4635,6 +5023,26 @@ class FlowTests(unittest.TestCase):
         status = self.app.handle({"operation": "status"})
         self.assertEqual(status["pending_checkout_status"], "uncertain")
         self.assertNotIn("private", status)
+
+    def test_product_favorites_are_idempotent_local_records_and_the_old_operation_is_absent(self):
+        calls_before = deepcopy(self.oda.calls)
+        request = {
+            "operation": "product_favorites", "action": "add",
+            "item": {"product_id": "10", "product_name": "Fullkornspasta", "quantity": 2},
+        }
+        first = self.app.handle(request)
+        second = self.app.handle(request)
+        self.assertEqual(first, second)
+        self.assertEqual(first["product_favorites"], [{
+            "product_id": "10", "product_name": "Fullkornspasta", "quantity": 2,
+        }])
+        self.assertEqual(self.oda.calls, calls_before)
+        self.app.handle({"operation": "product_favorites", "action": "remove", "product_id": "10"})
+        removed_again = self.app.handle({"operation": "product_favorites", "action": "remove", "product_id": "10"})
+        self.assertEqual(removed_again, {"product_favorites": []})
+        self.assertEqual(self.oda.calls, calls_before)
+        with self.assertRaisesRegex(HouseholdError, "unknown household operation"):
+            self.app.handle({"operation": "favorites", "action": "list"})
 
     def test_menu_clear_discards_only_an_expired_pre_dispatch_checkout(self):
         current = datetime(2026, 9, 1, tzinfo=timezone.utc)
@@ -5435,20 +5843,20 @@ class FlowTests(unittest.TestCase):
 
     def test_saved_items_must_match_the_configured_provider(self):
         with self.assertRaisesRegex(HouseholdError, "configured Oda provider"):
-            self.app.handle({"operation": "favorites", "action": "add", "item": {"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1}})
+            self.app.handle({"operation": "product_favorites", "action": "add", "item": {"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1}})
         with tempfile.TemporaryDirectory() as temp:
             store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
             app = Application(store, FakeOda(), self.browser)
-            added = app.handle({"operation": "favorites", "action": "add", "item": {"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1}})
-            self.assertEqual(added["favorites"][0]["product_id"], MENY_PRODUCT)
+            added = app.handle({"operation": "product_favorites", "action": "add", "item": {"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1}})
+            self.assertEqual(added["product_favorites"][0]["product_id"], MENY_PRODUCT)
             with self.assertRaisesRegex(HouseholdError, "MENY product_id"):
                 app.handle({"operation": "recurring", "action": "add", "item": {"product_id": "10", "product_name": "Pasta", "quantity": 1}})
 
     def test_incompatible_saved_item_is_not_silently_listed(self):
         with self.store.locked() as state:
-            state["favorites"] = [{"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1}]
+            state["product_favorites"] = [{"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 1}]
         with self.assertRaisesRegex(HouseholdError, "configured Oda provider"):
-            self.app.handle({"operation": "favorites", "action": "list"})
+            self.app.handle({"operation": "product_favorites", "action": "list"})
 
     def test_expired_service_cart_deadline_dispatches_no_provider_call(self):
         with tempfile.TemporaryDirectory() as temp:

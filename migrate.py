@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from core import StateStore, _atomic_json, initial_state
+from core import StateStore, _atomic_json, _validate_product_items, initial_state
 
 
 def load(path: Path) -> dict[str, Any]:
@@ -22,10 +22,11 @@ def load(path: Path) -> dict[str, Any]:
 def migrate(config: dict[str, Any], planning: dict[str, Any], schedule: dict[str, Any] | None = None) -> dict[str, Any]:
     result = initial_state(config)
     documents = planning.get("documents") if isinstance(planning.get("documents"), dict) else {}
-    favorites = (documents.get("favorites") or {}).get("items", [])
+    product_favorites = (documents.get("favorites") or {}).get("items", [])
     recurring = (documents.get("recurring_items") or {}).get("items", [])
-    if isinstance(favorites, list):
-        result["favorites"] = favorites
+    if isinstance(product_favorites, list):
+        _validate_product_items(product_favorites, "product_favorites")
+        result["product_favorites"] = product_favorites
     if isinstance(recurring, list):
         result["recurring_items"] = recurring
     preferences = (documents.get("preferences") or {}).get("content", "")
@@ -57,7 +58,7 @@ def main() -> None:
     result = migrate(config, planning, schedule)
     store = StateStore(args.output_directory, config)
     _atomic_json(store.path, result)
-    print(json.dumps({"ok": True, "favorites": len(result["favorites"]), "recurring_items": len(result["recurring_items"]), "schedule_enabled": result["schedule"]["enabled"], "menu_migrated": False, "checkout_migrated": False, "email_recipient_configured": bool(result["email_recipient"])}))
+    print(json.dumps({"ok": True, "product_favorites_count": len(result["product_favorites"]), "recurring_items": len(result["recurring_items"]), "schedule_enabled": result["schedule"]["enabled"], "menu_migrated": False, "checkout_migrated": False, "email_recipient_configured": bool(result["email_recipient"])}))
 
 
 if __name__ == "__main__":

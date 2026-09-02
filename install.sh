@@ -78,6 +78,10 @@ launchd_label="${MEAL_PLANNER_LAUNCHD_LABEL:-com.hermes-agent.meal-planner}"
 launch_agent_path="${MEAL_PLANNER_LAUNCH_AGENT_PATH:-$HOME/Library/LaunchAgents/$launchd_label.plist}"
 launchd_stdout_path="${MEAL_PLANNER_STDOUT_LOG:-$HOME/Library/Logs/$launchd_label.out.log}"
 launchd_stderr_path="${MEAL_PLANNER_STDERR_LOG:-$HOME/Library/Logs/$launchd_label.err.log}"
+existing_install=false
+if [[ -e "$config_path" || -e "$private_root/state/state.json" || -e "$unit_path" || -e "$user_unit_path" || -e "$launch_agent_path" ]]; then
+  existing_install=true
+fi
 
 find_hermes_python() {
   local candidate
@@ -195,6 +199,7 @@ case "$(uname -s)" in
       echo "MEAL_PLANNER_LAUNCHD_LABEL contains unsupported characters" >&2
       exit 2
     fi
+    launchd_domain="gui/$(id -u)"
     service_manager=launchd
     ;;
   Linux)
@@ -246,6 +251,24 @@ with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
 PY
 fi
 chmod 600 "$config_path"
+
+if [[ "$existing_install" == true && "$service_manager" == "systemd" ]]; then
+  if systemctl --user is-active --quiet hermes-meal-planner.service; then
+    systemctl --user stop hermes-meal-planner.service
+  fi
+elif [[ "$existing_install" == true ]] && launchctl print "$launchd_domain/$launchd_label" >/dev/null 2>&1; then
+  launchctl bootout "$launchd_domain/$launchd_label"
+fi
+
+"$python" - "$private_root/state" "$config_path" <<'PY'
+from pathlib import Path
+import sys
+
+from core import StateStore
+from service import config
+
+StateStore(Path(sys.argv[1]), config(Path(sys.argv[2])))
+PY
 
 cp "$source_root/skill/SKILL.md" "$hermes_home/skills/meal-planner/SKILL.md"
 chmod 600 "$hermes_home/skills/meal-planner/SKILL.md"
@@ -387,6 +410,45 @@ PY
 
 if [[ "$service_manager" == "systemd" ]]; then
   systemctl --user daemon-reload
+  if [[ "$existing_install" == true ]]; then
+    systemctl --user start hermes-meal-planner.service
+  fi
+else
+  if [[ "$existing_install" == true ]]; then
+    launchctl bootstrap "$launchd_domain" "$launch_agent_path"
+  fi
+fi
+
+if [[ "$existing_install" == true ]]; then
+  status_verified=false
+  for _attempt in {1..40}; do
+    if MEAL_PLANNER_SOCKET="$socket_path" "$python" - <<'PY'
+from mcp_server import rpc
+
+status = rpc("status")
+if "product_favorites_count" not in status or "favorites" in status:
+    raise SystemExit("meal-planner status still exposes the old favorites schema")
+PY
+    then
+      status_verified=true
+      break
+    fi
+    sleep 0.5
+  done
+  if [[ "$status_verified" != true ]]; then
+    echo "the restarted meal-planner service did not expose canonical v6 status" >&2
+    exit 1
+  fi
+fi
+
+mcp_probe="$(hermes mcp test meal_planner 2>&1)"
+if [[ "$mcp_probe" != *"meal_planner_product_favorites"* || "$mcp_probe" == *"meal_planner_favorites"* ]]; then
+  echo "Hermes MCP discovery did not expose only meal_planner_product_favorites" >&2
+  printf '%s\n' "$mcp_probe" >&2
+  exit 1
+fi
+
+if [[ "$service_manager" == "systemd" ]]; then
   cat <<EOF
 Installed the meal planner for $household with provider $provider.
 
@@ -402,7 +464,6 @@ Resolved runtime:
   Chromium: $chromium
 EOF
 else
-  launchd_domain="gui/$(id -u)"
   cat <<EOF
 Installed the meal planner for $household with provider $provider.
 

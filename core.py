@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import re
 import secrets
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 
 class HouseholdError(RuntimeError):
@@ -119,11 +119,11 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 5,
+        "version": 6,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
-        "favorites": [],
+        "product_favorites": [],
         "recurring_items": [],
         "schedule": deepcopy(DEFAULT_SCHEDULE),
         "email_recipient": None,
@@ -270,12 +270,31 @@ def _add_legacy_usage(state: dict[str, Any], menu: Mapping[str, Any]) -> None:
     })
 
 
-def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
+def _validate_product_items(value: Any, field: str) -> None:
+    if not isinstance(value, list):
+        raise HouseholdError(f"household {field} must be a list")
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise HouseholdError(f"household {field} item must be an object")
+        item_key(item)
+        product_name = item.get("product_name")
+        quantity = item.get("quantity", 1)
+        if not isinstance(product_name, str) or not product_name.strip() or isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+            raise HouseholdError(f"household {field} item requires a product name and positive integer quantity")
+
+
+def _migrate_state(
+    state: dict[str, Any],
+    config: Mapping[str, Any],
+    before_v6: Callable[[Mapping[str, Any]], None] | None = None,
+) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 5:
+    if version > 6:
         raise HouseholdError("household state is newer than this meal planner")
+    if version == 6 and "favorites" in state:
+        raise HouseholdError("household v6 state contains the retired favorites key")
     if version == 1:
         profile = state.get("profile")
         if not isinstance(profile, dict):
@@ -361,6 +380,24 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
             "noninteractive_defaults_applied_at": None,
         })
         state["version"] = 5
+    if version < 5:
+        state.setdefault("favorites", [])
+    if state["version"] == 5:
+        if before_v6 is not None:
+            before_v6(state)
+        old_items = state.get("favorites")
+        _validate_product_items(old_items, "favorites")
+        if "product_favorites" in state:
+            new_items = state["product_favorites"]
+            _validate_product_items(new_items, "product_favorites")
+            old_encoded = json.dumps(old_items, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            new_encoded = json.dumps(new_items, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            if old_encoded != new_encoded:
+                raise HouseholdError("household v5 favorites conflict with product_favorites")
+        state["product_favorites"] = deepcopy(old_items)
+        del state["favorites"]
+        state["version"] = 6
+    _validate_product_items(state.get("product_favorites"), "product_favorites")
     state.setdefault("recipe_usage", {})
     state.setdefault("recipe_usage_requests", {})
     state.setdefault("order_snapshots", {})
@@ -482,7 +519,12 @@ class StateStore:
                 backup = self.directory / f"state-v{source_version}.backup.json"
                 if not backup.exists():
                     _atomic_json(backup, state)
-            _migrate_state(state, self.config)
+            def backup_v5(value: Mapping[str, Any]) -> None:
+                backup = self.directory / "state-v5.backup.json"
+                if not backup.exists():
+                    _atomic_json(backup, value)
+
+            _migrate_state(state, self.config, before_v6=backup_v5)
             state_household = state.get("household")
             configured_household = str(self.config["household"])
             if state_household is None:
@@ -629,7 +671,7 @@ def masked_status(state: Mapping[str, Any], integration: Mapping[str, Any]) -> d
         "auto_checkout": state["schedule"]["auto_checkout"],
         "schedule": deepcopy(state["schedule"]),
         "email_recipient": mask_email(state.get("email_recipient")),
-        "favorites": len(state["favorites"]),
+        "product_favorites_count": len(state["product_favorites"]),
         "recurring_items": len(state["recurring_items"]),
         "menu_phase": (state.get("menu") or {}).get("phase"),
         "menu_id": (state.get("menu") or {}).get("menu_id"),

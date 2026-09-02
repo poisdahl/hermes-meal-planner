@@ -904,8 +904,8 @@ class Application:
             return self._setup(request)
         if operation == "profile":
             return self._profile(request)
-        if operation == "favorites":
-            return self._items(request, "favorites")
+        if operation == "product_favorites":
+            return self._items(request, "product_favorites")
         if operation == "recurring":
             return self._recurring(request)
         if operation == "recipes":

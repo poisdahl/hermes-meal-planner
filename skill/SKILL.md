@@ -58,9 +58,16 @@ or list tools; it may be numeric or a full provider path, so never shorten it.
 MENY has one household browser, so call provider-facing tools sequentially and
 never start two MENY catalog, cart, delivery, order or checkout calls in
 parallel. Each call then gets its own bounded browser window.
-For a favorite or recurring add, pass search's `product_id` and `name` through
-the tool's top-level `product_id` and `product_name` arguments; do not construct
-an item object. To add goods to an existing order or move its delivery, start
+For a product-favorite or recurring add, pass product search's `product_id` and
+`name` through the tool's top-level `product_id` and `product_name` arguments;
+do not construct an item object. “Save this product as a favorite,” “list
+favorite products,” and equivalent requests use
+`meal_planner_product_favorites`. This local provider-bound list never changes
+the cart. Never route “favorite this recipe” to the product tool; recipe
+favorites are unsupported unless a separate discovered recipe-favorites
+capability is available. If one displayed product and one displayed recipe
+share the same name and the request is genuinely ambiguous, ask one short
+clarification. To add goods to an existing order or move its delivery, start
 that exact order change first,
 then use the ordinary cart or delivery tool and protected checkout. Do not
 reproduce integration rules or maintain household data in the skill or chat.
