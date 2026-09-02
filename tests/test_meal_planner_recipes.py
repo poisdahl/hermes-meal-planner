@@ -354,6 +354,12 @@ class RecipeStoreTests(unittest.TestCase):
         self.assertNotEqual(deep.returncode, 0)
         self.assertIn("line 1 is invalid", deep.stderr)
         self.assertNotIn("Traceback", deep.stderr)
+        scalar_path = Path(self.temp.name) / "scalar.jsonl"
+        scalar_path.write_text("null\n", encoding="utf-8")
+        scalar = subprocess.run([sys.executable, str(CORE / "import_recipes.py"), str(scalar_path), "--state-directory", str(state_directory)], capture_output=True, text=True)
+        self.assertNotEqual(scalar.returncode, 0)
+        self.assertIn("line 1 is invalid", scalar.stderr)
+        self.assertNotIn("Traceback", scalar.stderr)
 
 
 class RecipeSourceAdapterTests(unittest.TestCase):

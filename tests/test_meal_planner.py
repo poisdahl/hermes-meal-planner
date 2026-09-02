@@ -31,6 +31,7 @@ from oda_browser import (  # noqa: E402
     CancellationPreconditionError,
     CheckoutPreconditionError,
     OdaBrowser,
+    OdaCheckoutMismatchError,
     cancellation_delivery_matches,
     cancellation_total_matches,
     clear_cancellation_cache,
@@ -39,7 +40,7 @@ from oda_browser import (  # noqa: E402
     product_identity,
 )
 from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, MenyOrderChangeDispatchError, _BrowserTransportError, _DeliveryReservationError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_card_status, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, MenyOrderChangeDispatchError, _BrowserTransportError, _CheckoutNotReadyError, _DeliveryReservationError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_card_status, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -239,6 +240,7 @@ class FakeMeny(FakeOda):
 
     def submit_checkout(self, cart, review, before_click=None, *, order_change=None, deadline=None):
         if before_click:
+            before_click()
             before_click()
         self.checkout_clicks += 1
         return {"awaiting_user_payment": True, "payment": "vipps"}
@@ -1854,15 +1856,44 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._read_cart.call_count, 4)
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.5), mock.call(0.5), mock.call(0.5)])
 
-    def test_cart_change_marks_an_unsettled_readback_as_partial(self):
+    def test_cart_change_accepts_stable_quantities_while_totals_finish_updating(self):
         client = self.client()
         client._change_one = mock.Mock()
         client._read_cart = mock.Mock(side_effect=[
-            {"provider": "meny", "items": [], "total": float(total)} for total in range(4)
+            {
+                "provider": "meny",
+                "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1}],
+                "count": 1,
+                "total": float(total),
+            }
+            for total in range(4)
         ])
         client._sleep = mock.Mock()
+
+        result = client._change_cart({"operations": [{"productId": MENY_PRODUCT, "quantity": 1}]})
+
+        self.assertEqual(result["total"], 3.0)
+        self.assertEqual(client._read_cart.call_count, 4)
+        self.assertEqual(client._sleep.call_count, 3)
+
+    def test_cart_change_marks_unsettled_quantities_as_partial(self):
+        client = self.client()
+        client._change_one = mock.Mock()
+        quantities = [1, 2, 1, 2]
+        client._read_cart = mock.Mock(side_effect=[
+            {
+                "provider": "meny",
+                "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": quantity}],
+                "count": quantity,
+                "total": float(quantity),
+            }
+            for quantity in quantities
+        ])
+        client._sleep = mock.Mock()
+
         with self.assertRaisesRegex(HouseholdError, "changed partially.*do not retry"):
             client._change_cart({"operations": [{"productId": MENY_PRODUCT, "quantity": 1}]})
+
         self.assertEqual(client._read_cart.call_count, 4)
         self.assertEqual(client._sleep.call_count, 3)
 
@@ -2309,6 +2340,9 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn(r"/^Bestilling\s+\S+/i", scripts[-1])
         self.assertIn("deliveredDatePattern", scripts[-1])
         self.assertIn("deliveredDates.length === 1 ? 'delivered'", scripts[-1])
+        client._open.assert_called_once_with("https://meny.no/trumf-profil/nettbutikk/bestilling/99990001")
+        self.assertIn("/trumf-profil/nettbutikk/bestilling/", scripts[-1])
+        self.assertIn("/profil/nettbutikk/bestilling/", scripts[-1])
 
     def test_order_details_reload_a_cached_page_and_use_deleted_provider_status(self):
         client = self.client()
@@ -2376,6 +2410,7 @@ class MenyClientTests(unittest.TestCase):
         result = client._get_orders(10)
 
         self.assertEqual(len(result["orders"]), 1)
+        client._open.assert_called_once_with("https://meny.no/trumf-profil/nettbutikk#/bestillinger")
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("network", "requests", "--clear"),
             mock.call("network", "requests", "--filter", "/api/order/search/"),
@@ -3430,6 +3465,23 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client._select_delivery_slot.call_count, 2)
 
+    def test_checkout_submit_rejects_a_changed_selected_delivery_without_reserving_it(self):
+        client = self.client()
+        client._delivery_slots = mock.Mock(return_value={"slots": [{
+            "slot_id": "4. september klokka 10:00 til 12:00",
+            "date": "2026-09-04",
+            "start": "10:00",
+            "end": "12:00",
+            "selected": True,
+        }]})
+        client._select_delivery_slot = mock.Mock()
+        with self.assertRaisesRegex(HouseholdError, "delivery changed after review"):
+            client._require_selected_delivery(
+                {"display": "torsdag 3. september kl. 10:00-12:00"}
+            )
+
+        client._select_delivery_slot.assert_not_called()
+
     def test_checkout_review_stops_when_meny_reports_a_lost_delivery_reservation(self):
         client = self.client()
         client._verify_order_change = mock.Mock()
@@ -3583,10 +3635,7 @@ class MenyClientTests(unittest.TestCase):
 
     def test_checkout_submit_revalidates_exact_gate_after_hover_before_dispatch(self):
         client = self.client()
-        review = {
-            "summary": {"total": 1234.56, "delivery": {"display": "torsdag 3. september Kl. 09:00-12:00"}},
-            "target_order_code": "XY-CODE-1",
-        }
+        review = self.checkout_review(target_order_code="XY-CODE-1")
         events = []
 
         def evaluate(script):
@@ -3601,16 +3650,30 @@ class MenyClientTests(unittest.TestCase):
 
         client._eval = evaluate
         client._invoke = invoke
+        client._read_cart = lambda: events.append(("read_cart",)) or {
+            "items": deepcopy(review["summary"]["items"]),
+            "count": 1,
+            "subtotal": 19.9,
+        }
+        client._close_checkout_cart = lambda: events.append(("close_cart",))
         client._require_time = lambda value: events.append(("require_time", value))
         client._wait_for_vipps_dispatch = lambda *args: events.append(("wait_for_vipps_dispatch", *args))
-        client._click_checkout_submit(review, lambda: events.append(("dispatch_fence",)))
+        client._click_checkout_submit(
+            review,
+            lambda: events.append(("before_dispatch",)),
+            lambda: events.append(("dispatch_fence",)),
+        )
 
         kinds = [event[0] for event in events]
-        self.assertEqual(kinds, ["eval", "scrollintoview", "get", "eval", "mouse", "eval", "require_time", "network", "dispatch_fence", "mouse", "mouse", "wait_for_vipps_dispatch"])
-        self.assertEqual(events[4], ("mouse", "move", "26", "41"))
-        self.assertEqual(events[7], ("network", "requests", "--clear"))
-        self.assertEqual(events[9:11], [("mouse", "down"), ("mouse", "up")])
-        second_gate = events[5][1]
+        self.assertEqual(kinds, [
+            "eval", "before_dispatch", "read_cart", "close_cart", "eval",
+            "scrollintoview", "get", "eval", "mouse", "eval", "require_time", "network",
+            "before_dispatch", "eval", "dispatch_fence", "mouse", "mouse", "wait_for_vipps_dispatch",
+        ])
+        self.assertEqual(events[8], ("mouse", "move", "26", "41"))
+        self.assertEqual(events[11], ("network", "requests", "--clear"))
+        self.assertEqual(events[15:17], [("mouse", "down"), ("mouse", "up")])
+        second_gate = events[9][1]
         self.assertIn("elementFromPoint(26, 41)", second_gate)
         self.assertIn("location.href ===", second_gate)
         self.assertIn("123456", second_gate)
@@ -3623,6 +3686,53 @@ class MenyClientTests(unittest.TestCase):
         known_failure = events[-1][2]
         known_failure()
         self.assertIn('[role="alert"]', events[-1][1])
+
+    def test_checkout_submit_rejects_a_same_count_same_total_item_substitution(self):
+        client = self.client()
+        review = self.checkout_review()
+        observed = {
+            "items": deepcopy(review["summary"]["items"]),
+            "count": 1,
+            "subtotal": 19.9,
+        }
+        client._eval = mock.Mock(return_value={"ready": True})
+        client._read_cart = mock.Mock(side_effect=lambda: deepcopy(observed))
+        client._close_checkout_cart = mock.Mock()
+        client._invoke = mock.Mock()
+
+        def before_dispatch():
+            observed["items"] = [{
+                "product_id": "/varer/frukt-gront/gronnsaker/kal/brokkoli/brokkoli-4349",
+                "name": "Annen vare",
+                "quantity": 1,
+                "price": 19.9,
+            }]
+
+        dispatch_fence = mock.Mock()
+
+        with self.assertRaisesRegex(HouseholdError, "cart items changed"):
+            client._click_checkout_submit(review, before_dispatch, dispatch_fence)
+
+        client._close_checkout_cart.assert_called_once_with()
+        dispatch_fence.assert_not_called()
+        client._invoke.assert_not_called()
+
+    def test_checkout_cart_close_returns_to_the_exact_payment_page(self):
+        client = self.client()
+        client._eval = mock.Mock(side_effect=[
+            {"ready": True, "open": True},
+            {"ready": True, "open": False},
+        ])
+        client._invoke = mock.Mock()
+        client._sleep = mock.Mock()
+
+        client._close_checkout_cart()
+
+        client._invoke.assert_called_once_with(
+            "click", '[data-hermes-meal-planner-action="checkout-cart-close"]'
+        )
+        client._sleep.assert_called_once_with(0.25)
+        self.assertIn("location.href === 'https://meny.no/kassen'", client._eval.call_args_list[0].args[0])
 
     def test_vipps_dispatch_requires_one_successful_payment_post(self):
         self.assertTrue(vipps_dispatch_acknowledged({"requests": [{
@@ -3880,14 +3990,23 @@ class MenyClientTests(unittest.TestCase):
 
     def test_checkout_submit_does_not_open_dispatch_fence_when_post_hover_gate_fails(self):
         client = self.client()
-        review = {"summary": {"total": 1234.56, "delivery": {"display": "delivery"}}, "target_order_code": None}
+        review = self.checkout_review()
         calls = []
-        client._eval = mock.Mock(side_effect=[{"ready": True}, {"ready": True}, {"ready": False}])
+        client._eval = mock.Mock(side_effect=[
+            {"ready": True}, {"ready": True}, {"ready": True}, {"ready": True},
+            {"ready": False},
+        ])
         client._invoke = lambda *arguments: calls.append(arguments) or ({"box": {"x": 1, "y": 2, "width": 20, "height": 10}} if arguments[:2] == ("get", "box") else {})
-        fence = mock.Mock()
+        client._read_cart = mock.Mock(return_value={
+            "items": deepcopy(review["summary"]["items"]), "count": 1, "subtotal": 19.9,
+        })
+        client._close_checkout_cart = mock.Mock()
+        before_dispatch = mock.Mock()
+        dispatch_fence = mock.Mock()
         with self.assertRaisesRegex(HouseholdError, "changed or is obscured"):
-            client._click_checkout_submit(review, fence)
-        fence.assert_not_called()
+            client._click_checkout_submit(review, before_dispatch, dispatch_fence)
+        self.assertEqual(before_dispatch.call_count, 2)
+        dispatch_fence.assert_not_called()
         self.assertNotIn(("mouse", "down"), calls)
 
     def test_cart_click_never_dispatches_after_login_loss(self):
@@ -3917,6 +4036,7 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         review = self.checkout_review()
         client._review_checkout = mock.Mock(return_value=review)
+        client._require_selected_delivery = mock.Mock()
         client._eval = mock.Mock(return_value={"ready": True})
         client._click_checkout_submit = mock.Mock()
         cart = {"items": [], "delivery": {"display": "torsdag 3. september Kl. 09:00-12:00"}}
@@ -3927,9 +4047,11 @@ class MenyClientTests(unittest.TestCase):
             review["summary"]["delivery"],
         )
         self.assertIsNotNone(cart["delivery"])
+        client._require_selected_delivery.assert_called_once_with(review["summary"]["delivery"])
         client._click_checkout_submit.assert_called_once()
         self.assertEqual(client._click_checkout_submit.call_args.args[0], review)
         self.assertTrue(callable(client._click_checkout_submit.call_args.args[1]))
+        self.assertTrue(callable(client._click_checkout_submit.call_args.args[2]))
         self.assertIn("Vipps", client._eval.call_args.args[0])
         self.assertIn("Levert på døren", client._eval.call_args.args[0])
         self.assertIn("123456", client._eval.call_args.args[0])
@@ -3937,6 +4059,37 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("Endre dato og tid", client._eval.call_args.args[0])
         self.assertIn("deliveryBinding", client._eval.call_args.args[0])
         self.assertNotIn("deliveryRoots", client._eval.call_args.args[0])
+
+    def test_vipps_submit_retries_one_transient_disabled_checkout_before_payment(self):
+        client = self.client()
+        review = self.checkout_review()
+        client._require_selected_delivery = mock.Mock()
+        client._review_checkout = mock.Mock(side_effect=[
+            _CheckoutNotReadyError("MENY checkout cannot continue"),
+            review,
+        ])
+        client._reset_checkout_review = mock.Mock()
+        client._eval = mock.Mock(return_value={"ready": True})
+        client._click_checkout_submit = mock.Mock()
+
+        result = client.submit_checkout({"items": [], "delivery": review["summary"]["delivery"]}, review)
+
+        self.assertTrue(result["awaiting_user_payment"])
+        self.assertEqual(client._review_checkout.call_count, 2)
+        client._reset_checkout_review.assert_called_once_with()
+        client._click_checkout_submit.assert_called_once()
+
+    def test_checkout_retry_reloads_the_exact_authenticated_wizard(self):
+        client = self.client()
+        client._eval = mock.Mock(return_value={"ready": True})
+        client._invoke = mock.Mock()
+        client._sleep = mock.Mock()
+
+        client._reset_checkout_review()
+
+        client._invoke.assert_called_once_with("reload")
+        client._sleep.assert_called_once_with(0.8)
+        self.assertIn("location.href === 'https://meny.no/kassen'", client._eval.call_args.args[0])
 
     def test_meny_checkout_review_enables_recovery_only_for_pre_dispatch_work(self):
         client = self.client()
@@ -3952,10 +4105,11 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         review = self.checkout_review()
         client._review_checkout = mock.Mock(return_value=review)
+        client._require_selected_delivery = mock.Mock()
         client._eval = mock.Mock(return_value={"ready": True})
 
-        def fail_after_fence(_review, fence):
-            fence()
+        def fail_after_fence(_review, _before_dispatch, dispatch_fence):
+            dispatch_fence()
             raise HouseholdError("mouse down outcome is uncertain")
 
         client._click_checkout_submit = fail_after_fence
@@ -3975,6 +4129,7 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         review = self.checkout_review(target_order_id="99990001", target_order_code="TEST-CODE-1")
         client._review_checkout = mock.Mock(return_value=review)
+        client._require_selected_delivery = mock.Mock()
         client._eval = mock.Mock(return_value={"ready": False})
         client._invoke = mock.Mock()
         with self.assertRaises(CheckoutPreconditionError):
@@ -4127,6 +4282,116 @@ class CartPlanTests(unittest.TestCase):
             self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), 0)
             self.assertEqual(store.read()["cart_plan"]["status"], "needs_input")
             self.assertTrue(any(str(item["product_id"]) == "20" for item in provider.cart["items"]))
+
+    def test_restart_detects_hours_later_manual_adds_and_deletes_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, _browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            provider._mutate_cart({"operations": [
+                {"productId": 10, "quantity": -2},
+                {"productId": 20, "quantity": 1},
+            ]})
+            writes = sum(tool == "manipulate_cart" for tool, _arguments in provider.calls)
+            reopened_store = StateStore(Path(directory), {**CONFIG, "provider": "oda"})
+            reopened = Application(reopened_store, provider, FakeBrowser())
+
+            result = self.sync(reopened, product_id)
+
+            self.assertFalse(result["synced"])
+            self.assertEqual(result["reason"], "cart_or_menu_changed_before_sync")
+            items = {item["product_id"]: item for item in result["cart_plan"]["items"]}
+            self.assertEqual(items["10"]["missing_quantity"], 2)
+            self.assertEqual(items["20"]["extra_quantity"], 1)
+            self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), writes)
+
+    def test_sync_turns_a_postwrite_provider_error_into_a_digest_question(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, _browser, application, product_id = self.app(directory, "meny")
+            original = provider.call
+
+            def changed_then_failed(tool, arguments, **kwargs):
+                result = original(tool, arguments, **kwargs)
+                if tool == "manipulate_cart":
+                    raise HouseholdError("MENY cart changed partially; read the cart and do not retry this request")
+                return result
+
+            provider.call = changed_then_failed
+            result = self.sync(application, product_id)
+
+            self.assertFalse(result["synced"])
+            self.assertEqual(result["reason"], "cart_write_result_uncertain")
+            self.assertEqual(provider.cart["items"][0]["quantity"], 2)
+            self.assertEqual(store.read()["cart_plan"]["status"], "needs_input")
+            self.assertEqual(store.read()["cart_plan"]["added_quantities"], {})
+            self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), 1)
+
+    def test_sync_turns_a_manual_change_during_readback_into_a_digest_question(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, _browser, application, product_id = self.app(directory, "oda")
+            original = provider.call
+            reads = 0
+
+            def concurrent(tool, arguments, **kwargs):
+                nonlocal reads
+                if tool == "get_cart":
+                    reads += 1
+                    if reads == 3:
+                        provider._mutate_cart({"operations": [{"productId": 20, "quantity": 1}]})
+                return original(tool, arguments, **kwargs)
+
+            provider.call = concurrent
+            result = self.sync(application, product_id)
+
+            self.assertFalse(result["synced"])
+            self.assertEqual(result["reason"], "cart_changed_during_sync")
+            self.assertEqual(store.read()["cart_plan"]["status"], "needs_input")
+            self.assertTrue(any(item["product_id"] == "20" for item in result["cart_plan"]["items"]))
+            self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), 1)
+
+    def test_oda_prepare_turns_a_browser_cart_race_into_a_new_digest_question(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "keep_current",
+                "cart_digest": stopped["cart_plan"]["cart_digest"],
+            })
+
+            def changed_review(_cart, *, deadline=None):
+                provider._mutate_cart({"operations": [{"productId": 20, "quantity": 1}]})
+                raise OdaCheckoutMismatchError("Oda checkout does not match the reviewed cart")
+
+            browser.review_checkout = changed_review
+            result = application.handle({"operation": "checkout", "action": "prepare"})
+
+            self.assertTrue(result["cart_reconciliation_required"])
+            self.assertEqual(result["reason"], "cart_requires_owner_decision")
+            self.assertTrue(any(item["product_id"] == "20" for item in result["cart_plan"]["items"]))
+            self.assertIsNone(store.read()["pending_checkout"])
+
+    def test_oda_prepare_rereads_after_browser_review_before_saving_confirmation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "keep_current",
+                "cart_digest": stopped["cart_plan"]["cart_digest"],
+            })
+            original_review = browser.review_checkout
+
+            def review_then_change(cart, *, deadline=None):
+                review = original_review(cart, deadline=deadline)
+                provider._mutate_cart({"operations": [{"productId": 20, "quantity": 1}]})
+                return review
+
+            browser.review_checkout = review_then_change
+            result = application.handle({"operation": "checkout", "action": "prepare"})
+
+            self.assertTrue(result["cart_reconciliation_required"])
+            self.assertEqual(result["reason"], "cart_requires_owner_decision")
+            self.assertIsNone(store.read()["pending_checkout"])
 
     def test_checkout_combines_start_extras_and_missing_then_binds_explicit_keep_current_digest(self):
         for provider_name in ("oda", "meny"):
@@ -4288,7 +4553,7 @@ class CartPlanTests(unittest.TestCase):
             self.assertEqual(store.read()["occurrences"]["2026-W36"]["status"], "needs_input")
             self.assertEqual(browser.checkout_clicks, 0)
 
-    def test_meny_rereads_the_approved_cart_immediately_before_payment_click(self):
+    def test_meny_does_not_nest_a_provider_read_inside_the_locked_payment_click(self):
         with tempfile.TemporaryDirectory() as directory:
             _store, provider, _browser, application, product_id = self.app(directory, "meny")
             self.sync(application, product_id)
@@ -4298,20 +4563,38 @@ class CartPlanTests(unittest.TestCase):
                 "cart_digest": stopped["cart_plan"]["cart_digest"],
             })
             prepared = application.handle({"operation": "checkout", "action": "prepare"})
+            confirm_start = len(provider.calls)
+            provider_call = provider.call
+            provider_lock = threading.Lock()
 
-            def change_before_click(cart, review, before_click=None, **_kwargs):
-                provider._mutate_cart({"operations": [{"productId": product_id, "quantity": 1}]})
-                if before_click:
-                    before_click()
-                provider.checkout_clicks += 1
+            def locked_call(tool, arguments, **kwargs):
+                if not provider_lock.acquire(blocking=False):
+                    raise AssertionError("nested MENY provider call would deadlock")
+                try:
+                    return provider_call(tool, arguments, **kwargs)
+                finally:
+                    provider_lock.release()
 
-            provider.submit_checkout = change_before_click
-            with self.assertRaisesRegex(CheckoutPreconditionError, "changed before the final click"):
-                application.handle({
-                    "operation": "checkout", "action": "confirm",
-                    "confirmation_id": prepared["confirmation_id"],
-                })
-            self.assertEqual(provider.checkout_clicks, 0)
+            def submit(cart, review, before_click=None, **_kwargs):
+                with provider_lock:
+                    if before_click:
+                        before_click()
+                    provider.checkout_clicks += 1
+                    return {"awaiting_user_payment": True, "payment": "vipps"}
+
+            provider.call = locked_call
+            provider.submit_checkout = submit
+            result = application.handle({
+                "operation": "checkout", "action": "confirm",
+                "confirmation_id": prepared["confirmation_id"],
+            })
+
+            self.assertTrue(result["awaiting_user_payment"])
+            self.assertEqual(provider.checkout_clicks, 1)
+            self.assertEqual(
+                [tool for tool, _arguments in provider.calls[confirm_start:]],
+                ["get_cart"],
+            )
 
     def test_active_menu_raw_delta_change_is_rejected_in_favor_of_requirement_sync(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4549,6 +4832,30 @@ class FlowTests(unittest.TestCase):
             self.assertEqual(result["authorized_summary"], prepared["summary"])
             self.assertEqual([call.args[0] for call in provider.call.call_args_list], ["get_cart"])
             self.assertEqual(provider.checkout_clicks, 1)
+
+    def test_meny_confirmation_can_expire_during_final_browser_checks(self):
+        started = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            app = Application(store, provider, self.browser)
+            with mock.patch("service.now", return_value=started):
+                prepared = app.handle({"operation": "checkout", "action": "prepare"})
+            with store.locked() as state:
+                state["pending_checkout"]["expires_at"] = (started + timedelta(seconds=1)).isoformat()
+
+            with (
+                mock.patch("service.now", side_effect=[started, started, started + timedelta(seconds=2)]),
+                self.assertRaisesRegex(CheckoutPreconditionError, "expired before the final click"),
+            ):
+                app.handle({
+                    "operation": "checkout",
+                    "action": "confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                })
+
+            self.assertEqual(provider.checkout_clicks, 0)
+            self.assertIsNone(store.read()["pending_checkout"])
 
     def test_fresh_policy_rejects_direct_submit_before_provider_calls(self):
         self.oda.calls.clear()

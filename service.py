@@ -24,7 +24,7 @@ from typing import Any, Mapping
 import unicodedata
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from oda_browser import OdaBrowser, delivery_signature as oda_delivery_signature
+from oda_browser import OdaBrowser, OdaCheckoutMismatchError, delivery_signature as oda_delivery_signature
 from core import (
     CancellationPreconditionError,
     CheckoutPreconditionError,
@@ -1921,6 +1921,7 @@ class Application:
                     "productId": int(product_id) if self.provider == "oda" else product_id,
                     "quantity": missing,
                 })
+        mutation_error = None
         if operations:
             prewrite_cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {})
             prewrite_summary = cart_summary(prewrite_cart)
@@ -1931,7 +1932,10 @@ class Application:
                     self._set_cart_needs_input(plan, prewrite_live, prewrite_names)
                     current = deepcopy(plan)
                 return {"synced": False, **self._cart_question(current, prewrite_summary, reason="cart_changed_immediately_before_sync")}
-            self.oda.call("manipulate_cart", {"operations": operations}, deadline=deadline) if self.provider == "meny" else self.oda.call("manipulate_cart", {"operations": operations})
+            try:
+                self.oda.call("manipulate_cart", {"operations": operations}, deadline=deadline) if self.provider == "meny" else self.oda.call("manipulate_cart", {"operations": operations})
+            except HouseholdError as exc:
+                mutation_error = exc
         verified_cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {})
         verified_summary = cart_summary(verified_cart)
         verified_live, verified_names = self._cart_lines(verified_summary)
@@ -1939,8 +1943,19 @@ class Application:
         for operation in operations:
             product_id = str(operation["productId"])
             expected[product_id] = expected.get(product_id, 0) + operation["quantity"]
-        if verified_live != expected:
-            raise HouseholdError("cart sync result is uncertain; read the cart and do not retry")
+        if mutation_error is not None or verified_live != expected:
+            with self.store.locked() as state:
+                plan = state["cart_plan"]
+                self._set_cart_needs_input(plan, verified_live, verified_names)
+                current = deepcopy(plan)
+            return {
+                "synced": False,
+                **self._cart_question(
+                    current,
+                    verified_summary,
+                    reason="cart_write_result_uncertain" if mutation_error is not None else "cart_changed_during_sync",
+                ),
+            }
         with self.store.locked() as state:
             plan = state.get("cart_plan")
             if not isinstance(plan, dict) or canonical(plan.get("menu_ref")) != canonical(current.get("menu_ref")):
@@ -2017,6 +2032,7 @@ class Application:
             delta = target.get(product_id, 0) - first_live.get(product_id, 0)
             if delta:
                 operations.append({"productId": int(product_id) if self.provider == "oda" else product_id, "quantity": delta})
+        mutation_error = None
         if operations:
             prewrite_cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {})
             prewrite_summary = cart_summary(prewrite_cart)
@@ -2027,12 +2043,26 @@ class Application:
                     self._set_cart_needs_input(current, prewrite_live, prewrite_names)
                     plan = deepcopy(current)
                 return {"reconciled": False, **self._cart_question(plan, prewrite_summary, reason="cart_changed_immediately_before_decision")}
-            self.oda.call("manipulate_cart", {"operations": operations}, deadline=deadline) if self.provider == "meny" else self.oda.call("manipulate_cart", {"operations": operations})
+            try:
+                self.oda.call("manipulate_cart", {"operations": operations}, deadline=deadline) if self.provider == "meny" else self.oda.call("manipulate_cart", {"operations": operations})
+            except HouseholdError as exc:
+                mutation_error = exc
         verified_cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {})
         verified_summary = cart_summary(verified_cart)
         verified_live, verified_names = self._cart_lines(verified_summary)
-        if verified_live != target:
-            raise HouseholdError("cart reconciliation result is uncertain; read the cart and do not retry")
+        if mutation_error is not None or verified_live != target:
+            with self.store.locked() as state:
+                current = state["cart_plan"]
+                self._set_cart_needs_input(current, verified_live, verified_names)
+                plan = deepcopy(current)
+            return {
+                "reconciled": False,
+                **self._cart_question(
+                    plan,
+                    verified_summary,
+                    reason="cart_write_result_uncertain" if mutation_error is not None else "cart_changed_while_applying_decision",
+                ),
+            }
         approved_digest = self._cart_digest(verified_live)
         with self.store.locked() as state:
             current = state.get("cart_plan")
@@ -2908,12 +2938,26 @@ class Application:
                     deadline=deadline,
                 )
             else:
-                review = self.browser.review_checkout(
-                    cart,
-                    order_change=order_change if self.provider == "meny" else None,
-                    deadline=deadline,
-                    allow_recovery=allow_recovery,
-                ) if self.provider == "meny" else self.browser.review_checkout(cart, deadline=deadline)
+                if self.provider == "meny":
+                    review = self.browser.review_checkout(
+                        cart,
+                        order_change=order_change,
+                        deadline=deadline,
+                        allow_recovery=allow_recovery,
+                    )
+                else:
+                    try:
+                        review = self.browser.review_checkout(cart, deadline=deadline)
+                    except OdaCheckoutMismatchError:
+                        refreshed_cart = self.oda.call("get_cart", {})
+                        refreshed_summary = cart_summary(refreshed_cart)
+                        if canonical(refreshed_summary) == canonical(summary):
+                            raise
+                        if isinstance(menu_baseline, Mapping):
+                            cart_gate = self._cart_checkout_gate(refreshed_summary, menu_baseline)
+                            if cart_gate is not None:
+                                return cart_gate
+                        raise HouseholdError("Oda cart or delivery changed while preparing checkout; prepare a new summary")
             if self.provider == "meny":
                 reviewed_summary = review.get("summary")
                 if not isinstance(reviewed_summary, Mapping):
@@ -2960,6 +3004,17 @@ class Application:
                     summary = deepcopy(dict(stable_summary))
                 else:
                     raise HouseholdError("MENY checkout summary did not settle")
+            elif not order_change:
+                refreshed_cart = self.oda.call("get_cart", {})
+                refreshed_summary = cart_summary(refreshed_cart)
+                if canonical(refreshed_summary) != canonical(summary):
+                    if isinstance(menu_baseline, Mapping):
+                        cart_gate = self._cart_checkout_gate(refreshed_summary, menu_baseline)
+                        if cart_gate is not None:
+                            return cart_gate
+                    raise HouseholdError("Oda cart or delivery changed while preparing checkout; prepare a new summary")
+                cart = refreshed_cart
+                summary = refreshed_summary
             payment_display = None
             if self.provider == "oda":
                 payment_display = str((review.get("summary") or {}).get("payment") or review.get("payment_display") or "")
@@ -3052,15 +3107,13 @@ class Application:
                     state["pending_checkout"]["status"] = "clicking"
 
                 def before_click() -> None:
-                    if self.provider == "oda" or pending.get("cart_plan") is not None:
-                        fresh = (
-                            self.oda.call("get_cart", {}, deadline=deadline)
-                            if self.provider == "meny"
-                            else self.oda.call("get_cart", {})
-                        )
+                    # MENY's provider client is this same locked browser tab;
+                    # submit_checkout performs its own exact fresh review.
+                    if self.provider == "oda":
+                        fresh = self.oda.call("get_cart", {})
                         expected = (
                             cart_summary(pending["cart"])
-                            if self.provider == "meny" or pending_change.get("requested_delivery")
+                            if pending_change.get("requested_delivery")
                             else pending["summary"]
                         )
                         if canonical(cart_summary(fresh)) != canonical(expected):

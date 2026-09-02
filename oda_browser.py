@@ -20,6 +20,10 @@ import unicodedata
 from core import CancellationPreconditionError, CheckoutPreconditionError, HouseholdError, cart_summary
 
 
+class OdaCheckoutMismatchError(HouseholdError):
+    """The live checkout surface no longer matches the supplied cart snapshot."""
+
+
 STORE_URL = "https://oda.com/no/"
 CART_URL = "https://oda.com/no/cart/"
 CHECKOUT_ENTRY_URL = "https://oda.com/no/checkout/"
@@ -250,7 +254,7 @@ class OdaBrowser:
         result["line_matches"] = checkout_lines_match(expected["lines"], result.pop("items"))
         result["delivery_matches"] = checkout_delivery_matches(expected["delivery_text"], result.pop("delivery_roots"))
         if not all(result[key] is True for key in ("authenticated", "available", "line_matches", "total_matches", "delivery_matches", "address_matches", "masked_payment")) or result["submit_controls"] != 1:
-            raise HouseholdError("Oda checkout does not match the reviewed cart")
+            raise OdaCheckoutMismatchError("Oda checkout does not match the reviewed cart")
         if re.fullmatch(r"•••• \d{4}", str(result.get("payment_display") or "")) is None:
             raise HouseholdError("Oda checkout payment identity is unavailable")
         return result

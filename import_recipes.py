@@ -30,6 +30,8 @@ def _json_records(path: Path) -> Iterator[Any]:
                         value = json.loads(line)
                     except (ValueError, RecursionError) as exc:
                         raise RecipeError(f"JSONL line {line_number} is invalid") from exc
+                    if not isinstance(value, dict):
+                        raise RecipeError(f"JSONL line {line_number} is invalid")
                     count += 1
                     if count > MAX_IMPORT_RECORDS:
                         raise RecipeError(f"import exceeds {MAX_IMPORT_RECORDS} recipes")

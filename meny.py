@@ -33,8 +33,8 @@ class MenyOrderChangeDispatchError(HouseholdError):
 BASE_URL = "https://meny.no"
 STORE_URL = f"{BASE_URL}/varer"
 CHECKOUT_URL = f"{BASE_URL}/kassen"
-ORDERS_URL = f"{BASE_URL}/profil/nettbutikk#/bestillinger"
-ORDER_PATH = re.compile(r"/profil/nettbutikk/bestilling/(\d{1,20})")
+ORDERS_URL = f"{BASE_URL}/trumf-profil/nettbutikk#/bestillinger"
+ORDER_PATH = re.compile(r"/(?:trumf-)?profil/nettbutikk/bestilling/(\d{1,20})")
 PRODUCT_PATH = re.compile(r"/varer/(?!kampanjer/)[A-Za-z0-9._~%/-]+-\d{4,14}")
 DELIVERY_SLOT = re.compile(
     r"^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+"
@@ -104,6 +104,10 @@ class _BrowserTransportError(HouseholdError):
 
 
 class _DeliveryReservationError(HouseholdError):
+    pass
+
+
+class _CheckoutNotReadyError(HouseholdError):
     pass
 
 
@@ -989,9 +993,16 @@ class MenyClient:
             snapshots.append(self._read_cart())
             if attempt < 3:
                 self._sleep(0.5)
-        if snapshots[-2] == snapshots[-1]:
+        signatures = [
+            sorted(
+                (str(item["product_id"]), int(item["quantity"]))
+                for item in snapshot["items"]
+            )
+            for snapshot in snapshots
+        ]
+        if signatures[-2] == signatures[-1]:
             return snapshots[-1]
-        raise HouseholdError("MENY cart readback did not settle")
+        raise HouseholdError("MENY cart quantities did not settle")
 
     def _change_one(self, product: str, delta: int, *, order_change_code: str | None = None) -> None:
         self._open(BASE_URL + product)
@@ -1344,7 +1355,12 @@ class MenyClient:
         self._invoke("mouse", "down")
         self._invoke("mouse", "up")
 
-    def _click_checkout_submit(self, review: Mapping[str, Any], before_dispatch: Any) -> None:
+    def _click_checkout_submit(
+        self,
+        review: Mapping[str, Any],
+        before_dispatch: Any,
+        dispatch_fence: Any = None,
+    ) -> None:
         if self.vipps_phone_number is None:
             raise HouseholdError("MENY checkout requires vipps_phone_number in the private household config")
         selector = '[data-hermes-meal-planner-action="checkout-submit"]'
@@ -1393,6 +1409,31 @@ __DELIVERY_BINDING__
 
         if self._eval(render_gate(False)) != {"ready": True}:
             raise HouseholdError("MENY Vipps payment control changed")
+        before_dispatch()
+        observed_cart = self._read_cart()
+        self._close_checkout_cart()
+        review_summary = review.get("summary")
+        if not isinstance(review_summary, Mapping) or not isinstance(review_summary.get("items"), list):
+            raise HouseholdError("MENY checkout item identity is unavailable")
+        expected_items = sorted(
+            (normalize_product_ref(item.get("product_id")), item.get("quantity"))
+            for item in review_summary["items"]
+            if isinstance(item, Mapping)
+        )
+        observed_summary = cart_summary(observed_cart)
+        observed_items = sorted(
+            (normalize_product_ref(item.get("product_id")), item.get("quantity"))
+            for item in observed_summary["items"]
+            if isinstance(item, Mapping)
+        )
+        if (
+            len(expected_items) != len(review_summary["items"])
+            or expected_items != observed_items
+            or review_summary.get("count") != observed_summary.get("count")
+        ):
+            raise HouseholdError("MENY cart items changed before the final payment click")
+        if self._eval(render_gate(False)) != {"ready": True}:
+            raise HouseholdError("MENY Vipps payment control changed")
         x, y = self._wait_for_checkout_hit(
             selector,
             render_gate,
@@ -1403,7 +1444,13 @@ __DELIVERY_BINDING__
             raise HouseholdError("MENY Vipps payment control changed or is obscured")
         self._require_time(15)
         self._invoke("network", "requests", "--clear")
+        # Recheck the confirmation after every potentially slow browser read
+        # and immediately before the exact DOM gate and dispatch fence.
         before_dispatch()
+        if self._eval(render_gate(True, x, y)) != {"ready": True}:
+            raise HouseholdError("MENY Vipps payment control changed or is obscured")
+        if dispatch_fence is not None:
+            dispatch_fence()
         self._invoke("mouse", "down")
         self._invoke("mouse", "up")
         self._wait_for_vipps_dispatch(
@@ -1668,6 +1715,36 @@ __DELIVERY_BINDING__
             "checkout": {"mode": "protected_vipps", "url": CHECKOUT_URL},
         }
 
+    def _close_checkout_cart(self) -> None:
+        clicked = False
+        for attempt in range(20):
+            result = self._eval(r"""
+(() => {
+  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
+  const carts = [...document.querySelectorAll('[aria-label="Handlevogn"]')].filter(visible).filter(x => [...x.querySelectorAll('button')].filter(visible).some(button => ['Til kassen','Fortsett'].includes(norm(button.innerText))));
+  const open = [...document.querySelectorAll('button')].filter(visible).filter(button => !button.disabled && button.getAttribute('aria-disabled') !== 'true' && norm(button.getAttribute('aria-label')) === 'Åpne handlevognen');
+  const closers = carts.length === 1 ? [...carts[0].querySelectorAll('button[aria-label="Lukk"]')].filter(visible) : [];
+  const identity = location.href === 'https://meny.no/kassen' && authenticated.length === 1;
+  if (identity && carts.length === 0 && open.length === 1) return JSON.stringify({ready:true, open:false});
+  if (identity && carts.length === 1 && closers.length === 1) {
+    closers[0].setAttribute('data-hermes-meal-planner-action', 'checkout-cart-close');
+    return JSON.stringify({ready:true, open:true});
+  }
+  return JSON.stringify({ready:false, open:carts.length > 0});
+})()
+""")
+            if result == {"ready": True, "open": False}:
+                return
+            if result == {"ready": True, "open": True} and not clicked:
+                self._invoke("click", '[data-hermes-meal-planner-action="checkout-cart-close"]')
+                clicked = True
+            if attempt < 19:
+                self._sleep(0.25)
+        raise HouseholdError("MENY checkout cart did not close")
+
     @staticmethod
     def _order_id(value: Any) -> str:
         order_id = str(value or "").strip()
@@ -1798,6 +1875,18 @@ __DELIVERY_BINDING__
         if delivery_date:
             slots = [slot for slot in slots if slot.get("date") == delivery_date]
         return {"provider": "meny", "slots": slots}
+
+    def _require_selected_delivery(self, required: Mapping[str, Any]) -> None:
+        required_display = required.get("display")
+        selected = meny_selected_delivery(self._delivery_slots().get("slots"))
+        selected_display = selected.get("display") if selected is not None else None
+        if (
+            not isinstance(required_display, str)
+            or not isinstance(selected_display, str)
+            or meny_delivery_window_identity(required_display)
+            != meny_delivery_window_identity(selected_display)
+        ):
+            raise HouseholdError("MENY checkout delivery changed after review")
 
     def _wait_for_delivery_reservation(self) -> None:
         requests: Any = {"requests": []}
@@ -1969,8 +2058,8 @@ __DELIVERY_BINDING__
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const orders = [], seen = new Set();
-  for (const anchor of [...document.querySelectorAll('a[href*="/profil/nettbutikk/bestilling/"]')].filter(visible)) {
-    const url = new URL(anchor.href, location.origin), match = url.pathname.match(/^\/profil\/nettbutikk\/bestilling\/(\d{1,20})$/);
+  for (const anchor of [...document.querySelectorAll('a[href*="/nettbutikk/bestilling/"]')].filter(visible)) {
+    const url = new URL(anchor.href, location.origin), match = url.pathname.match(/^\/(?:trumf-)?profil\/nettbutikk\/bestilling\/(\d{1,20})$/);
     if (!match || seen.has(match[1])) continue;
     seen.add(match[1]);
     const root = anchor.closest('tr,li,article,section') || anchor;
@@ -2025,7 +2114,7 @@ __DELIVERY_BINDING__
         raise HouseholdError("MENY orders did not finish rendering")
 
     def _get_order(self, order_id: str) -> dict[str, Any]:
-        path = f"/profil/nettbutikk/bestilling/{order_id}"
+        path = f"/trumf-profil/nettbutikk/bestilling/{order_id}"
         self._invoke("network", "requests", "--clear")
         self._open(BASE_URL + path)
         request_id = None
@@ -2092,7 +2181,8 @@ __DELIVERY_BINDING__
   const buttons = [...root.querySelectorAll('button')].filter(visible).filter(x => /^Bestilte varer \(\d+\)$/.test(norm(x.innerText)));
   const expand = !rowsReady && buttons.length === 1 && buttons[0].getAttribute('aria-expanded') !== 'true';
   if (expand) buttons[0].setAttribute('data-hermes-meal-planner-action', 'order-items');
-  const baseReady = actual === expected && location.pathname === `/profil/nettbutikk/bestilling/${expected}` && heading.length === 1 && Number.isFinite(total) && Boolean(delivery) && Number.isInteger(itemCount) && itemCount > 0;
+  const orderPaths = [`/trumf-profil/nettbutikk/bestilling/${expected}`, `/profil/nettbutikk/bestilling/${expected}`];
+  const baseReady = actual === expected && orderPaths.includes(location.pathname) && heading.length === 1 && Number.isFinite(total) && Boolean(delivery) && Number.isInteger(itemCount) && itemCount > 0;
   return JSON.stringify({ready:baseReady && rowsReady, expand:baseReady && expand, authenticated:true, order_number:actual, code, status, total, delivery, item_count:itemCount, products});
 })()
 """.replace("EXPECTED", json.dumps(order_id))
@@ -2396,6 +2486,22 @@ __DELIVERY_BINDING__
         with self._locked_operation(MENY_ORDER_TIMEOUT, deadline, allow_recovery=allow_recovery):
             return self._review_checkout(cart, order_change=order_change)
 
+    def _reset_checkout_review(self) -> None:
+        state = self._eval(r"""
+(() => {
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
+  return JSON.stringify({ready:location.href === 'https://meny.no/kassen' && authenticated.length === 1});
+})()
+""")
+        if state != {"ready": True}:
+            raise HouseholdError("MENY checkout page changed before retry")
+        # /kassen uses the same URL for both wizard steps. Reloading is needed
+        # to return a payment-stage failure to the checkout entry step.
+        self._invoke("reload")
+        self._sleep(0.8)
+
     def _review_checkout(self, cart: Mapping[str, Any], *, order_change: Mapping[str, Any] | None = None) -> dict[str, Any]:
         expected = cart_summary(cart)
         if not expected["items"]:
@@ -2521,7 +2627,7 @@ __DELIVERY_BINDING__
                 flags=re.IGNORECASE,
             ):
                 raise HouseholdError(f"MENY checkout cannot continue: {minimum_message}")
-            raise HouseholdError("MENY checkout cannot continue; check the home-delivery minimum and cart messages")
+            raise _CheckoutNotReadyError("MENY checkout cannot continue; check the home-delivery minimum and cart messages")
         self._click_checkout_control("checkout-next", expected_items=expected_items, target_code=target_code or None)
         self._sleep(0.6)
         unavailable = self._eval(r"""
@@ -2622,7 +2728,7 @@ __DELIVERY_BINDING__
         if result.get("ready") is not True or result.get("vipps_checked") is not True or result.get("home_delivery") is not True:
             raise HouseholdError("MENY checkout does not have one verified home-delivery Vipps payment")
         if result.get("submit_enabled") is not True:
-            raise HouseholdError("MENY checkout cannot continue; check the home-delivery minimum and cart messages")
+            raise _CheckoutNotReadyError("MENY checkout cannot continue; check the home-delivery minimum and cart messages")
         payment_summary = normalize_checkout_payment_snapshot(result)
         expected_delivery = expected.get("delivery")
         if not isinstance(expected_delivery, Mapping) or meny_delivery_window_identity(expected_delivery.get("display")) != meny_delivery_window_identity(payment_summary["delivery"]):
@@ -2654,8 +2760,19 @@ __DELIVERY_BINDING__
                 review_delivery = review_summary.get("delivery") if isinstance(review_summary, Mapping) else None
                 if not isinstance(review_delivery, Mapping):
                     raise HouseholdError("MENY checkout delivery identity is unavailable")
+                # Bind the current account selection to the authorized window
+                # without changing provider state during protected submit.
+                self._require_selected_delivery(review_delivery)
                 final_cart["delivery"] = dict(review_delivery)
-                fresh = self._review_checkout(final_cart, order_change=order_change)
+                try:
+                    fresh = self._review_checkout(final_cart, order_change=order_change)
+                except _CheckoutNotReadyError:
+                    # The live site once exposed a transient disabled checkout
+                    # immediately after a successful prepare. Reset the
+                    # same-URL wizard before one full retry; neither attempt
+                    # reaches payment.
+                    self._reset_checkout_review()
+                    fresh = self._review_checkout(final_cart, order_change=order_change)
                 if not meny_checkout_reviews_match(review, fresh):
                     raise HouseholdError("MENY checkout changed after review")
                 ready = self._eval(r"""
@@ -2695,13 +2812,15 @@ __DELIVERY_BINDING__
 """.replace("__DELIVERY_BINDING__", CHECKOUT_DELIVERY_BINDING_JS).replace("__CODE__", json.dumps(review.get("target_order_code"))).replace("__TOTAL__", str(int(round(float(review["summary"]["total"]) * 100)))).replace("__DELIVERY__", json.dumps(review["summary"]["delivery"]["display"], ensure_ascii=False)).replace("__URL__", json.dumps(CHECKOUT_URL)))
                 if ready != {"ready": True}:
                     raise HouseholdError("MENY Vipps payment control changed")
-                def mark_dispatched() -> None:
-                    nonlocal final_dispatched
+                def check_pre_dispatch() -> None:
                     if before_click:
                         before_click()
+
+                def mark_dispatched() -> None:
+                    nonlocal final_dispatched
                     final_dispatched = True
 
-                self._click_checkout_submit(review, mark_dispatched)
+                self._click_checkout_submit(review, check_pre_dispatch, mark_dispatched)
                 return {"awaiting_user_payment": True, "payment": "vipps"}
         except HouseholdError as exc:
             if not final_dispatched:
@@ -2722,11 +2841,11 @@ __DELIVERY_BINDING__
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
-  const expected = ORDER, path = `/profil/nettbutikk/bestilling/${expected}`;
+  const expected = ORDER, paths = [`/trumf-profil/nettbutikk/bestilling/${expected}`, `/profil/nettbutikk/bestilling/${expected}`];
   const main = [...document.querySelectorAll('main')].filter(visible);
   const lines = main.length === 1 ? (main[0].innerText || '').split(/\n+/).map(norm).filter(Boolean) : [];
   const index = lines.findIndex(x => x === 'Ordrenummer');
-  if (location.pathname !== path || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({available:false});
+  if (!paths.includes(location.pathname) || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({available:false});
   const buttons = [...main[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Kanseller bestilling');
   if (buttons.length !== 1) return JSON.stringify({available:false});
   buttons[0].setAttribute('data-hermes-meal-planner-action', 'cancel-open');
@@ -2788,11 +2907,11 @@ __DELIVERY_BINDING__
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
-  const expected = ORDER, path = `/profil/nettbutikk/bestilling/${expected}`;
+  const expected = ORDER, paths = [`/trumf-profil/nettbutikk/bestilling/${expected}`, `/profil/nettbutikk/bestilling/${expected}`];
   const main = [...document.querySelectorAll('main')].filter(visible);
   const lines = main.length === 1 ? (main[0].innerText || '').split(/\n+/).map(norm).filter(Boolean) : [];
   const index = lines.findIndex(x => x === 'Ordrenummer');
-  if (location.pathname !== path || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({ready:false});
+  if (!paths.includes(location.pathname) || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({ready:false});
   const buttons = [...main[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Kanseller bestilling');
   if (buttons.length !== 1) return JSON.stringify({ready:false});
   buttons[0].setAttribute('data-hermes-meal-planner-action', 'cancel-submit-open');
@@ -2809,11 +2928,11 @@ __DELIVERY_BINDING__
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
-  const expected = ORDER, path = `/profil/nettbutikk/bestilling/${expected}`;
+  const expected = ORDER, paths = [`/trumf-profil/nettbutikk/bestilling/${expected}`, `/profil/nettbutikk/bestilling/${expected}`];
   const main = [...document.querySelectorAll('main')].filter(visible);
   const lines = main.length === 1 ? (main[0].innerText || '').split(/\n+/).map(norm).filter(Boolean) : [];
   const index = lines.findIndex(x => x === 'Ordrenummer');
-  if (location.pathname !== path || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({ready:false});
+  if (!paths.includes(location.pathname) || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({ready:false});
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
   if (dialogs.length !== 1) return JSON.stringify({ready:false});
   const confirm = [...dialogs[0].querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Kanseller');
