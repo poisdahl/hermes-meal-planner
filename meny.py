@@ -22,6 +22,14 @@ from urllib.parse import quote, urlencode, urlparse
 from core import CancellationPreconditionError, CheckoutPreconditionError, HouseholdError, cart_summary
 
 
+class MenyOrderChangeDispatchError(HouseholdError):
+    def __init__(self, order_id: str, code: str, order: Mapping[str, Any], message: str):
+        super().__init__(message)
+        self.order_id = order_id
+        self.code = code
+        self.order = dict(order)
+
+
 BASE_URL = "https://meny.no"
 STORE_URL = f"{BASE_URL}/varer"
 CHECKOUT_URL = f"{BASE_URL}/kassen"
@@ -2310,9 +2318,10 @@ __DELIVERY_BINDING__
 """)
             if dialog != {"ready": True}:
                 raise HouseholdError("MENY order change confirmation changed")
-            self._invoke("click", '[data-hermes-meal-planner-action="change-confirm"]')
-            for _ in range(40):
-                ready = self._eval(r"""
+            try:
+                self._invoke("click", '[data-hermes-meal-planner-action="change-confirm"]')
+                for _ in range(40):
+                    ready = self._eval(r"""
 (() => {
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -2326,11 +2335,16 @@ __DELIVERY_BINDING__
   return JSON.stringify({ready:authenticated.length === 1 && exact.length === 1});
 })()
 """.replace("CODE", json.dumps(code)))
-                if ready == {"ready": True}:
-                    verified = self._verify_order_change(order_id, code)
-                    return {"provider": "meny", "order_id": order_id, "code": verified["code"], "order": order, "editing": True}
-                self._sleep(0.25)
-            raise HouseholdError("MENY order did not enter change mode")
+                    if ready == {"ready": True}:
+                        verified = self._verify_order_change(order_id, code)
+                        return {"provider": "meny", "order_id": order_id, "code": verified["code"], "order": order, "editing": True}
+                    self._sleep(0.25)
+                raise HouseholdError("MENY order did not enter change mode")
+            except Exception as exc:
+                raise MenyOrderChangeDispatchError(
+                    order_id, code, order,
+                    "MENY order-change dispatch is uncertain; recover or abort it before continuing",
+                ) from exc
 
     def abort_order_change(self, order_id: str, code: str | None = None, *, deadline: float | None = None) -> dict[str, Any]:
         with self._locked_operation(MENY_ORDER_TIMEOUT, deadline):

@@ -6,7 +6,9 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, timedelta
 import fcntl
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -82,6 +84,9 @@ DEFAULT_PROFILE: dict[str, Any] = {
         "breakfast_context": [],
         "notes": [],
     },
+    "recipes": {
+        "repeat_cooldown_weeks": 6,
+    },
 }
 
 
@@ -98,11 +103,18 @@ DEFAULT_SCHEDULE: dict[str, Any] = {
 }
 
 
+def valid_email_address(value: Any) -> bool:
+    return isinstance(value, str) and len(value) <= 254 and re.fullmatch(
+        r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+",
+        value,
+    ) is not None
+
+
 def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 1,
+        "version": 2,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -116,6 +128,12 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "order_change": None,
         "email_jobs": [],
         "occurrences": {},
+        "recipe_usage": {},
+        "recipe_usage_requests": {},
+        "order_snapshots": {},
+        "order_snapshot_times": {},
+        "protected_results": {},
+        "protected_requests": {},
     }
 
 
@@ -134,15 +152,195 @@ def _merge(target: dict[str, Any], changes: Mapping[str, Any]) -> None:
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    encoded = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+    try:
+        encoded = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n").encode()
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise HouseholdError("household state contains an invalid JSON value") from exc
     temp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.write(descriptor, encoded)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temp, path)
+        try:
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("state write made no progress")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _normalized_identity(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+def _legacy_recipe_key(recipe: Mapping[str, Any]) -> str:
+    source = recipe.get("source") if isinstance(recipe.get("source"), Mapping) else {}
+    if source.get("publisher") and source.get("external_id"):
+        return f"source:{_normalized_identity(source['publisher'])}:{_normalized_identity(source['external_id'])}"
+    if source.get("url"):
+        return f"source-url:{source['url']}"
+    ingredients = recipe.get("ingredients") if isinstance(recipe.get("ingredients"), list) else []
+    identity = {
+        "name": _normalized_identity(recipe.get("name")),
+        "ingredients": sorted(
+            _normalized_identity(item.get("item") or item.get("name") if isinstance(item, Mapping) else item)
+            for item in ingredients
+        ),
+    }
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return f"content:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _menu_digest(menu: Mapping[str, Any]) -> str:
+    content = deepcopy(dict(menu))
+    for key in ("menu_id", "revision", "digest", "phase", "order_id"):
+        content.pop(key, None)
+    encoded = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _upgrade_legacy_menu(menu: dict[str, Any]) -> None:
+    for collection in ("dishes", "salads"):
+        recipes = menu.get(collection)
+        if not isinstance(recipes, list):
+            continue
+        for recipe in recipes:
+            if not isinstance(recipe, dict):
+                continue
+            source_defaults = {
+                "kind": "unknown", "publisher": None, "title": None, "author": None,
+                "url": None, "external_id": None, "relationship": "unknown",
+            }
+            source = recipe.setdefault("source", {})
+            if not isinstance(source, dict):
+                source = recipe["source"] = {}
+            for key, value in source_defaults.items():
+                source.setdefault(key, value)
+            rights_defaults = {"storage": "full", "license": None, "license_url": None, "credit": None}
+            rights = recipe.setdefault("rights", {})
+            if not isinstance(rights, dict):
+                rights = recipe["rights"] = {}
+            for key, value in rights_defaults.items():
+                rights.setdefault(key, value)
+            recipe.setdefault("recipe_key", _legacy_recipe_key(recipe))
+    digest = _menu_digest(menu)
+    menu.setdefault("menu_id", f"menu_legacy_{digest[:16]}")
+    menu.setdefault("revision", 1)
+    menu["digest"] = digest
+    menu.setdefault("phase", "draft")
+
+
+def _add_legacy_usage(state: dict[str, Any], menu: Mapping[str, Any]) -> None:
+    keys = [
+        recipe.get("recipe_key")
+        for collection in ("dishes", "salads")
+        for recipe in (menu.get(collection) if isinstance(menu.get(collection), list) else [])
+        if isinstance(recipe, Mapping) and recipe.get("recipe_key")
+    ]
+    state["recipe_usage"].setdefault(menu["menu_id"], {
+        "week": menu.get("week"),
+        "status": "ordered" if menu.get("phase") == "ordered" else "planned",
+        "recipe_keys": keys,
+        "cooked_keys": [],
+        "not_cooked_keys": [],
+        "cooldown_overrides": {},
+        "order_id": menu.get("order_id"),
+    })
+
+
+def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
+    version = state.get("version", 1)
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise HouseholdError("household state version is invalid")
+    if version > 2:
+        raise HouseholdError("household state is newer than this meal planner")
+    if version == 1:
+        profile = state.get("profile")
+        if not isinstance(profile, dict):
+            raise HouseholdError("household profile is invalid")
+        profile.setdefault("recipes", deepcopy(DEFAULT_PROFILE["recipes"]))
+        state.setdefault("recipe_usage", {})
+        state.setdefault("recipe_usage_requests", {})
+        state.setdefault("order_snapshots", {})
+        state.setdefault("order_snapshot_times", {})
+        state.setdefault("protected_results", {})
+        state.setdefault("protected_requests", {})
+        if not isinstance(state["recipe_usage"], dict) or not isinstance(state["recipe_usage_requests"], dict) or not isinstance(state["order_snapshots"], dict) or not isinstance(state["order_snapshot_times"], dict):
+            raise HouseholdError("household recipe lifecycle state is invalid")
+        menu = state.get("menu")
+        if isinstance(menu, dict):
+            _upgrade_legacy_menu(menu)
+            _add_legacy_usage(state, menu)
+            if menu.get("order_id"):
+                state["order_snapshots"].setdefault(str(menu["order_id"]), deepcopy(menu))
+        pending = state.get("pending_checkout")
+        if isinstance(pending, dict) and isinstance(pending.get("menu"), dict):
+            pending_menu = pending["menu"]
+            _upgrade_legacy_menu(pending_menu)
+            if isinstance(menu, Mapping) and pending_menu.get("digest") == menu.get("digest"):
+                pending["menu"] = pending_menu = deepcopy(menu)
+            _add_legacy_usage(state, pending_menu)
+            pending.setdefault("menu_ref", {
+                "menu_id": pending_menu["menu_id"],
+                "revision": pending_menu["revision"],
+                "digest": pending_menu["digest"],
+            })
+        recipient = state.get("email_recipient")
+        for job in state.get("email_jobs", []):
+            if not isinstance(job, dict):
+                continue
+            snapshot = state["order_snapshots"].get(str(job.get("order_id") or ""))
+            if snapshot:
+                job.setdefault("menu_snapshot", deepcopy(snapshot))
+            if isinstance(recipient, str) and recipient:
+                job.setdefault("recipient_snapshot", recipient)
+        state["version"] = 2
+    state.setdefault("recipe_usage", {})
+    state.setdefault("recipe_usage_requests", {})
+    state.setdefault("order_snapshots", {})
+    state.setdefault("order_snapshot_times", {})
+    state.setdefault("protected_results", {})
+    state.setdefault("protected_requests", {})
+    recipient = state.get("email_recipient")
+    if recipient is not None and not valid_email_address(recipient):
+        state["email_recipient"] = None
+    for job in state.get("email_jobs", []):
+        if not isinstance(job, dict):
+            continue
+        if not isinstance(job.get("order_id"), str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", job["order_id"]) is None:
+            job["status"] = "invalid"
+        if not valid_email_address(job.get("recipient_snapshot")):
+            job.pop("recipient_snapshot", None)
+            if job.get("status") in {"pending", "claimed", "sending"}:
+                job["status"] = "invalid"
+        delivery_date = job.get("delivery_date")
+        try:
+            canonical_date = date.fromisoformat(delivery_date).isoformat() if isinstance(delivery_date, str) else None
+        except ValueError:
+            canonical_date = None
+        if canonical_date != delivery_date:
+            job["status"] = "invalid"
+    profile = state.get("profile")
+    if not isinstance(profile, dict):
+        raise HouseholdError("household profile is invalid")
+    profile.setdefault("recipes", deepcopy(DEFAULT_PROFILE["recipes"]))
+    recipe_profile = profile.get("recipes")
+    if not isinstance(recipe_profile, dict):
+        raise HouseholdError("household recipe profile is invalid")
+    cooldown = recipe_profile.get("repeat_cooldown_weeks")
+    if isinstance(cooldown, bool) or not isinstance(cooldown, int) or not 0 <= cooldown <= 260:
+        raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
+    if not isinstance(state["recipe_usage"], dict) or not isinstance(state["recipe_usage_requests"], dict) or not isinstance(state["order_snapshots"], dict) or not isinstance(state["order_snapshot_times"], dict) or not isinstance(state["protected_results"], dict) or not isinstance(state["protected_requests"], dict):
+        raise HouseholdError("household recipe lifecycle state is invalid")
 
 
 class StateStore:
@@ -157,6 +355,19 @@ class StateStore:
             _atomic_json(self.path, initial_state(self.config))
         configured_provider = str(self.config.get("provider") or "oda").casefold()
         with self.locked() as state:
+            if state.get("version", 1) == 1:
+                backup = self.directory / "state-v1.backup.json"
+                if not backup.exists():
+                    _atomic_json(backup, state)
+            _migrate_state(state, self.config)
+            state_household = state.get("household")
+            configured_household = str(self.config["household"])
+            if state_household is None:
+                state["household"] = configured_household
+            elif state_household != configured_household:
+                raise HouseholdError(
+                    f"household state belongs to {state_household}; use a separate state directory for {configured_household}"
+                )
             state_provider = state.get("provider")
             if state_provider is None:
                 state["provider"] = configured_provider
@@ -174,9 +385,15 @@ class StateStore:
                 state = json.loads(self.path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise HouseholdError("household state is unreadable") from exc
-            before = json.dumps(state, ensure_ascii=False, sort_keys=True)
+            try:
+                before = json.dumps(state, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise HouseholdError("household state contains an invalid JSON value") from exc
             yield state
-            after = json.dumps(state, ensure_ascii=False, sort_keys=True)
+            try:
+                after = json.dumps(state, ensure_ascii=False, sort_keys=True, allow_nan=False)
+            except (TypeError, ValueError, UnicodeError) as exc:
+                raise HouseholdError("household state contains an invalid JSON value") from exc
             if before != after:
                 _atomic_json(self.path, state)
         finally:
@@ -292,6 +509,7 @@ def masked_status(state: Mapping[str, Any], integration: Mapping[str, Any]) -> d
         "favorites": len(state["favorites"]),
         "recurring_items": len(state["recurring_items"]),
         "menu_phase": (state.get("menu") or {}).get("phase"),
+        "menu_id": (state.get("menu") or {}).get("menu_id"),
         "pending_checkout_status": (state.get("pending_checkout") or {}).get("status"),
         "pending_cancellation_status": (state.get("pending_cancellation") or {}).get("status"),
         "order_change_status": (state.get("order_change") or {}).get("status"),
@@ -318,12 +536,23 @@ def cart_summary(cart: Mapping[str, Any]) -> dict[str, Any]:
             raise HouseholdError("Oda cart line is invalid")
         product = item.get("product") if isinstance(item.get("product"), Mapping) else item
         quantity = item.get("quantity", 1)
-        if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or quantity < 1 or not float(quantity).is_integer():
+        try:
+            numeric_quantity = float(quantity)
+        except (TypeError, ValueError, OverflowError):
+            numeric_quantity = math.nan
+        if (
+            isinstance(quantity, bool)
+            or not isinstance(quantity, (int, float))
+            or not math.isfinite(numeric_quantity)
+            or numeric_quantity < 1
+            or numeric_quantity > 1_000_000
+            or not numeric_quantity.is_integer()
+        ):
             raise HouseholdError("Oda cart quantity is invalid")
         lines.append({
             "product_id": str(product.get("id") or product.get("product_id") or ""),
             "name": str(product.get("name") or product.get("product_name") or ""),
-            "quantity": int(quantity),
+            "quantity": int(numeric_quantity),
             "price": item.get("totalGrossAmount", item.get("price", product.get("price"))),
         })
     total = cart.get("totalGrossAmount", cart.get("subtotal", cart.get("total")))
@@ -331,6 +560,8 @@ def cart_summary(cart: Mapping[str, Any]) -> dict[str, Any]:
         numeric_total = float(str(total).replace(",", "."))
     except (TypeError, ValueError) as exc:
         raise HouseholdError("Oda cart total is unavailable") from exc
+    if not math.isfinite(numeric_total) or numeric_total < 0:
+        raise HouseholdError("Oda cart total is unavailable")
     slot = cart.get("deliverySlot", cart.get("delivery"))
     if isinstance(slot, Mapping):
         delivery = {

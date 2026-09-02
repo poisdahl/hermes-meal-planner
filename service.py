@@ -7,8 +7,10 @@ import argparse
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import html
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,15 +35,21 @@ from core import (
     masked_status,
     put_item,
     remove_item,
+    valid_email_address,
 )
 from oda import OdaClient
-from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, meny_checkout_reviews_match, normalize_product_ref
+from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, MenyOrderChangeDispatchError, meny_checkout_reviews_match, normalize_product_ref
+from recipes import RecipeError, RecipeStore, normalize_recipe, normalize_source_url, recipe_key, scale_recipe, validate_week
 
 
 MAX_REQUEST = 2 * 1024 * 1024
+MAX_EMAIL_HTML_BYTES = MAX_REQUEST // 2
+MAX_MENU_BYTES = MAX_REQUEST // 2
 CANCELLATION_OPERATION_TIMEOUT = 105
 MENY_CHECKOUT_OPERATION_TIMEOUT = 600
 MENY_VIPPS_EXPIRY_BUFFER = timedelta(minutes=11)
+SCHEDULE_OCCURRENCE_LEASE = timedelta(minutes=5)
+EMAIL_CLAIM_LEASE = timedelta(minutes=5)
 UNRESOLVED_CHECKOUT_STATUSES = {"clicking", "uncertain", "awaiting_user_payment"}
 SCHEDULE_WEEKDAYS = {
     "monday": 0,
@@ -77,6 +85,39 @@ def now() -> datetime:
 
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def strict_json_loads(value: str | bytes) -> Any:
+    def reject_constant(constant: str) -> None:
+        raise ValueError(f"non-finite JSON number is not allowed: {constant}")
+
+    def parse_float(number: str) -> float:
+        parsed = float(number)
+        if not math.isfinite(parsed):
+            raise ValueError("non-finite JSON number is not allowed")
+        return parsed
+
+    return json.loads(value, parse_constant=reject_constant, parse_float=parse_float)
+
+
+def validate_request_value(value: Any, depth: int = 0) -> None:
+    if depth > 32:
+        raise HouseholdError("request nesting is too deep")
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if not isinstance(key, str) or any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+                raise HouseholdError("request contains invalid Unicode")
+            validate_request_value(child, depth + 1)
+    elif isinstance(value, list):
+        for child in value:
+            validate_request_value(child, depth + 1)
+    elif isinstance(value, str):
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise HouseholdError("request contains invalid Unicode")
+    elif isinstance(value, float) and not math.isfinite(value):
+        raise HouseholdError("request numbers must be finite")
+    elif not isinstance(value, (int, float, bool, type(None))):
+        raise HouseholdError("request contains an unsupported value")
 
 
 def expired_awaiting_confirmation(value: Any) -> bool:
@@ -118,10 +159,73 @@ def meny_login_lost(error: BaseException) -> bool:
 
 
 def menu_email_period(menu: Mapping[str, Any]) -> str:
-    week = menu.get("week")
-    if not isinstance(week, str) or not re.fullmatch(r"\d{4}-W(?:0[1-9]|[1-4]\d|5[0-3])", week):
-        raise HouseholdError("email menu needs a valid ISO week")
-    return week
+    try:
+        return validate_week(menu.get("week"))
+    except RecipeError as exc:
+        raise HouseholdError("email menu needs a valid ISO week") from exc
+
+
+def safe_order_id(value: Any) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None:
+        raise HouseholdError("order_id must be a bounded safe provider identifier")
+    return value
+
+
+def bounded_limit(value: Any, *, default: int, maximum: int = 100) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        raise HouseholdError(f"limit must be an integer from one to {maximum}")
+    return value
+
+
+def require_provider_identity(value: Any, expected_order_id: str, *, tracking: bool = False) -> None:
+    if not isinstance(value, Mapping):
+        raise HouseholdError("provider returned no exact order identity")
+    primary = ("order_id", "orderNumber", "order_number") if tracking else ("orderNumber", "order_number")
+    candidates = [str(value.get(key)) for key in primary if value.get(key) is not None and value.get(key) != ""]
+    if not candidates and value.get("id") is not None and value.get("id") != "":
+        candidates = [str(value["id"])]
+    if not candidates or any(candidate != expected_order_id for candidate in candidates):
+        raise HouseholdError("provider response does not match the requested order")
+    for candidate in candidates:
+        safe_order_id(candidate)
+
+
+def email_automation_prompt(order_id: str, delivery_date: str, automation_key: str) -> str:
+    order_id = safe_order_id(order_id)
+    try:
+        if date.fromisoformat(delivery_date).isoformat() != delivery_date:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise HouseholdError("delivery_date must be a canonical ISO date") from exc
+    if re.fullmatch(r"meal-planner-email-[a-f0-9]{16}", automation_key) is None:
+        raise HouseholdError("email automation key is invalid")
+    return (
+        f"Opprett eller oppdater den ene automatiseringen {automation_key}. På {delivery_date}: "
+        f"kall meal_planner_email action=due for ordre {order_id}. "
+        "Hvis claim=true, kall begin_send med returnert claim_token rett før senderen. Bare hvis dispatch=true, "
+        "send nøyaktig returnert recipient, subject og HTML én gang. Etter vellykket sending: kall mark_sent "
+        f"for samme ordre {order_id} med returnert claim_token. Ved en uttrykkelig definitiv sendefeil "
+        "kan samme token frigis med action=release; ikke frigi ved timeout eller usikkert resultat."
+    )
+
+
+def email_automation_ack(order_id: str, delivery_date: str, automation_key: str) -> dict[str, Any]:
+    prompt = email_automation_prompt(order_id, delivery_date, automation_key)
+    return {
+        "action": "ack_automation", "order_id": order_id, "delivery_date": delivery_date,
+        "automation_key": automation_key, "automation_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+        "protocol": 2,
+    }
+
+
+def menu_digest(menu: Mapping[str, Any]) -> str:
+    value = deepcopy(dict(menu))
+    for key in ("menu_id", "revision", "digest", "phase", "order_id"):
+        value.pop(key, None)
+    import hashlib
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
 def menu_email_html(menu: Mapping[str, Any], *, test: bool = False) -> str:
@@ -133,7 +237,8 @@ def menu_email_html(menu: Mapping[str, Any], *, test: bool = False) -> str:
             if isinstance(value, Mapping):
                 amount = str(value.get("amount") or "").strip()
                 item = str(value.get("item") or value.get("name") or "").strip()
-                text = " ".join(part for part in (amount, item) if part)
+                raw = str(value.get("raw") or "").strip()
+                text = " ".join(part for part in (amount, item) if part) if amount else raw or item
             else:
                 text = str(value).strip()
             if text:
@@ -144,6 +249,34 @@ def menu_email_html(menu: Mapping[str, Any], *, test: bool = False) -> str:
         if not isinstance(values, list):
             return ""
         return "".join(f"<li>{escape(value)}</li>" for value in values if str(value).strip())
+
+    def source(value: Mapping[str, Any]) -> str:
+        metadata = value.get("source") if isinstance(value.get("source"), Mapping) else {}
+        publisher = str(metadata.get("publisher") or metadata.get("kind") or "Kilde ikke registrert").strip()
+        source_title = str(metadata.get("title") or value.get("name") or "").strip()
+        relationship = str(metadata.get("relationship") or "unknown").casefold()
+        labels = {
+            "adapted": "Tilpasset",
+            "inspired_by": "Inspirert av",
+            "generated": "Generert av Hermes",
+            "user_supplied": "Familiens egen oppskrift",
+            "original": "Kilde",
+            "unknown": "Kilde",
+        }
+        label = labels.get(relationship, "Kilde")
+        try:
+            url = normalize_source_url(metadata.get("url"))
+        except RecipeError:
+            url = None
+        text = " – ".join(part for part in (publisher, source_title if source_title.casefold() != publisher.casefold() else "") if part)
+        if relationship == "generated":
+            text = "Hermes for denne ukemenyen"
+        elif relationship == "user_supplied" and publisher.casefold() in {"unknown", "user", "bruker"}:
+            text = "Familiens egen oppskrift"
+        rendered = f'<a href="{escape(url)}">{escape(text)}</a>' if url else escape(text)
+        credit = (value.get("rights") or {}).get("credit") if isinstance(value.get("rights"), Mapping) else None
+        suffix = f". {escape(credit)}" if credit else ""
+        return f"<p><strong>{escape(label)}:</strong> {rendered}{suffix}</p>"
 
     week = menu_email_period(menu)
     title = f"Ukesmeny og oppskrifter – {week}"
@@ -177,12 +310,14 @@ def menu_email_html(menu: Mapping[str, Any], *, test: bool = False) -> str:
             parts.extend([
                 '<section class="recipe">',
                 f"<h2>{escape(recipe.get('name'))}</h2>",
+                source(recipe),
                 f"<p>{escape(recipe.get('portions'))} porsjoner</p>" if recipe.get("portions") else "",
-                "<h3>Ingredienser</h3><ul>",
-                ingredients(recipe.get("ingredients")),
-                "</ul><h3>Fremgangsmåte</h3><ol>",
-                steps(recipe.get("steps")),
-                "</ol>",
+                "<h3>Ingredienser</h3><ul>" if (recipe.get("rights") or {}).get("storage") != "link_only" else "",
+                ingredients(recipe.get("ingredients")) if (recipe.get("rights") or {}).get("storage") != "link_only" else "",
+                "</ul><h3>Fremgangsmåte</h3><ol>" if (recipe.get("rights") or {}).get("storage") != "link_only" else "",
+                steps(recipe.get("steps")) if (recipe.get("rights") or {}).get("storage") != "link_only" else "",
+                "</ol>" if (recipe.get("rights") or {}).get("storage") != "link_only" else "",
+                f"<p>{escape(recipe.get('notes'))}</p>" if recipe.get("notes") else "",
                 f"<p><strong>Lagring:</strong> {escape(recipe.get('storage'))}</p>" if recipe.get("storage") else "",
                 f"<p><strong>Oppvarming:</strong> {escape(recipe.get('reheating'))}</p>" if recipe.get("reheating") else "",
                 "</section>",
@@ -205,9 +340,63 @@ def delivery_matches(preference: Mapping[str, Any], delivery: Mapping[str, Any] 
         return False
     latest = str(preference.get("latest_end") or "")
     times = re.findall(r"\b([01]\d|2[0-3]):([0-5]\d)\b", display)
-    if latest and times and f"{times[-1][0]}:{times[-1][1]}" > latest:
-        return False
+    if latest:
+        if not times or f"{times[-1][0]}:{times[-1][1]}" > latest:
+            return False
     return True
+
+
+def validate_schedule(schedule: Mapping[str, Any], provider: str) -> float | None:
+    if not isinstance(schedule.get("enabled"), bool) or not isinstance(schedule.get("auto_checkout"), bool):
+        raise HouseholdError("schedule enabled and auto_checkout must be true or false")
+    if str(schedule.get("mode") or "") not in {"draft", "cart_ready", "auto_checkout"}:
+        raise HouseholdError("schedule mode is invalid")
+    weekday = str(schedule.get("weekday") or "").casefold()
+    if weekday not in SCHEDULE_WEEKDAYS:
+        raise HouseholdError("schedule weekday is invalid")
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(schedule.get("time") or "")) is None:
+        raise HouseholdError("schedule time is invalid")
+    try:
+        ZoneInfo(str(schedule.get("timezone") or ""))
+    except ZoneInfoNotFoundError as exc:
+        raise HouseholdError("schedule timezone is invalid") from exc
+    maximum = schedule.get("maximum_total")
+    maximum_value = None
+    if maximum is not None:
+        try:
+            maximum_value = float(maximum)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise HouseholdError("schedule maximum total must be a positive finite number") from exc
+        if isinstance(maximum, bool) or not isinstance(maximum, (int, float)) or not math.isfinite(maximum_value) or maximum_value <= 0:
+            raise HouseholdError("schedule maximum total must be a positive finite number")
+    delivery = schedule.get("delivery")
+    if not isinstance(delivery, Mapping) or not set(delivery).issubset({"weekday", "preferred_end", "latest_end"}):
+        raise HouseholdError("schedule delivery preference is invalid")
+    delivery_weekday = str(delivery.get("weekday") or "").casefold()
+    if delivery_weekday and delivery_weekday not in SCHEDULE_WEEKDAYS:
+        raise HouseholdError("schedule delivery weekday is invalid")
+    for key in ("preferred_end", "latest_end"):
+        if delivery.get(key) is not None and re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(delivery[key])) is None:
+            raise HouseholdError(f"schedule delivery {key} is invalid")
+    if schedule.get("auto_checkout"):
+        if provider != "oda":
+            raise HouseholdError("MENY supports cart_ready scheduling; checkout continues manually in the browser")
+        if maximum is None or not (delivery_weekday or delivery.get("latest_end")):
+            raise HouseholdError("auto-checkout requires maximum total and a delivery weekday or latest end")
+    return maximum_value
+
+
+def money_cents(value: Any) -> int | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    scaled = number * 100
+    if not math.isfinite(scaled):
+        return None
+    return int(round(scaled))
 
 
 def order_matches_checkout(order: Mapping[str, Any], summary: Mapping[str, Any]) -> bool:
@@ -292,20 +481,31 @@ def order_matches_checkout(order: Mapping[str, Any], summary: Mapping[str, Any])
 
     summary_delivery = summary.get("delivery")
     expected_delivery = summary_delivery.get("display") if isinstance(summary_delivery, Mapping) else None
+    expected_address = summary_delivery.get("address") if isinstance(summary_delivery, Mapping) else None
     observed_delivery = order.get("deliverySlotDisplay")
     observed_date = order.get("deliveryDate")
+    observed_address = order.get("deliveryAddress", order.get("delivery_address"))
+    if isinstance(observed_address, Mapping):
+        observed_address = observed_address.get("address") or observed_address.get("display")
     if not isinstance(expected_delivery, str) or not isinstance(observed_delivery, str):
+        return False
+    if not isinstance(expected_address, str) or not expected_address.strip() or not isinstance(observed_address, str) or not observed_address.strip():
         return False
     if observed_date is not None and not isinstance(observed_date, str):
         return False
     expected_signature = delivery_signature(expected_delivery)
     observed_signature = delivery_signature(observed_delivery, observed_date or "")
+    observed_total = money_cents(observed.get("total"))
+    expected_total = money_cents(summary.get("total"))
     return (
         items(observed) is not None
         and items(observed) == items(summary)
-        and int(round(observed["total"] * 100)) == int(round(float(summary.get("total")) * 100))
+        and observed_total is not None
+        and observed_total == expected_total
         and expected_signature is not None
         and observed_signature == expected_signature
+        and re.sub(r"\s+", " ", unicodedata.normalize("NFC", observed_address)).strip().casefold()
+        == re.sub(r"\s+", " ", unicodedata.normalize("NFC", expected_address)).strip().casefold()
     )
 
 
@@ -375,26 +575,77 @@ def meny_order_matches_checkout(order: Mapping[str, Any], summary: Mapping[str, 
     )
 
 
-def oda_order_matches_addition(before: Mapping[str, Any], after: Mapping[str, Any], additions: Mapping[str, Any]) -> bool:
-    def quantities(order: Mapping[str, Any]) -> dict[str, int] | None:
-        products = order.get("products")
-        if not isinstance(products, list):
+def oda_order_quantities(order: Mapping[str, Any]) -> dict[str, int] | None:
+    products = order.get("products")
+    if not isinstance(products, list):
+        return None
+    try:
+        summary = cart_summary({"items": products, "total": order.get("grossAmount", 0)})
+    except HouseholdError:
+        return None
+    result: dict[str, int] = {}
+    for item in summary["items"]:
+        product_id = item["product_id"]
+        if not product_id:
             return None
-        try:
-            summary = cart_summary({"items": products, "total": order.get("grossAmount", 0)})
-        except HouseholdError:
-            return None
-        result: dict[str, int] = {}
-        for item in summary["items"]:
-            product_id = item["product_id"]
-            if not product_id:
-                return None
-            result[product_id] = result.get(product_id, 0) + item["quantity"]
-        return result
+        result[product_id] = result.get(product_id, 0) + item["quantity"]
+    return result
 
-    expected = quantities(before)
-    observed = quantities(after)
+
+def oda_order_delivery_identity(order: Mapping[str, Any]) -> tuple[tuple[str, Any], ...] | None:
+    identity: list[tuple[str, Any]] = []
+    for key in ("deliveryDate", "delivery_date"):
+        if key in order:
+            value = order.get(key)
+            if not isinstance(value, str):
+                return None
+            try:
+                canonical_date = date.fromisoformat(value).isoformat()
+            except ValueError:
+                return None
+            if canonical_date != value:
+                return None
+            identity.append(("date", canonical_date))
+            break
+    for key in ("deliverySlotDisplay", "delivery_slot_display"):
+        if key in order:
+            signature = oda_delivery_signature(str(order.get(key) or ""))
+            if signature is None:
+                return None
+            identity.append(("slot", signature))
+            break
+    for key in ("deliveryAddressId", "delivery_address_id", "addressId", "address_id"):
+        if key in order:
+            value = order.get(key)
+            if not isinstance(value, (str, int)) or isinstance(value, bool):
+                return None
+            identity.append(("address", str(value)))
+            break
+    kinds = {kind for kind, _value in identity}
+    return tuple(identity) if {"date", "slot"}.issubset(kinds) else None
+
+
+def oda_order_address_identity(order: Mapping[str, Any]) -> str | None:
+    for key in ("deliveryAddressId", "delivery_address_id", "addressId", "address_id"):
+        if key not in order:
+            continue
+        value = order.get(key)
+        if not isinstance(value, (str, int)) or isinstance(value, bool):
+            return None
+        normalized = str(value).strip()
+        return normalized or None
+    return None
+
+
+def oda_order_matches_addition(before: Mapping[str, Any], after: Mapping[str, Any], additions: Mapping[str, Any]) -> bool:
+
+    expected = oda_order_quantities(before)
+    observed = oda_order_quantities(after)
     if expected is None or observed is None:
+        return False
+    before_delivery = oda_order_delivery_identity(before)
+    after_delivery = oda_order_delivery_identity(after)
+    if before_delivery is None or before_delivery != after_delivery:
         return False
     for item in additions.get("items", []):
         if not isinstance(item, Mapping) or not item.get("product_id") or not isinstance(item.get("quantity"), int):
@@ -409,9 +660,34 @@ def oda_order_matches_addition(before: Mapping[str, Any], after: Mapping[str, An
     return observed == expected and total_matches
 
 
+def checkout_intent_signature(summary: Mapping[str, Any]) -> str | None:
+    items = summary.get("items")
+    if not isinstance(items, list):
+        return None
+    lines = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            return None
+        product_id = str(item.get("product_id") or "")
+        quantity = item.get("quantity")
+        if not product_id or isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+            return None
+        lines.append((product_id, quantity))
+    total = money_cents(summary.get("total"))
+    if total is None:
+        return None
+    delivery = summary.get("delivery") if isinstance(summary.get("delivery"), Mapping) else {}
+    identity = {
+        "items": sorted(lines), "total_cents": total,
+        "delivery": str(delivery.get("display") or ""), "address": str(delivery.get("address") or ""),
+    }
+    return hashlib.sha256(canonical(identity).encode()).hexdigest()
+
+
 class Application:
     def __init__(self, store: StateStore, provider_client: Any, browser: OdaBrowser):
         self.store = store
+        self.recipes = RecipeStore(store.directory / "recipes.sqlite3", str(store.config["household"]))
         self.oda = provider_client
         self.provider = str(store.config.get("provider") or "oda").casefold()
         self.confirmation_policy = str(store.config.get("confirmation_policy") or "fresh").casefold()
@@ -430,6 +706,62 @@ class Application:
             }
         else:
             self._refresh_integration()
+
+    def _household_today(self, state: Mapping[str, Any] | None = None) -> date:
+        current = state or self.store.read()
+        timezone_name = str((current.get("schedule") or {}).get("timezone") or "Europe/Oslo")
+        try:
+            return now().astimezone(ZoneInfo(timezone_name)).date()
+        except ZoneInfoNotFoundError as exc:
+            raise HouseholdError("schedule timezone is invalid") from exc
+
+    @staticmethod
+    def _store_protected_result(
+        state: dict[str, Any], confirmation_id: str, kind: str, result: Mapping[str, Any],
+        *, target_id: str | None = None, intent_signature: str | None = None,
+    ) -> None:
+        records = state.setdefault("protected_results", {})
+        records[confirmation_id] = {
+            "kind": kind, "target_id": target_id, "intent_signature": intent_signature,
+            "result": deepcopy(dict(result)), "completed_at": now().isoformat(),
+        }
+        state[f"last_{kind}_confirmation_id"] = confirmation_id
+        for request in state.setdefault("protected_requests", {}).values():
+            if isinstance(request, dict) and request.get("kind") == kind and request.get("confirmation_id") == confirmation_id:
+                request["result"] = deepcopy(dict(result))
+                request["completed_at"] = now().isoformat()
+
+    @staticmethod
+    def _read_protected_result(state: Mapping[str, Any], confirmation_id: str, kind: str) -> dict[str, Any] | None:
+        record = state.get("protected_results", {}).get(confirmation_id) if isinstance(state.get("protected_results"), Mapping) else None
+        if not isinstance(record, Mapping) or record.get("kind") != kind or not isinstance(record.get("result"), Mapping):
+            return None
+        return {**deepcopy(dict(record["result"])), "idempotent": True}
+
+    @staticmethod
+    def _idempotency_key(value: Any, kind: str) -> str:
+        if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}", value) is None:
+            raise HouseholdError(f"{kind} idempotency_key is required and must be bounded safe text")
+        return value
+
+    @staticmethod
+    def _protected_request(state: dict[str, Any], kind: str, key: str, *, target_id: str | None = None) -> dict[str, Any] | None:
+        records = state.setdefault("protected_requests", {})
+        identity = f"{kind}:{key}"
+        existing = records.get(identity)
+        if existing is not None:
+            if not isinstance(existing, dict) or existing.get("kind") != kind or existing.get("target_id") != target_id:
+                raise HouseholdError("idempotency_key was already used for a different protected request")
+            return existing
+        return None
+
+    @staticmethod
+    def _bind_protected_request(state: dict[str, Any], kind: str, key: str, confirmation_id: str, *, target_id: str | None = None) -> None:
+        records = state.setdefault("protected_requests", {})
+        records[f"{kind}:{key}"] = {
+            "kind": kind, "target_id": target_id, "confirmation_id": confirmation_id,
+            "created_at": now().isoformat(),
+        }
 
     def _refresh_integration(self, deadline: float | None = None, *, allow_recovery: bool = False) -> None:
         try:
@@ -463,6 +795,15 @@ class Application:
             self.browser_lock.release()
 
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        if not isinstance(request, Mapping):
+            raise HouseholdError("request must be an object")
+        validate_request_value(request)
+        operation = request.get("operation")
+        action = request.get("action")
+        if not isinstance(operation, str) or not 1 <= len(operation) <= 40:
+            raise HouseholdError("operation must be bounded text")
+        if action is not None and (not isinstance(action, str) or not 1 <= len(action) <= 40):
+            raise HouseholdError("action must be bounded text")
         try:
             result = self._handle(request)
         except HouseholdError as exc:
@@ -506,6 +847,8 @@ class Application:
             return self._items(request, "favorites")
         if operation == "recurring":
             return self._recurring(request)
+        if operation == "recipes":
+            return self._recipes(request)
         if operation == "menu":
             return self._menu(request)
         if operation == "schedule":
@@ -560,15 +903,22 @@ class Application:
             state = self.store.read()
             return {"profile": state["profile"], "email_recipient": mask_email(state.get("email_recipient"))}
         if action == "update":
-            return {"profile": self.store.update_profile(request.get("changes", {}))}
+            changes = request.get("changes", {})
+            recipe_changes = changes.get("recipes") if isinstance(changes, Mapping) else None
+            if isinstance(recipe_changes, Mapping) and "repeat_cooldown_weeks" in recipe_changes:
+                cooldown = recipe_changes["repeat_cooldown_weeks"]
+                if isinstance(cooldown, bool) or not isinstance(cooldown, int) or not 0 <= cooldown <= 260:
+                    raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
+            return {"profile": self.store.update_profile(changes)}
         if action == "reset":
             paths = request.get("paths")
             if paths is not None and (not isinstance(paths, list) or not all(isinstance(item, str) for item in paths)):
                 raise HouseholdError("reset paths must be strings")
             return {"profile": self.store.reset_profile(paths)}
         if action == "set_email":
-            email = str(request.get("email") or "").strip()
-            if not email or "@" not in email or len(email) > 254:
+            supplied_email = request.get("email")
+            email = supplied_email.strip() if isinstance(supplied_email, str) else ""
+            if not valid_email_address(email):
                 raise HouseholdError("email address is invalid")
             with self.store.locked() as state:
                 state["email_recipient"] = email
@@ -608,7 +958,7 @@ class Application:
         action = request.get("action", "list")
         if action == "due":
             try:
-                when = date.fromisoformat(str(request.get("date") or date.today().isoformat()))
+                when = date.fromisoformat(str(request.get("date") or self._household_today().isoformat()))
             except ValueError as exc:
                 raise HouseholdError("due date is invalid") from exc
             items = self.store.read()["recurring_items"]
@@ -617,29 +967,357 @@ class Application:
             return {"date": when.isoformat(), "due": [item for item in items if due_recurring(item, when)]}
         return self._items({**request, "action": action}, "recurring_items")
 
+    @staticmethod
+    def _week_index(week: str) -> int:
+        match = re.fullmatch(r"(\d{4})-W(\d{2})", validate_week(week))
+        return date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1).toordinal() // 7
+
+    def _usage_summary(
+        self,
+        state: Mapping[str, Any],
+        key: str,
+        week: str,
+        *,
+        ignore_menu_id: str | None = None,
+    ) -> dict[str, Any]:
+        cooldown = (state.get("profile") or {}).get("recipes", {}).get("repeat_cooldown_weeks", 6)
+        if isinstance(cooldown, bool) or not isinstance(cooldown, int) or cooldown < 0 or cooldown > 260:
+            raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
+        target = self._week_index(week)
+        last_planned = last_ordered = last_cooked = None
+        blockers = []
+        for menu_id, record in (state.get("recipe_usage") or {}).items():
+            if menu_id == ignore_menu_id or not isinstance(record, Mapping) or key not in record.get("recipe_keys", []):
+                continue
+            record_week = record.get("week")
+            try:
+                index = self._week_index(str(record_week))
+            except (HouseholdError, RecipeError):
+                continue
+            status = record.get("status")
+            previous = record.get("previous_status")
+            if status in {"planned", "ordered"}:
+                last_planned = max(filter(None, (last_planned, record_week)), default=record_week)
+            if status == "ordered" or previous == "ordered":
+                last_ordered = max(filter(None, (last_ordered, record_week)), default=record_week)
+            cooked = key in record.get("cooked_keys", [])
+            not_cooked = key in record.get("not_cooked_keys", [])
+            if cooked:
+                last_cooked = max(filter(None, (last_cooked, record_week)), default=record_week)
+            active = (status in {"planned", "ordered"} and not not_cooked) or cooked
+            distance = target - index
+            if active and cooldown and -cooldown < distance < cooldown:
+                match = re.fullmatch(r"(\d{4})-W(\d{2})", str(record_week))
+                try:
+                    eligible_date = date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1) + timedelta(weeks=cooldown)
+                except OverflowError:
+                    next_eligible_week = None
+                else:
+                    eligible_iso = eligible_date.isocalendar()
+                    next_eligible_week = f"{eligible_iso.year}-W{eligible_iso.week:02d}"
+                blockers.append({
+                    "menu_id": menu_id, "week": record_week, "status": "cooked" if cooked else status,
+                    "next_eligible_week": next_eligible_week,
+                })
+        next_eligible = max((item["next_eligible_week"] for item in blockers if item["next_eligible_week"]), default=None)
+        return {
+            "last_planned_week": last_planned,
+            "last_ordered_week": last_ordered,
+            "last_cooked_week": last_cooked,
+            "next_eligible_week": next_eligible,
+            "eligible": not blockers,
+            "blocked_by": blockers,
+            "cooldown_weeks": cooldown,
+        }
+
+    @staticmethod
+    def _usage_request(state: dict[str, Any], key: str, digest: str) -> dict[str, Any] | None:
+        requests = state.setdefault("recipe_usage_requests", {})
+        existing = requests.get(key)
+        if existing and existing.get("digest") != digest:
+            raise HouseholdError("usage idempotency key was already used with different content")
+        return deepcopy(existing.get("result")) if existing else None
+
+    @staticmethod
+    def _store_usage_request(state: dict[str, Any], key: str, digest: str, result: Mapping[str, Any]) -> None:
+        requests = state.setdefault("recipe_usage_requests", {})
+        requests[key] = {"digest": digest, "result": deepcopy(dict(result)), "at": now().isoformat()}
+        while len(requests) > 200:
+            requests.pop(next(iter(requests)))
+
+    def _recipes(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        action = request.get("action", "search")
+        if action == "search":
+            state = self.store.read()
+            week = validate_week(request.get("week") or self._household_today(state).strftime("%G-W%V"))
+            results = []
+            requested_limit = request.get("limit", 10)
+            include_ineligible = request.get("include_ineligible") is True
+            offset = 0
+            page_limit = requested_limit
+            while True:
+                rows = self.recipes.search(
+                    request.get("query", ""), limit=page_limit,
+                    include_archived=request.get("include_archived") is True, offset=offset,
+                )
+                offset += len(rows)
+                for row in rows:
+                    summary = self._usage_summary(state, row["recipe_key"], week)
+                    value = {
+                        key: deepcopy(row.get(key))
+                        for key in (
+                            "id", "revision", "status", "name", "language", "tags", "source", "rights",
+                            "portions", "created_at", "updated_at", "created_via", "content_fingerprint", "recipe_key",
+                        )
+                    }
+                    value["usage"] = summary
+                    if include_ineligible or summary["eligible"]:
+                        results.append(value)
+                        if len(results) == requested_limit:
+                            break
+                if len(results) == requested_limit or len(rows) < page_limit or include_ineligible:
+                    break
+                page_limit = 50
+            return {"week": week, "recipes": results}
+        if action == "get":
+            recipe = self.recipes.get(request.get("recipe_id"), request.get("revision"))
+            result = scale_recipe(recipe, request.get("portions")) if recipe["rights"]["storage"] == "full" else recipe
+            if request.get("week"):
+                result["usage"] = self._usage_summary(self.store.read(), result["recipe_key"], validate_week(request["week"]))
+            return {"recipe": result}
+        if action == "save":
+            value = normalize_recipe(request.get("recipe"))
+            key = request.get("idempotency_key")
+            return {"recipe": self.recipes.save(value, status=str(request.get("status") or "active"), idempotency_key=key)}
+        if action == "update":
+            value = normalize_recipe(request.get("recipe"))
+            recipe_id = str(request.get("recipe_id") or "")
+            expected = request.get("expected_revision")
+            key = request.get("idempotency_key")
+            return {"recipe": self.recipes.update(recipe_id, expected, value, status=request.get("status"), idempotency_key=key)}
+        if action == "archive":
+            recipe_id = str(request.get("recipe_id") or "")
+            expected = request.get("expected_revision")
+            key = request.get("idempotency_key")
+            return {"recipe": self.recipes.archive(recipe_id, expected, idempotency_key=key)}
+        if action in {"mark_cooked", "mark_not_cooked"}:
+            week = validate_week(request.get("week"))
+            recipe_identity = str(request.get("recipe_key") or "")
+            if request.get("recipe_id"):
+                stored_identity = self.recipes.get(request.get("recipe_id"))["recipe_key"]
+                if recipe_identity and recipe_identity != stored_identity:
+                    raise HouseholdError("recipe_id and recipe_key refer to different recipes")
+                recipe_identity = stored_identity
+            if not recipe_identity or len(recipe_identity) > 200:
+                raise HouseholdError("recipe_key or recipe_id is required")
+            menu_id = str(request.get("menu_id") or "") or None
+            supplied_request_key = request.get("idempotency_key")
+            if supplied_request_key is not None and (not isinstance(supplied_request_key, str) or not 1 <= len(supplied_request_key.strip()) <= 200):
+                raise HouseholdError("idempotency_key must be one to 200 characters")
+            request_key = supplied_request_key.strip() if supplied_request_key else None
+            digest = canonical({"action": action, "menu_id": menu_id, "recipe_key": recipe_identity, "week": week})
+            with self.store.locked() as state:
+                if request_key:
+                    if existing := self._usage_request(state, request_key, digest):
+                        return existing
+                records = state.setdefault("recipe_usage", {})
+                if menu_id:
+                    record = records.get(menu_id)
+                    if not isinstance(record, dict) or record.get("week") != week or recipe_identity not in record.get("recipe_keys", []):
+                        raise HouseholdError("menu usage record does not contain this recipe and week")
+                else:
+                    candidates = [
+                        (candidate_id, value)
+                        for candidate_id, value in records.items()
+                        if isinstance(value, dict)
+                        and value.get("week") == week
+                        and recipe_identity in value.get("recipe_keys", [])
+                        and value.get("status") in {"planned", "ordered", "manual"}
+                    ]
+                    if len(candidates) > 1:
+                        raise HouseholdError("multiple menu usage records match; menu_id is required")
+                    if candidates:
+                        menu_id, record = candidates[0]
+                    elif action == "mark_cooked":
+                        menu_id = f"manual_{secrets.token_hex(10)}"
+                        record = records[menu_id] = {"week": week, "status": "manual", "recipe_keys": [recipe_identity], "cooked_keys": [], "not_cooked_keys": [], "cooldown_overrides": {}, "order_id": None}
+                    else:
+                        raise HouseholdError("mark_not_cooked requires a matching planned or ordered menu")
+                cooked = record.setdefault("cooked_keys", [])
+                not_cooked = record.setdefault("not_cooked_keys", [])
+                if action == "mark_cooked":
+                    if recipe_identity not in cooked:
+                        cooked.append(recipe_identity)
+                    not_cooked[:] = [key for key in not_cooked if key != recipe_identity]
+                else:
+                    if recipe_identity not in not_cooked:
+                        not_cooked.append(recipe_identity)
+                    cooked[:] = [key for key in cooked if key != recipe_identity]
+                result = {"menu_id": menu_id, "recipe_key": recipe_identity, "week": week, "cooked": action == "mark_cooked", "usage": self._usage_summary(state, recipe_identity, week)}
+                if request_key:
+                    self._store_usage_request(state, request_key, digest, result)
+                return result
+        raise HouseholdError("unknown recipe action")
+
+    def _materialize_menu(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise HouseholdError("menu must be an object")
+        week = validate_week(value.get("week"))
+        result: dict[str, Any] = {"week": week}
+        profile_portions = self.store.read()["profile"]["meals"]["portions"]
+        count = 0
+        for collection in ("dishes", "salads"):
+            values = value.get(collection, [])
+            if not isinstance(values, list) or len(values) > 31:
+                raise HouseholdError(f"menu {collection} must be a bounded list")
+            materialized = []
+            for raw in values:
+                if not isinstance(raw, Mapping):
+                    raise HouseholdError("menu recipes must be objects")
+                reference = raw.get("recipe_ref")
+                if isinstance(reference, Mapping):
+                    stored = self.recipes.get(reference.get("id"), reference.get("revision"))
+                    if stored.get("status") != "active" or stored.get("revision_status", stored.get("status")) != "active":
+                        raise HouseholdError("only active recipes can be added to a new menu")
+                    recipe = scale_recipe(stored, raw.get("portions"))
+                else:
+                    candidate = deepcopy(dict(raw))
+                    candidate.setdefault("portions", profile_portions)
+                    if not isinstance(candidate.get("source"), Mapping) or not isinstance(candidate.get("rights"), Mapping):
+                        raise HouseholdError("new menu recipes require explicit source, relationship and rights metadata")
+                    recipe = scale_recipe(normalize_recipe(candidate), candidate["portions"])
+                materialized.append(recipe)
+                count += 1
+            result[collection] = materialized
+        if count < 1:
+            raise HouseholdError("menu needs at least one complete recipe")
+        schedule = value.get("schedule")
+        if schedule is not None:
+            if not isinstance(schedule, list) or len(schedule) > 31 or any(not isinstance(item, Mapping) for item in schedule):
+                raise HouseholdError("menu schedule must be a bounded list of objects")
+            result["schedule"] = deepcopy(schedule)
+        if value.get("notes") is not None:
+            if not isinstance(value["notes"], str) or len(value["notes"]) > 4_000:
+                raise HouseholdError("menu notes are invalid")
+            result["notes"] = value["notes"].strip()
+        rendered_email = menu_email_html(result)
+        if len(rendered_email.encode()) > MAX_EMAIL_HTML_BYTES:
+            raise HouseholdError("menu recipes exceed the deliverable email size limit")
+        if len(json.dumps({"ok": True, "result": {"html": rendered_email}}, ensure_ascii=True).encode()) > MAX_REQUEST - 4_096:
+            raise HouseholdError("menu recipe email cannot fit the meal planner response transport")
+        if len(canonical(result).encode()) > MAX_MENU_BYTES:
+            raise HouseholdError("menu is too large")
+        response_probe = {"ok": True, "result": {"menu": result}}
+        if len(json.dumps(response_probe, ensure_ascii=True).encode()) > MAX_REQUEST - 4_096:
+            raise HouseholdError("menu cannot fit the meal planner response transport")
+        return result
+
+    @staticmethod
+    def _abandon_predispatch(state: dict[str, Any], *, reason: str) -> None:
+        pending = state.get("pending_checkout")
+        if not pending:
+            return
+        if pending.get("status") != "awaiting_confirmation":
+            raise HouseholdError("checkout is pending and may have been dispatched; reconcile it before changing the menu")
+        occurrence = pending.get("occurrence")
+        if occurrence and isinstance(state.get("occurrences", {}).get(occurrence), dict):
+            state["occurrences"][occurrence]["status"] = "abandoned"
+            state["occurrences"][occurrence]["reason"] = reason
+        state["pending_checkout"] = None
+
     def _menu(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "get")
-        with self.store.locked() as state:
-            if action == "get":
-                return {"menu": deepcopy(state.get("menu"))}
-            if action == "clear":
-                if expired_awaiting_confirmation(state.get("pending_checkout")):
-                    state["pending_checkout"] = None
-                elif state.get("pending_checkout"):
-                    raise HouseholdError("checkout is pending; the menu was not cleared")
+        if action == "get":
+            return {"menu": deepcopy(self.store.read().get("menu"))}
+        if action == "clear":
+            with self.store.locked() as state:
+                current = state.get("menu")
+                if isinstance(current, Mapping) and (current.get("menu_id") or current.get("revision") is not None):
+                    supplied_menu_id = request.get("menu_id")
+                    expected_revision = request.get("expected_revision")
+                    if supplied_menu_id != current.get("menu_id"):
+                        raise HouseholdError("menu_id does not match the current menu")
+                    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision != current.get("revision"):
+                        raise HouseholdError(f"menu revision conflict; current revision is {current.get('revision')}")
+                self._abandon_predispatch(state, reason="menu cleared")
+                if isinstance(current, Mapping):
+                    usage = state.setdefault("recipe_usage", {}).get(current.get("menu_id"))
+                    if isinstance(usage, dict) and usage.get("status") == "planned":
+                        usage["status"] = "cancelled"
                 state["menu"] = None
                 return {"menu": None}
-            if action == "save":
-                menu = request.get("menu")
-                if not isinstance(menu, Mapping) or not isinstance(menu.get("week"), str):
-                    raise HouseholdError("menu needs an ISO week")
-                menu_email_period(menu)
-                recipes = list(menu.get("dishes", [])) + list(menu.get("salads", []))
-                if not recipes or any(not isinstance(item, Mapping) or not item.get("name") or not item.get("ingredients") or not item.get("steps") for item in recipes):
-                    raise HouseholdError("menu needs complete recipes with ingredients and steps")
-                state["menu"] = deepcopy(dict(menu))
-                state["menu"].setdefault("phase", "draft")
-                return {"menu": deepcopy(state["menu"])}
+        if action == "save":
+            baseline_menu = deepcopy(self.store.read().get("menu"))
+            menu = self._materialize_menu(request.get("menu"))
+            supplied_menu_id = str(request.get("menu_id") or "") or None
+            expected_revision = request.get("expected_revision")
+            repeat_keys = request.get("allow_repeat_keys", [])
+            if not isinstance(repeat_keys, list) or len(repeat_keys) > 62 or not all(isinstance(key, str) and 1 <= len(key) <= 200 for key in repeat_keys):
+                raise HouseholdError("allow_repeat_keys must be a list of recipe keys")
+            override_reason = str(request.get("override_reason") or "").strip()
+            if repeat_keys and not override_reason:
+                raise HouseholdError("a cooldown override reason is required")
+            if len(override_reason) > 500:
+                raise HouseholdError("cooldown override reason is too long")
+            digest = menu_digest(menu)
+            keys = [recipe["recipe_key"] for collection in ("dishes", "salads") for recipe in menu[collection]]
+            if len(keys) != len(set(keys)):
+                raise HouseholdError("the same recipe cannot appear twice in one menu")
+            with self.store.locked() as state:
+                current = state.get("menu")
+                if isinstance(current, Mapping) and current.get("digest") == digest:
+                    return {"menu": deepcopy(current), "idempotent": True}
+                if supplied_menu_id:
+                    if not isinstance(current, Mapping) or current.get("menu_id") != supplied_menu_id:
+                        raise HouseholdError("menu_id does not match the current menu")
+                    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or current.get("revision") != expected_revision:
+                        raise HouseholdError(f"menu revision conflict; current revision is {current.get('revision')}")
+                    current_usage = state.setdefault("recipe_usage", {}).get(supplied_menu_id)
+                    if current.get("phase") == "ordered" or (isinstance(current_usage, Mapping) and current_usage.get("status") == "ordered"):
+                        raise HouseholdError("an ordered menu is immutable; save a new menu instead")
+                    if isinstance(current_usage, Mapping) and (
+                        current_usage.get("cooked_keys")
+                        or current_usage.get("not_cooked_keys")
+                        or current_usage.get("cooldown_overrides")
+                    ):
+                        raise HouseholdError("a menu with explicit usage history is immutable; save a new menu instead")
+                    menu_id = supplied_menu_id
+                    revision = expected_revision + 1
+                else:
+                    if canonical(current) != canonical(baseline_menu):
+                        raise HouseholdError("menu changed while saving; read it and try again")
+                    menu_id = f"menu_{secrets.token_hex(12)}"
+                    revision = 1
+                self._abandon_predispatch(state, reason="menu replaced")
+                blocked = []
+                current_usage = state.setdefault("recipe_usage", {}).get(current.get("menu_id")) if isinstance(current, Mapping) else None
+                for key in keys:
+                    ignored_menu_id = (
+                        current.get("menu_id")
+                        if isinstance(current_usage, Mapping)
+                        and current_usage.get("status") == "planned"
+                        and key not in current_usage.get("cooked_keys", [])
+                        and key not in current_usage.get("cooldown_overrides", {})
+                        else None
+                    )
+                    summary = self._usage_summary(state, key, menu["week"], ignore_menu_id=ignored_menu_id)
+                    if not summary["eligible"] and key not in repeat_keys:
+                        blocked.append({"recipe_key": key, "usage": summary})
+                if blocked:
+                    raise HouseholdError(f"recipe cooldown blocks this menu: {canonical(blocked)}")
+                if isinstance(current, Mapping):
+                    old_usage = state.setdefault("recipe_usage", {}).get(current.get("menu_id"))
+                    if isinstance(old_usage, dict) and old_usage.get("status") == "planned" and current.get("menu_id") != menu_id:
+                        old_usage["status"] = "cancelled"
+                menu.update({"menu_id": menu_id, "revision": revision, "digest": digest, "phase": "draft"})
+                state["menu"] = deepcopy(menu)
+                state.setdefault("recipe_usage", {})[menu_id] = {
+                    "week": menu["week"], "status": "planned", "recipe_keys": keys,
+                    "cooked_keys": [], "not_cooked_keys": [],
+                    "cooldown_overrides": {key: override_reason for key in keys if key in repeat_keys},
+                    "order_id": None, "updated_at": now().isoformat(),
+                }
+                return {"menu": deepcopy(menu)}
         raise HouseholdError("unknown menu action")
 
     def _schedule(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -663,13 +1341,8 @@ class Application:
                 if not set(changes).issubset(allowed):
                     raise HouseholdError("schedule contains unknown fields")
                 schedule.update(deepcopy(changes))
-                if schedule.get("mode") not in {"draft", "cart_ready", "auto_checkout"}:
-                    raise HouseholdError("schedule mode is invalid")
+                validate_schedule(schedule, self.provider)
                 if schedule.get("auto_checkout"):
-                    if self.provider != "oda":
-                        raise HouseholdError("MENY supports cart_ready scheduling; checkout continues manually in the browser")
-                    if not isinstance(schedule.get("maximum_total"), (int, float)) or not schedule.get("delivery"):
-                        raise HouseholdError("auto-checkout requires maximum total and delivery preference")
                     schedule["mode"] = "auto_checkout"
                 elif schedule.get("mode") == "auto_checkout":
                     schedule["mode"] = "cart_ready"
@@ -692,10 +1365,16 @@ class Application:
             "allow_recovery": request.get("_allow_browser_recovery") is True,
         } if self.provider == "meny" else {}
         if action == "products":
-            query = str(request.get("query") or "").strip()
-            return self.oda.call("product_search", {"queries": [query], "page": 1, "size": int(request.get("limit", 5))}, **kwargs)
+            query_value = request.get("query", "")
+            if not isinstance(query_value, str):
+                raise HouseholdError("catalog query must be text")
+            query = query_value.strip()
+            return self.oda.call("product_search", {"queries": [query], "page": 1, "size": bounded_limit(request.get("limit"), default=5)}, **kwargs)
         if action == "recipes":
-            return self.oda.call("recipe_search", {"query": str(request.get("query") or ""), "page": 1, "size": int(request.get("limit", 5))}, **kwargs)
+            query = request.get("query", "")
+            if not isinstance(query, str):
+                raise HouseholdError("catalog query must be text")
+            return self.oda.call("recipe_search", {"query": query, "page": 1, "size": bounded_limit(request.get("limit"), default=5)}, **kwargs)
         if action == "usuals":
             return self.oda.call("likely_to_buy", {}, **kwargs)
         raise HouseholdError("unknown catalog action")
@@ -716,7 +1395,8 @@ class Application:
                 item = dict(operation)
                 if "product_id" in item and "productId" not in item:
                     product_id = item.pop("product_id")
-                    item["productId"] = int(product_id) if self.provider == "oda" else str(product_id)
+                    normalized_id = self._product_id(product_id)
+                    item["productId"] = int(normalized_id) if self.provider == "oda" else normalized_id
                 normalized.append(item)
             with self._browser_operation(deadline):
                 state = self.store.read()
@@ -834,20 +1514,24 @@ class Application:
         action = request.get("action", "list")
         cancellation_deadline = time.monotonic() + CANCELLATION_OPERATION_TIMEOUT if action in {"cancel_prepare", "cancel_confirm", "cancel_reconcile", "cancel_submit"} else None
         if action == "list":
-            return self.oda.call("get_orders", {"page": 1, "size": int(request.get("limit", 10))}, deadline=request.get("_deadline"), allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("get_orders", {"page": 1, "size": int(request.get("limit", 10))})
-        order_id = str(request.get("order_id") or "")
+            limit = bounded_limit(request.get("limit"), default=10)
+            return self.oda.call("get_orders", {"page": 1, "size": limit}, deadline=request.get("_deadline"), allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("get_orders", {"page": 1, "size": limit})
+        supplied_order_id = request.get("order_id")
+        order_id = safe_order_id(supplied_order_id) if supplied_order_id is not None and supplied_order_id != "" else ""
         if action == "get":
             deadline = request.get("_deadline") if self.provider == "meny" else None
             if self.provider == "meny":
                 order = self.oda.call("get_order", {"order_number": order_id}, deadline=deadline, allow_recovery=request.get("_allow_browser_recovery") is True)
+                require_provider_identity(order, order_id)
                 return {
                     "order": order,
                     "tracking": {"order_id": order_id, "status": str(order.get("status") or "unknown")},
                 }
-            return {
-                "order": self.oda.call("get_order", {"order_number": order_id}),
-                "tracking": self.oda.call("order_tracking", {"order_number": order_id}),
-            }
+            order = self.oda.call("get_order", {"order_number": order_id})
+            tracking = self.oda.call("order_tracking", {"order_number": order_id})
+            require_provider_identity(order, order_id)
+            require_provider_identity(tracking, order_id, tracking=True)
+            return {"order": order, "tracking": tracking}
         if action == "change_begin":
             if not order_id:
                 raise HouseholdError("order_id is required for an order change")
@@ -908,6 +1592,19 @@ class Application:
                     if canonical(state.get("order_change")) != canonical(reservation):
                         raise HouseholdError("order change state changed while starting")
                     state["order_change"] = change
+            except MenyOrderChangeDispatchError as exc:
+                with self.store.locked() as state:
+                    if canonical(state.get("order_change")) == canonical(reservation):
+                        state["order_change"] = {
+                            "provider": "meny", "order_id": exc.order_id, "status": "uncertain",
+                            "code": exc.code,
+                            "before": {
+                                "order": deepcopy(exc.order),
+                                "tracking": {"order_id": exc.order_id, "status": str(exc.order.get("status") or "unknown")},
+                            },
+                            "started_at": reservation["started_at"],
+                        }
+                raise
             except Exception:
                 with self.store.locked() as state:
                     if canonical(state.get("order_change")) == canonical(reservation):
@@ -937,25 +1634,43 @@ class Application:
                 with self.store.locked() as state:
                     if canonical(state.get("order_change")) != canonical(change):
                         raise HouseholdError("order change state changed before aborting")
-                if change.get("status") == "starting":
-                    if self.provider == "meny":
+                if self.provider == "meny":
+                    code = str(change.get("code") or "")
+                    if not code and change.get("status") == "starting":
                         current = self._orders({"action": "get", "order_id": change["order_id"], "_deadline": deadline})
                         code = str((current.get("order") or {}).get("code") or "")
+                    if change.get("status") in {"starting", "uncertain", "abort_uncertain"}:
                         try:
                             self.browser.verify_order_change(change["order_id"], code, deadline=deadline)
-                        except HouseholdError:
-                            self.browser.verify_order_change(None, None, deadline=deadline)
+                        except HouseholdError as active_error:
+                            try:
+                                self.browser.verify_order_change(None, None, deadline=deadline)
+                            except HouseholdError as neutral_error:
+                                raise HouseholdError("MENY order-change mode cannot be reconciled safely") from neutral_error
                             result = {"provider": "meny", "order_id": change["order_id"], "aborted": True, "recovered": True}
                         else:
-                            result = self.browser.abort_order_change(change["order_id"], code, deadline=deadline)
+                            try:
+                                result = self.browser.abort_order_change(change["order_id"], code, deadline=deadline)
+                            except HouseholdError:
+                                with self.store.locked() as state:
+                                    if canonical(state.get("order_change")) == canonical(change):
+                                        state["order_change"]["status"] = "abort_uncertain"
+                                raise
                     else:
-                        result = {"provider": "oda", "order_id": change["order_id"], "aborted": True, "recovered": True}
-                elif self.provider == "meny":
-                    result = self.browser.abort_order_change(change["order_id"], change.get("code"), deadline=deadline)
+                        try:
+                            result = self.browser.abort_order_change(change["order_id"], code, deadline=deadline)
+                        except HouseholdError:
+                            with self.store.locked() as state:
+                                if canonical(state.get("order_change")) == canonical(change):
+                                    state["order_change"]["status"] = "abort_uncertain"
+                            raise
                 else:
-                    if cart_summary(self.oda.call("get_cart", {}))["items"]:
+                    if change.get("status") == "starting":
+                        result = {"provider": "oda", "order_id": change["order_id"], "aborted": True, "recovered": True}
+                    elif cart_summary(self.oda.call("get_cart", {}))["items"]:
                         raise HouseholdError("remove the staged Oda additions before aborting the order change")
-                    result = {"provider": "oda", "order_id": change["order_id"], "aborted": True}
+                    else:
+                        result = {"provider": "oda", "order_id": change["order_id"], "aborted": True}
                 with self.store.locked() as state:
                     if canonical(state.get("order_change")) != canonical(change):
                         raise HouseholdError("order change state changed while aborting")
@@ -1009,18 +1724,45 @@ class Application:
         if action == "cancel_submit":
             if self.confirmation_policy != "standing":
                 raise HouseholdError("standing authorization is not configured; prepare cancellation and ask for confirmation")
-            prepared = self._orders({"action": "cancel_prepare", "order_id": order_id})
+            idempotency_key = self._idempotency_key(request.get("idempotency_key"), "cancellation")
+            with self.store.locked() as state:
+                pending = deepcopy(state.get("pending_cancellation"))
+                protected_request = deepcopy(self._protected_request(state, "cancellation", idempotency_key, target_id=order_id))
+            if protected_request:
+                if isinstance(protected_request.get("result"), Mapping):
+                    return {**deepcopy(dict(protected_request["result"])), "idempotent": True}
+                bound_confirmation = str(protected_request.get("confirmation_id") or "")
+                if pending and pending.get("confirmation_id") == bound_confirmation and pending.get("status") == "awaiting_confirmation" and not expired_awaiting_confirmation(pending):
+                    prepared = {
+                        "available": True, "confirmation_id": bound_confirmation,
+                        "order": deepcopy((pending.get("before") or {}).get("order")),
+                        "tracking": deepcopy((pending.get("before") or {}).get("tracking")),
+                        "consequence": deepcopy((pending.get("browser") or {}).get("consequence")),
+                    }
+                else:
+                    return self._cancel_reconcile(cancellation_deadline, bound_confirmation)
+            else:
+                prepared = self._orders({"action": "cancel_prepare", "order_id": order_id})
             if prepared.get("available") is not True:
                 return prepared
+            with self.store.locked() as state:
+                existing = self._protected_request(state, "cancellation", idempotency_key, target_id=order_id)
+                if existing is None:
+                    current_pending = state.get("pending_cancellation")
+                    if not isinstance(current_pending, Mapping) or current_pending.get("confirmation_id") != prepared["confirmation_id"]:
+                        raise HouseholdError("cancellation state changed before binding its idempotency key")
+                    self._bind_protected_request(state, "cancellation", idempotency_key, prepared["confirmation_id"], target_id=order_id)
+                elif existing.get("confirmation_id") != prepared["confirmation_id"]:
+                    raise HouseholdError("cancellation idempotency_key is bound to another attempt")
             result = self._cancel(
                 "cancel_confirm",
                 cancellation_deadline,
                 order_id=order_id,
                 confirmation_id=str(prepared.get("confirmation_id") or ""),
             )
-            return {**result, "authorized_summary": {"order": prepared.get("order"), "tracking": prepared.get("tracking"), "consequence": prepared.get("consequence")}}
+            return {**result, "confirmation_id": prepared.get("confirmation_id"), "authorized_summary": {"order": prepared.get("order"), "tracking": prepared.get("tracking"), "consequence": prepared.get("consequence")}}
         if action == "cancel_reconcile":
-            return self._cancel(action, cancellation_deadline)
+            return self._cancel(action, cancellation_deadline, confirmation_id=str(request.get("confirmation_id") or ""))
         raise HouseholdError("unknown order action")
 
     def _cancel(
@@ -1032,9 +1774,12 @@ class Application:
         confirmation_id: str = "",
     ) -> dict[str, Any]:
         if action == "cancel_reconcile":
-            return self._cancel_reconcile(deadline)
+            return self._cancel_reconcile(deadline, confirmation_id)
         with self.store.locked() as state:
             pending = deepcopy(state.get("pending_cancellation"))
+            recovered = self._read_protected_result(state, confirmation_id, "cancellation")
+        if recovered:
+            return recovered
         if not pending:
             raise HouseholdError("no order cancellation is pending")
         if order_id != pending.get("order_id") or confirmation_id != pending.get("confirmation_id"):
@@ -1073,6 +1818,7 @@ class Application:
                     deadline=deadline,
                 )
                 tracking = self.oda.call("order_tracking", {"order_number": order_id}, deadline=deadline) if self.provider == "meny" else self.oda.call("order_tracking", {"order_number": order_id})
+                require_provider_identity(tracking, order_id, tracking=True)
                 current = {"order": current["order"], "tracking": tracking}
             except CancellationPreconditionError:
                 with self.store.locked() as state:
@@ -1092,17 +1838,74 @@ class Application:
                     raise HouseholdError("cancellation state changed while reconciling the order")
                 if cancelled:
                     state["pending_cancellation"] = None
-                    for job in state["email_jobs"]:
-                        if job.get("order_id") == order_id and job.get("status") == "pending":
-                            job["status"] = "cancelled"
+                    self._mark_order_cancelled(state, order_id)
+                    terminal = {
+                        "cancelled": True, "order_id": order_id,
+                        "tracking_status": str(tracking.get("status") or "").casefold(),
+                        "retry_allowed": False, "confirmation_id": pending["confirmation_id"],
+                    }
+                    self._store_protected_result(state, pending["confirmation_id"], "cancellation", terminal, target_id=order_id)
                 else:
                     state["pending_cancellation"]["status"] = "uncertain"
         return {"cancelled": cancelled, "tracking": current["tracking"], "retry_allowed": False}
 
-    def _cancel_reconcile(self, deadline: float | None = None) -> dict[str, Any]:
+    @staticmethod
+    def _prune_order_snapshots(state: dict[str, Any], *, keep_order_id: str | None = None) -> None:
+        keep = {str(keep_order_id)} if keep_order_id else set()
+        terminal = set()
+        current = state.get("menu")
+        if isinstance(current, Mapping) and current.get("order_id"):
+            keep.add(str(current["order_id"]))
+        for job in state.get("email_jobs", []):
+            if isinstance(job, Mapping) and job.get("status") in {"pending", "claimed", "sending"} and job.get("order_id"):
+                keep.add(str(job["order_id"]))
+            elif isinstance(job, Mapping) and job.get("status") in {"sent", "cancelled", "invalid"} and job.get("order_id"):
+                terminal.add(str(job["order_id"]))
+        snapshots = state.setdefault("order_snapshots", {})
+        snapshot_times = state.setdefault("order_snapshot_times", {})
+        unscheduled = [
+            (str(snapshot_times.get(order_id) or ""), order_id)
+            for order_id in snapshots
+            if order_id not in keep and order_id not in terminal
+        ]
+        keep.update(order_id for _recorded_at, order_id in sorted(unscheduled)[-20:])
+        for order_id in list(snapshots):
+            if order_id not in keep:
+                snapshots.pop(order_id, None)
+                snapshot_times.pop(order_id, None)
+
+    @staticmethod
+    def _mark_order_cancelled(state: dict[str, Any], order_id: str) -> None:
+        for job in state["email_jobs"]:
+            if job.get("order_id") == order_id and job.get("status") in {"pending", "claimed"}:
+                job["status"] = "cancelled"
+                job.pop("claim_token", None)
+                job.pop("claim_expires_at", None)
+                job.pop("html", None)
+                job.pop("menu_snapshot", None)
+                job.pop("subject", None)
+        for usage in state.get("recipe_usage", {}).values():
+            if isinstance(usage, dict) and usage.get("order_id") == order_id and usage.get("status") == "ordered":
+                usage["previous_status"] = "ordered"
+                usage["status"] = "planned"
+                usage["cancelled_order_id"] = order_id
+                usage["order_id"] = None
+                usage["updated_at"] = now().isoformat()
+        current = state.get("menu")
+        if isinstance(current, dict) and current.get("order_id") == order_id:
+            current["phase"] = "draft"
+            current.pop("order_id", None)
+        Application._prune_order_snapshots(state)
+
+    def _cancel_reconcile(self, deadline: float | None = None, confirmation_id: str = "") -> dict[str, Any]:
         with self._browser_operation(deadline):
             with self.store.locked() as state:
                 pending = deepcopy(state.get("pending_cancellation"))
+                recovered = self._read_protected_result(state, confirmation_id, "cancellation") if confirmation_id else None
+            if recovered:
+                return recovered
+            if confirmation_id and isinstance(pending, Mapping) and pending.get("confirmation_id") != confirmation_id:
+                raise HouseholdError("cancellation reconciliation does not match the pending attempt")
             if not pending:
                 raise HouseholdError("no order cancellation is pending")
             if pending.get("status") not in {"clicking", "uncertain"}:
@@ -1115,9 +1918,13 @@ class Application:
                     raise HouseholdError("cancellation state changed while reconciling the order")
                 if cancelled:
                     state["pending_cancellation"] = None
-                    for job in state["email_jobs"]:
-                        if job.get("order_id") == order_id and job.get("status") == "pending":
-                            job["status"] = "cancelled"
+                    self._mark_order_cancelled(state, order_id)
+                    terminal = {
+                        "cancelled": True, "order_id": order_id,
+                        "tracking_status": str((current.get("tracking") or {}).get("status") or "").casefold(),
+                        "retry_allowed": False, "confirmation_id": pending["confirmation_id"],
+                    }
+                    self._store_protected_result(state, pending["confirmation_id"], "cancellation", terminal, target_id=order_id)
                 else:
                     state["pending_cancellation"]["status"] = "uncertain"
             return {"cancelled": cancelled, "tracking": current["tracking"], "retry_allowed": False}
@@ -1132,9 +1939,25 @@ class Application:
         if action == "submit":
             if self.confirmation_policy != "standing":
                 raise HouseholdError("standing authorization is not configured; prepare checkout and ask for confirmation")
+            idempotency_key = self._idempotency_key(request.get("idempotency_key"), "checkout")
             with self.store.locked() as state:
                 pending = deepcopy(state.get("pending_checkout"))
-            if pending and pending.get("status") == "awaiting_confirmation" and not expired_awaiting_confirmation(pending):
+                protected_request = deepcopy(self._protected_request(state, "checkout", idempotency_key))
+            if protected_request:
+                if isinstance(protected_request.get("result"), Mapping):
+                    return {**deepcopy(dict(protected_request["result"])), "idempotent": True}
+                bound_confirmation = str(protected_request.get("confirmation_id") or "")
+                if not bound_confirmation:
+                    raise HouseholdError("checkout idempotency record is incomplete; reconcile before retrying")
+                if pending and pending.get("confirmation_id") == bound_confirmation and pending.get("status") == "awaiting_confirmation" and not expired_awaiting_confirmation(pending):
+                    prepared = {
+                        "confirmation_id": bound_confirmation,
+                        "summary": deepcopy(pending["summary"]),
+                        "order_change": deepcopy(pending.get("order_change")),
+                    }
+                else:
+                    return self._checkout_reconcile(deadline, bound_confirmation)
+            elif pending and pending.get("status") == "awaiting_confirmation" and not expired_awaiting_confirmation(pending):
                 prepared = {
                     "confirmation_id": pending["confirmation_id"],
                     "summary": deepcopy(pending["summary"]),
@@ -1142,14 +1965,24 @@ class Application:
                 }
             else:
                 prepared = self._checkout_prepare(deadline)
+            with self.store.locked() as state:
+                existing = self._protected_request(state, "checkout", idempotency_key)
+                if existing is None:
+                    current_pending = state.get("pending_checkout")
+                    if not isinstance(current_pending, Mapping) or current_pending.get("confirmation_id") != prepared["confirmation_id"]:
+                        raise HouseholdError("checkout state changed before binding its idempotency key")
+                    self._bind_protected_request(state, "checkout", idempotency_key, prepared["confirmation_id"])
+                elif existing.get("confirmation_id") != prepared["confirmation_id"]:
+                    raise HouseholdError("checkout idempotency_key is bound to another attempt")
             result = self._checkout_confirm(deadline, prepared["confirmation_id"])
-            return {**result, "authorized_summary": prepared["summary"], "order_change": prepared.get("order_change")}
+            return {**result, "confirmation_id": prepared["confirmation_id"], "authorized_summary": prepared["summary"], "order_change": prepared.get("order_change")}
         if action == "reconcile":
-            return self._checkout_reconcile(deadline)
+            return self._checkout_reconcile(deadline, str(request.get("confirmation_id") or ""))
         if action == "auto":
             occurrence = str(request.get("occurrence") or "")
             with self.store.locked() as state:
                 schedule = deepcopy(state["schedule"])
+                maximum_total = validate_schedule(schedule, self.provider)
                 if not schedule.get("enabled") or not schedule.get("auto_checkout"):
                     raise HouseholdError("auto-checkout is off")
                 if not isinstance(schedule.get("cron_job_id"), str) or not schedule["cron_job_id"].strip():
@@ -1159,22 +1992,48 @@ class Application:
                     raise HouseholdError("scheduled checkout cannot submit an interactive order change")
                 if occurrence != expected_occurrence:
                     raise HouseholdError("scheduled occurrence does not match the currently due local week")
-                if occurrence in state["occurrences"]:
-                    raise HouseholdError("this scheduled occurrence was already handled")
-                state["occurrences"][occurrence] = {"status": "started", "at": now().isoformat()}
+                existing = state["occurrences"].get(occurrence)
+                if isinstance(existing, Mapping) and existing.get("status") == "completed":
+                    order_id = str(existing.get("order_id") or "")
+                    if not order_id:
+                        raise HouseholdError("the completed scheduled occurrence has no bound order")
+                    return {
+                        "completed": True, "confirmed": True, "order_id": order_id,
+                        "idempotent": True, "retry_allowed": False,
+                    }
+                if isinstance(existing, Mapping) and existing.get("status") == "started":
+                    try:
+                        started_at = datetime.fromisoformat(str(existing.get("at") or ""))
+                    except ValueError:
+                        started_at = None
+                    if started_at is not None and started_at.tzinfo is not None and now() < started_at + SCHEDULE_OCCURRENCE_LEASE:
+                        raise HouseholdError("this scheduled occurrence is already running")
+                pending = state.get("pending_checkout")
+                if pending and pending.get("status") == "awaiting_confirmation" and pending.get("occurrence"):
+                    self._abandon_predispatch(state, reason="scheduled run retried")
+                elif pending:
+                    raise HouseholdError("finish the pending interactive or dispatched checkout before the scheduled run")
+                attempts = int(existing.get("attempts", 0)) + 1 if isinstance(existing, Mapping) else 1
+                state["occurrences"][occurrence] = {"status": "started", "at": now().isoformat(), "attempts": attempts}
             try:
-                prepared = self._checkout_prepare(deadline)
+                prepared = self._checkout_prepare(deadline, occurrence=occurrence)
             except HouseholdError:
                 with self.store.locked() as state:
                     state["occurrences"][occurrence]["status"] = "needs_input"
                 raise
             total = prepared["summary"]["total"]
-            if not isinstance(total, (int, float)) or total > schedule["maximum_total"]:
+            if isinstance(total, bool) or not isinstance(total, (int, float)) or not math.isfinite(float(total)) or maximum_total is None or total > maximum_total:
                 with self.store.locked() as state:
+                    pending = state.get("pending_checkout")
+                    if pending and pending.get("confirmation_id") == prepared["confirmation_id"] and pending.get("status") == "awaiting_confirmation":
+                        state["pending_checkout"] = None
                     state["occurrences"][occurrence]["status"] = "needs_input"
                 return {"completed": False, "reason": "total exceeds maximum", "summary": prepared["summary"]}
             if not delivery_matches(schedule["delivery"], prepared["summary"].get("delivery")):
                 with self.store.locked() as state:
+                    pending = state.get("pending_checkout")
+                    if pending and pending.get("confirmation_id") == prepared["confirmation_id"] and pending.get("status") == "awaiting_confirmation":
+                        state["pending_checkout"] = None
                     state["occurrences"][occurrence]["status"] = "needs_input"
                 return {"completed": False, "reason": "delivery does not match preference", "summary": prepared["summary"]}
             if self.confirmation_policy == "standing":
@@ -1199,12 +2058,40 @@ class Application:
             }
         raise HouseholdError("unknown checkout action")
 
-    def _checkout_prepare(self, deadline: float | None = None) -> dict[str, Any]:
+    def _checkout_prepare(self, deadline: float | None = None, *, occurrence: str | None = None) -> dict[str, Any]:
         with self.store.locked() as state:
+            current_pending = state.get("pending_checkout")
+            inherited_occurrence = (
+                current_pending.get("occurrence")
+                if occurrence is None
+                and isinstance(current_pending, Mapping)
+                and current_pending.get("status") == "awaiting_confirmation"
+                else None
+            )
+            if inherited_occurrence:
+                occurrence = inherited_occurrence
+                occurrence_record = state.get("occurrences", {}).get(occurrence)
+                if isinstance(occurrence_record, dict):
+                    occurrence_record["status"] = "started"
+                    occurrence_record["at"] = now().isoformat()
+            if expired_awaiting_confirmation(current_pending):
+                state["pending_checkout"] = None
             baseline = deepcopy(state.get("pending_checkout"))
             if baseline and baseline.get("status") in UNRESOLVED_CHECKOUT_STATUSES:
                 raise HouseholdError("reconcile the pending checkout before preparing another")
             order_change = deepcopy(state.get("order_change"))
+            menu_baseline = deepcopy(state.get("menu"))
+            current_usage = (
+                state.get("recipe_usage", {}).get(menu_baseline.get("menu_id"))
+                if isinstance(menu_baseline, Mapping)
+                else None
+            )
+            if not order_change and isinstance(menu_baseline, Mapping) and (
+                menu_baseline.get("phase") == "ordered"
+                or menu_baseline.get("order_id")
+                or (isinstance(current_usage, Mapping) and current_usage.get("status") == "ordered")
+            ):
+                raise HouseholdError("the current menu already belongs to an order; save or select a new menu before a new checkout")
             if expired_awaiting_confirmation(state.get("pending_cancellation")):
                 state["pending_cancellation"] = None
             pending_cancellation = deepcopy(state.get("pending_cancellation"))
@@ -1314,6 +2201,8 @@ class Application:
                     raise HouseholdError("checkout state changed while preparing the summary")
                 if canonical(state.get("order_change")) != canonical(order_change):
                     raise HouseholdError("order change state changed while preparing the summary")
+                if canonical(state.get("menu")) != canonical(menu_baseline):
+                    raise HouseholdError("menu changed while preparing checkout; prepare a new summary")
                 state["pending_checkout"] = {
                     "status": "awaiting_confirmation",
                     "confirmation_id": confirmation_id,
@@ -1322,7 +2211,13 @@ class Application:
                     "orders_before": before,
                     "browser_review": review,
                     "expires_at": (now() + timedelta(minutes=20)).isoformat(),
-                    "menu": deepcopy(state.get("menu")),
+                    "menu": menu_baseline,
+                    "menu_ref": {
+                        "menu_id": menu_baseline.get("menu_id"),
+                        "revision": menu_baseline.get("revision"),
+                        "digest": menu_baseline.get("digest"),
+                    } if isinstance(menu_baseline, Mapping) else None,
+                    "occurrence": occurrence,
                     "order_change": order_change,
                 }
         return {
@@ -1344,6 +2239,9 @@ class Application:
     def _checkout_confirm(self, deadline: float | None = None, confirmation_id: str = "") -> dict[str, Any]:
         with self.store.locked() as state:
             pending = deepcopy(state.get("pending_checkout"))
+            recovered = self._read_protected_result(state, confirmation_id, "checkout")
+        if recovered:
+            return recovered
         if not pending or pending["status"] != "awaiting_confirmation":
             raise HouseholdError("no fresh checkout confirmation is pending")
         if confirmation_id != pending.get("confirmation_id"):
@@ -1461,13 +2359,51 @@ class Application:
                     state["pending_checkout"]["status"] = "uncertain"
             raise
 
-    def _checkout_reconcile(self, deadline: float | None = None) -> dict[str, Any]:
-        with self._browser_operation(deadline):
-            return self._checkout_reconcile_unlocked(deadline)
+    @staticmethod
+    def _record_order_snapshot(state: dict[str, Any], pending: Mapping[str, Any], order_id: str) -> None:
+        order_id = safe_order_id(order_id)
+        occurrence = pending.get("occurrence")
+        if occurrence:
+            record = state.setdefault("occurrences", {}).get(occurrence)
+            if isinstance(record, dict):
+                record["status"] = "completed"
+                record["order_id"] = order_id
+                record["completed_at"] = now().isoformat()
+        if pending.get("order_change"):
+            return
+        snapshot = deepcopy(pending.get("menu"))
+        if not isinstance(snapshot, dict):
+            return
+        previous_order_id = snapshot.get("order_id")
+        if previous_order_id and previous_order_id != order_id:
+            return
+        snapshot["phase"] = "ordered"
+        snapshot["order_id"] = order_id
+        state.setdefault("order_snapshots", {})[order_id] = snapshot
+        state.setdefault("order_snapshot_times", {})[order_id] = now().isoformat()
+        menu_id = snapshot.get("menu_id")
+        usage = state.setdefault("recipe_usage", {}).get(menu_id)
+        if isinstance(usage, dict):
+            usage["status"] = "ordered"
+            usage["order_id"] = order_id
+            usage["updated_at"] = now().isoformat()
+        current = state.get("menu")
+        if isinstance(current, Mapping) and current.get("menu_id") == snapshot.get("menu_id") and current.get("digest") == snapshot.get("digest"):
+            state["menu"] = deepcopy(snapshot)
+        Application._prune_order_snapshots(state, keep_order_id=order_id)
 
-    def _checkout_reconcile_unlocked(self, deadline: float | None = None) -> dict[str, Any]:
+    def _checkout_reconcile(self, deadline: float | None = None, confirmation_id: str = "") -> dict[str, Any]:
+        with self._browser_operation(deadline):
+            return self._checkout_reconcile_unlocked(deadline, confirmation_id)
+
+    def _checkout_reconcile_unlocked(self, deadline: float | None = None, confirmation_id: str = "") -> dict[str, Any]:
         with self.store.locked() as state:
             pending = deepcopy(state.get("pending_checkout"))
+            recovered = self._read_protected_result(state, confirmation_id, "checkout") if confirmation_id else None
+        if recovered:
+            return recovered
+        if confirmation_id and isinstance(pending, Mapping) and pending.get("confirmation_id") != confirmation_id:
+            raise HouseholdError("checkout reconciliation does not match the pending attempt")
         if not pending:
             raise HouseholdError("no checkout attempt is pending")
         if pending.get("status") not in {"clicking", "uncertain", "awaiting_user_payment"}:
@@ -1551,10 +2487,15 @@ class Application:
             if confirmed:
                 order_id = str(order.get("orderNumber") or order.get("order_number") or order.get("id"))
                 state["pending_checkout"] = None
-                if pending.get("menu"):
-                    state["menu"] = pending["menu"]
-                    state["menu"]["phase"] = "ordered"
-                    state["menu"]["order_id"] = order_id
+                self._record_order_snapshot(state, pending, order_id)
+                terminal = {
+                    "confirmed": True, "order_id": order_id, "tracking_status": tracking_status,
+                    "retry_allowed": False, "confirmation_id": pending["confirmation_id"],
+                }
+                self._store_protected_result(
+                    state, pending["confirmation_id"], "checkout", terminal,
+                    target_id=order_id, intent_signature=checkout_intent_signature(pending["summary"]),
+                )
             elif expired_unpaid or undispatched_retryable:
                 state["pending_checkout"] = None
             else:
@@ -1582,7 +2523,39 @@ class Application:
         elif change.get("requested_delivery"):
             expected_delivery = str(change["requested_delivery"].get("display") or "")
             actual_delivery = str(current["order"].get("deliverySlotDisplay") or current["order"].get("deliveryDate") or "")
-            matched = oda_delivery_signature(expected_delivery) is not None and oda_delivery_signature(expected_delivery) == oda_delivery_signature(actual_delivery)
+            expected_signature = oda_delivery_signature(expected_delivery)
+            actual_signature = oda_delivery_signature(actual_delivery)
+            actual_date_value = current["order"].get("deliveryDate")
+            try:
+                actual_date = date.fromisoformat(actual_date_value) if isinstance(actual_date_value, str) else None
+            except ValueError:
+                actual_date = None
+            expected_month = {
+                "jan": 1, "feb": 2, "mar": 3, "apr": 4, "mai": 5, "jun": 6,
+                "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "des": 12,
+            }.get(expected_signature[5]) if expected_signature is not None else None
+            before_address = oda_order_address_identity(change["before"]["order"])
+            current_address = oda_order_address_identity(current["order"])
+            before_quantities = oda_order_quantities(change["before"]["order"])
+            current_quantities = oda_order_quantities(current["order"])
+            before_total = money_cents(change["before"]["order"].get("grossAmount"))
+            current_total = money_cents(current["order"].get("grossAmount"))
+            authorized_delta = money_cents(pending["summary"].get("total"))
+            matched = (
+                expected_signature is not None
+                and expected_signature == actual_signature
+                and actual_date is not None
+                and actual_date.isoformat() == actual_date_value
+                and (actual_date.month, actual_date.day) == (expected_month, expected_signature[4])
+                and before_address is not None
+                and before_address == current_address
+                and before_quantities is not None
+                and before_quantities == current_quantities
+                and before_total is not None
+                and current_total is not None
+                and authorized_delta is not None
+                and current_total == before_total + authorized_delta
+            )
             fulfillable = status in {"paid_and_modifiable", "paid_and_not_modifiable", "picking", "shipped", "delivered"}
         else:
             matched = oda_order_matches_addition(change["before"]["order"], current["order"], pending["summary"])
@@ -1594,10 +2567,16 @@ class Application:
             if confirmed:
                 state["pending_checkout"] = None
                 state["order_change"] = None
-                if pending.get("menu"):
-                    state["menu"] = pending["menu"]
-                    state["menu"]["phase"] = "ordered"
-                    state["menu"]["order_id"] = order_id
+                self._record_order_snapshot(state, pending, order_id)
+                terminal = {
+                    "confirmed": True, "changed_existing_order": True, "order_id": order_id,
+                    "tracking_status": status, "retry_allowed": False,
+                    "confirmation_id": pending["confirmation_id"],
+                }
+                self._store_protected_result(
+                    state, pending["confirmation_id"], "checkout", terminal,
+                    target_id=order_id, intent_signature=checkout_intent_signature(pending["summary"]),
+                )
             else:
                 state["pending_checkout"]["status"] = "uncertain"
         return {"confirmed": confirmed, "changed_existing_order": confirmed, "order": current["order"] if confirmed else None, "tracking": current["tracking"] if confirmed else None, "retry_allowed": False}
@@ -1606,34 +2585,114 @@ class Application:
         action = request.get("action", "status")
         if action == "status":
             state = self.store.read()
-            return {"jobs": [{**job, "recipient": mask_email(state.get("email_recipient"))} for job in state["email_jobs"]]}
-        if action == "schedule":
-            order_id = str(request.get("order_id") or "")
-            delivery_date = str(request.get("delivery_date") or "")
+            jobs = [{
+                "order_id": job.get("order_id"), "delivery_date": job.get("delivery_date"),
+                "status": job.get("status"), "sent_at": job.get("sent_at"),
+                "recipient": mask_email(job.get("recipient_snapshot")),
+                "automation_update_required": job.get("status") == "pending" and job.get("automation_protocol") != 2,
+            } for job in state["email_jobs"]]
+            return {"jobs": jobs, "automation_updates_required": sum(bool(job["automation_update_required"]) for job in jobs)}
+        if action == "automation_plan":
             state = self.store.read()
-            if not state.get("menu") or state["menu"].get("order_id") != order_id or not state.get("email_recipient"):
-                raise HouseholdError("confirmed order, exact menu and email recipient are required")
+            updates = []
+            for job in state["email_jobs"]:
+                if job.get("status") != "pending" or job.get("automation_protocol") == 2:
+                    continue
+                order_id = safe_order_id(job.get("order_id"))
+                delivery_date = str(job.get("delivery_date") or "")
+                automation_key = str(job.get("automation_key") or f"meal-planner-email-{hashlib.sha256(order_id.encode()).hexdigest()[:16]}")
+                if not order_id or not valid_email_address(job.get("recipient_snapshot")) or not isinstance(job.get("menu_snapshot"), Mapping):
+                    raise HouseholdError("pending email automation is not bound to one exact order, menu and recipient")
+                updates.append({
+                    "order_id": order_id, "delivery_date": delivery_date, "automation_key": automation_key,
+                    "cron_prompt": email_automation_prompt(order_id, delivery_date, automation_key),
+                    "ack": email_automation_ack(order_id, delivery_date, automation_key),
+                })
+            return {"protocol": 2, "updates": updates}
+        if action == "ack_automation":
+            order_id = safe_order_id(request.get("order_id"))
+            automation_key = str(request.get("automation_key") or "")
+            delivery_date = request.get("delivery_date")
+            automation_digest = request.get("automation_digest")
+            if request.get("protocol") != 2:
+                raise HouseholdError("email automation protocol must be 2")
+            with self.store.locked() as state:
+                jobs = [job for job in state["email_jobs"] if job.get("order_id") == order_id and job.get("status") == "pending"]
+                expected_key = str(jobs[0].get("automation_key") or f"meal-planner-email-{hashlib.sha256(order_id.encode()).hexdigest()[:16]}") if len(jobs) == 1 else ""
+                current_delivery = str(jobs[0].get("delivery_date") or "") if len(jobs) == 1 else ""
+                expected_digest = hashlib.sha256(email_automation_prompt(order_id, current_delivery, expected_key).encode()).hexdigest() if len(jobs) == 1 else ""
+                if (
+                    len(jobs) != 1 or not automation_key or not secrets.compare_digest(expected_key, automation_key)
+                    or delivery_date != current_delivery or not isinstance(automation_digest, str)
+                    or not secrets.compare_digest(expected_digest, automation_digest)
+                ):
+                    raise HouseholdError("email automation acknowledgement does not match one pending job")
+                jobs[0]["automation_key"] = automation_key
+                jobs[0]["automation_protocol"] = 2
+            return {"acknowledged": True, "order_id": order_id, "automation_key": automation_key, "protocol": 2}
+        if action == "schedule":
+            order_id = safe_order_id(request.get("order_id"))
+            supplied_delivery_date = request.get("delivery_date")
+            if not isinstance(supplied_delivery_date, str):
+                raise HouseholdError("delivery_date must be a canonical ISO date")
+            try:
+                delivery_date = date.fromisoformat(supplied_delivery_date).isoformat()
+            except ValueError as exc:
+                raise HouseholdError("delivery_date must be a canonical ISO date") from exc
+            if delivery_date != supplied_delivery_date:
+                raise HouseholdError("delivery_date must be a canonical ISO date")
             with self.store.locked() as locked:
+                snapshot = deepcopy((locked.get("order_snapshots") or {}).get(order_id))
+                if not snapshot and isinstance(locked.get("menu"), Mapping) and locked["menu"].get("order_id") == order_id:
+                    snapshot = deepcopy(locked["menu"])
+                recipient = locked.get("email_recipient")
+                if not isinstance(snapshot, Mapping) or not isinstance(recipient, str) or not recipient.strip():
+                    raise HouseholdError("confirmed order, exact menu and email recipient are required")
+                period = menu_email_period(snapshot)
                 existing = [job for job in locked["email_jobs"] if job.get("order_id") == order_id]
+                automation_key = f"meal-planner-email-{hashlib.sha256(order_id.encode()).hexdigest()[:16]}"
+                created = not existing
+                rescheduled = False
                 if not existing:
-                    locked["email_jobs"].append({"order_id": order_id, "delivery_date": delivery_date, "status": "pending", "sent_at": None})
+                    locked["email_jobs"].append({
+                        "order_id": order_id, "delivery_date": delivery_date, "status": "pending", "sent_at": None,
+                        "recipient_snapshot": recipient, "menu_snapshot": snapshot,
+                        "subject": f"Ukesmeny og oppskrifter – {period}", "html": menu_email_html(snapshot),
+                        "automation_key": automation_key, "automation_protocol": 0,
+                    })
+                elif len(existing) == 1:
+                    if existing[0].get("status") != "pending":
+                        raise HouseholdError("the order email is already claimed, sent or cancelled")
+                    if not valid_email_address(existing[0].get("recipient_snapshot")) or not isinstance(existing[0].get("menu_snapshot"), Mapping):
+                        raise HouseholdError("the pending order email is not bound to its original menu and recipient")
+                    recipient = existing[0]["recipient_snapshot"]
+                    rescheduled = existing[0].get("delivery_date") != delivery_date
+                    existing[0]["delivery_date"] = delivery_date
+                    existing[0].setdefault("automation_key", automation_key)
+                    if rescheduled:
+                        existing[0]["automation_protocol"] = 0
+                else:
+                    raise HouseholdError("the order has multiple email jobs")
+                job = (existing or [locked["email_jobs"][-1]])[0]
+                automation_update_required = job.get("automation_protocol") != 2
             return {
-                "scheduled": True,
+                "scheduled": created,
+                "idempotent": not created and not rescheduled,
+                "rescheduled": rescheduled,
+                "automation_key": automation_key,
                 "delivery_date": delivery_date,
-                "recipient": mask_email(state["email_recipient"]),
-                "cron_prompt": (
-                    f"På {delivery_date}: kall meal_planner_email action=due for ordre {order_id}. "
-                    "Hvis send=true, send nøyaktig returnert recipient, subject og HTML én gang med eksisterende "
-                    "e-postverktøy. Bare etter vellykket sending: kall meal_planner_email action=mark_sent "
-                    f"for samme ordre {order_id}. Ikke marker ved sendefeil."
-                ),
+                "recipient": mask_email(recipient),
+                "automation_update_required": automation_update_required,
+                "cron_prompt": email_automation_prompt(order_id, delivery_date, automation_key),
+                "automation_ack": email_automation_ack(order_id, delivery_date, automation_key),
             }
         if action == "test":
-            order_id = str(request.get("order_id") or "")
+            order_id = safe_order_id(request.get("order_id"))
             state = self.store.read()
             jobs = [job for job in state["email_jobs"] if job.get("order_id") == order_id and job.get("status") == "pending"]
-            menu = state.get("menu")
-            recipient = state.get("email_recipient")
+            job = jobs[0] if len(jobs) == 1 else {}
+            menu = job.get("menu_snapshot")
+            recipient = job.get("recipient_snapshot")
             if len(jobs) != 1 or not isinstance(menu, Mapping) or menu.get("order_id") != order_id or not isinstance(recipient, str) or not recipient.strip():
                 raise HouseholdError("pending email, exact menu and recipient are required for a test")
             period = menu_email_period(menu)
@@ -1651,48 +2710,157 @@ class Application:
                 result["automation_environment"] = {"HERMES_WORKSPACE_AUTOMATION_PROFILE": self.email_automation_profile}
             return result
         if action == "due":
-            order_id = str(request.get("order_id") or "")
+            order_id = safe_order_id(request.get("order_id"))
             current = self._orders({"action": "get", "order_id": order_id, "_deadline": request.get("_deadline")})
             tracking = str((current.get("tracking") or {}).get("status") or "").casefold()
             with self.store.locked() as state:
+                pending_cancellation = state.get("pending_cancellation")
+                if expired_awaiting_confirmation(pending_cancellation):
+                    state["pending_cancellation"] = None
+                    pending_cancellation = None
+                if isinstance(pending_cancellation, Mapping) and pending_cancellation.get("order_id") == order_id:
+                    return {"send": False, "reason": "order cancellation is pending"}
+                matching = [job for job in state["email_jobs"] if job.get("order_id") == order_id]
+                if len(matching) == 1 and matching[0].get("status") == "claimed":
+                    try:
+                        claim_expires_at = datetime.fromisoformat(str(matching[0].get("claim_expires_at") or ""))
+                    except ValueError:
+                        claim_expires_at = None
+                    if claim_expires_at is not None and claim_expires_at.tzinfo is not None and now() >= claim_expires_at:
+                        matching[0]["status"] = "pending"
+                        matching[0].pop("claim_token", None)
+                        matching[0].pop("claim_expires_at", None)
+                    else:
+                        return {"send": False, "reason": "email is already claimed before dispatch"}
+                elif len(matching) == 1 and matching[0].get("status") == "sending":
+                    return {"send": False, "reason": "email send outcome needs reconciliation"}
                 jobs = [job for job in state["email_jobs"] if job.get("order_id") == order_id and job.get("status") == "pending"]
                 if not jobs:
                     return {"send": False, "reason": "no pending email"}
-                menu = state.get("menu")
-                recipient = state.get("email_recipient")
+                job = jobs[0] if len(jobs) == 1 else {}
+                menu = job.get("menu_snapshot")
+                recipient = job.get("recipient_snapshot")
                 if len(jobs) != 1 or not isinstance(menu, Mapping) or menu.get("order_id") != order_id or not isinstance(recipient, str) or not recipient.strip():
                     return {"send": False, "reason": "pending email is not bound to one exact menu and recipient"}
                 if tracking in {"cancelled", "canceled"}:
-                    jobs[0]["status"] = "cancelled"
+                    self._mark_order_cancelled(state, order_id)
                     return {"send": False, "reason": "order cancelled"}
-                delivery = str((current.get("order") or {}).get("deliveryDate") or (current.get("order") or {}).get("delivery_date") or jobs[0]["delivery_date"])
-                if delivery != date.today().isoformat():
-                    jobs[0]["delivery_date"] = delivery
-                    return {"send": False, "reason": "delivery moved", "delivery_date": delivery}
+                fulfillable = {"confirmed", "delivered"} if self.provider == "meny" else {
+                    "paid_and_modifiable", "paid_and_not_modifiable", "picking", "shipped", "delivered",
+                }
+                if tracking not in fulfillable:
+                    return {"send": False, "reason": "order status is not confirmed for recipe email"}
+                order = current.get("order") if isinstance(current.get("order"), Mapping) else {}
+                delivery_values = [order.get(key) for key in ("deliveryDate", "delivery_date") if key in order]
+                if not delivery_values or not all(isinstance(value, str) for value in delivery_values) or len(set(delivery_values)) != 1:
+                    raise HouseholdError("provider order does not establish one delivery date")
+                delivery = delivery_values[0]
+                try:
+                    canonical_delivery = date.fromisoformat(delivery).isoformat()
+                except ValueError as exc:
+                    raise HouseholdError("provider returned an invalid delivery date") from exc
+                if canonical_delivery != delivery:
+                    raise HouseholdError("provider returned an invalid delivery date")
+                automation_key = job.get("automation_key") or f"meal-planner-email-{hashlib.sha256(order_id.encode()).hexdigest()[:16]}"
+                job["automation_key"] = automation_key
+                local_today = self._household_today(state).isoformat()
+                if delivery != local_today:
+                    job["delivery_date"] = delivery
+                    job["automation_protocol"] = 0
+                    return {
+                        "send": False, "reason": "delivery moved", "delivery_date": delivery,
+                        "automation_key": automation_key,
+                        "automation_update_required": True,
+                        "cron_prompt": email_automation_prompt(order_id, delivery, automation_key),
+                        "automation_ack": email_automation_ack(order_id, delivery, automation_key),
+                    }
                 period = menu_email_period(menu)
+                claim_token = secrets.token_urlsafe(18)
+                job["status"] = "claimed"
+                job["claim_token"] = claim_token
+                job["claim_expires_at"] = (now() + EMAIL_CLAIM_LEASE).isoformat()
                 result = {
-                    "send": True,
-                    "recipient": recipient,
-                    "subject": f"Ukesmeny og oppskrifter – {period}",
-                    "html": menu_email_html(menu),
+                    "send": False,
+                    "claim": True,
                     "order_id": order_id,
+                    "claim_token": claim_token,
                     "mark_sent_after_success": True,
-                    "next": "After this non-test email is sent successfully, call mark_sent for this exact order_id. Do not mark before success.",
+                    "next": "Call begin_send with this exact order_id and claim_token. Invoke the sender only with the payload returned when dispatch=true. After confirmed success call mark_sent. On a definite no-send failure only call release; leave uncertain post-dispatch outcomes locked.",
+                }
+                return result
+        if action == "begin_send":
+            order_id = safe_order_id(request.get("order_id"))
+            claim_token = request.get("claim_token")
+            if not isinstance(claim_token, str) or not claim_token:
+                raise HouseholdError("the email claim_token is required")
+            with self.store.locked() as state:
+                jobs = [job for job in state["email_jobs"] if job.get("order_id") == order_id and job.get("status") == "claimed"]
+                if len(jobs) != 1 or not secrets.compare_digest(str(jobs[0].get("claim_token") or ""), claim_token):
+                    raise HouseholdError("email claim_token does not match a claimed job")
+                pending_cancellation = state.get("pending_cancellation")
+                if isinstance(pending_cancellation, Mapping) and pending_cancellation.get("order_id") == order_id:
+                    raise HouseholdError("order cancellation is pending; do not send its recipe email")
+                try:
+                    expires_at = datetime.fromisoformat(str(jobs[0].get("claim_expires_at") or ""))
+                except ValueError as exc:
+                    raise HouseholdError("email claim is invalid; request due again") from exc
+                if expires_at.tzinfo is None or now() >= expires_at:
+                    jobs[0]["status"] = "pending"
+                    jobs[0].pop("claim_token", None)
+                    jobs[0].pop("claim_expires_at", None)
+                    raise HouseholdError("email claim expired before dispatch; request due again")
+                menu = jobs[0].get("menu_snapshot")
+                recipient = jobs[0].get("recipient_snapshot")
+                if not isinstance(menu, Mapping) or menu.get("order_id") != order_id or not isinstance(recipient, str) or not recipient.strip():
+                    raise HouseholdError("claimed email is not bound to one exact menu and recipient")
+                period = menu_email_period(menu)
+                payload = {
+                    "dispatch": True, "send": True, "recipient": recipient,
+                    "subject": jobs[0].get("subject") or f"Ukesmeny og oppskrifter – {period}",
+                    "html": jobs[0].get("html") or menu_email_html(menu),
+                    "order_id": order_id, "claim_token": claim_token,
                 }
                 if self.email_automation_profile:
-                    result["automation_environment"] = {
-                        "HERMES_WORKSPACE_AUTOMATION_PROFILE": self.email_automation_profile,
-                    }
-                return result
+                    payload["automation_environment"] = {"HERMES_WORKSPACE_AUTOMATION_PROFILE": self.email_automation_profile}
+                if len(json.dumps({"ok": True, "result": payload}, ensure_ascii=True).encode()) > MAX_REQUEST - 1_024:
+                    raise HouseholdError("claimed email cannot fit the meal planner response transport")
+                jobs[0]["status"] = "sending"
+                jobs[0].pop("claim_expires_at", None)
+                jobs[0]["dispatch_started_at"] = now().isoformat()
+            return payload
         if action == "mark_sent":
-            order_id = str(request.get("order_id") or "")
+            order_id = safe_order_id(request.get("order_id"))
+            claim_token = request.get("claim_token")
+            if not isinstance(claim_token, str) or not claim_token:
+                raise HouseholdError("the email claim_token is required")
             with self.store.locked() as state:
-                jobs = [job for job in state["email_jobs"] if job.get("order_id") == order_id and job.get("status") == "pending"]
+                jobs = [job for job in state["email_jobs"] if job.get("order_id") == order_id and job.get("status") == "sending"]
                 if len(jobs) != 1:
-                    raise HouseholdError("email is not pending")
+                    raise HouseholdError("email is not claimed for sending")
+                if not secrets.compare_digest(str(jobs[0].get("claim_token") or ""), claim_token):
+                    raise HouseholdError("email claim_token does not match")
                 jobs[0]["status"] = "sent"
                 jobs[0]["sent_at"] = now().isoformat()
+                jobs[0].pop("claim_token", None)
+                jobs[0].pop("dispatch_started_at", None)
+                jobs[0].pop("html", None)
+                jobs[0].pop("menu_snapshot", None)
+                self._prune_order_snapshots(state)
             return {"sent": True}
+        if action == "release":
+            order_id = safe_order_id(request.get("order_id"))
+            claim_token = request.get("claim_token")
+            if not isinstance(claim_token, str) or not claim_token:
+                raise HouseholdError("the email claim_token is required")
+            with self.store.locked() as state:
+                jobs = [job for job in state["email_jobs"] if job.get("order_id") == order_id and job.get("status") in {"claimed", "sending"}]
+                if len(jobs) != 1 or not secrets.compare_digest(str(jobs[0].get("claim_token") or ""), claim_token):
+                    raise HouseholdError("email claim_token does not match a claimed or sending job")
+                jobs[0]["status"] = "pending"
+                jobs[0].pop("claim_token", None)
+                jobs[0].pop("claim_expires_at", None)
+                jobs[0].pop("dispatch_started_at", None)
+            return {"released": True}
         raise HouseholdError("unknown email action")
 
 
@@ -1730,14 +2898,23 @@ class Server:
                     return
                 data += chunk
             try:
-                request = json.loads(data.split(b"\n", 1)[0])
+                line, separator, _remainder = data.partition(b"\n")
+                if not separator or len(line) > MAX_REQUEST:
+                    raise HouseholdError("request exceeds the meal planner size limit")
+                request = strict_json_loads(line)
                 if not isinstance(request, dict):
                     raise HouseholdError("request must be an object")
                 response = {"ok": True, "result": self.app.handle(request)}
-            except (HouseholdError, json.JSONDecodeError) as exc:
+            except (HouseholdError, TypeError, ValueError, OverflowError, UnicodeError, RecursionError) as exc:
                 response = {"ok": False, "error": str(exc)}
             try:
-                connection.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode())
+                encoded = (json.dumps(response, ensure_ascii=True, allow_nan=False) + "\n").encode()
+                if len(encoded) > MAX_REQUEST:
+                    encoded = (json.dumps({"ok": False, "error": "response exceeds the meal planner size limit"}) + "\n").encode()
+            except (TypeError, ValueError, UnicodeError):
+                encoded = (json.dumps({"ok": False, "error": "response contains an invalid JSON value"}) + "\n").encode()
+            try:
+                connection.sendall(encoded)
             except (BrokenPipeError, ConnectionResetError):
                 return
 

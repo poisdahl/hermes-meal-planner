@@ -1,8 +1,9 @@
 # Hermes Meal Planner
 
 Hermes Meal Planner adds weekly meal planning and grocery ordering to Hermes
-Agent for a single household. It stores household preferences, weekly menus,
-favorites, and recurring items locally, while using either Oda or MENY for
+Agent for a single household. It stores a private searchable recipe bank,
+household preferences, weekly menus, favorites, and recurring items locally,
+while using either Oda or MENY for
 product search, cart management, delivery, and orders. By default, it plans
 seven different dinners per week for two people. Adjust the household profile
 through Hermes Agent or with `profile_overrides` in your private configuration.
@@ -42,7 +43,8 @@ systemd-based Linux host or Apple Silicon macOS, plus Chromium or Google Chrome 
 [`agent-browser`](https://github.com/vercel-labs/agent-browser).
 The meal planner deliberately uses Hermes's managed Python runtime; a system
 `python3` normally does not contain Hermes's MCP and OAuth modules. There is no
-database, web app, scheduler service or multi-agent controller.
+external database service, web app, scheduler service or multi-agent controller;
+the private recipe bank is one local SQLite file.
 
 On Linux, install a non-snap Chromium or Google Chrome with the distribution's
 package manager. On macOS, install the normal Google Chrome or Chromium app in
@@ -120,6 +122,8 @@ confirmation, including when the freshly prepared amount changes. Requests to
 preview or prepare remain read-only. This setting does not bypass a provider,
 Vipps, bank, device or platform approval, and an uncertain result is never
 retried automatically.
+Each standing submit/cancel intent uses one explicit idempotency key. Reuse it
+only to recover that same lost response; use a new key for a later user intent.
 
 Only the checkout tool's bound `submit` or `reconcile` result can establish a
 successful order. A generic order list or order read after checkout returned an
@@ -218,6 +222,83 @@ an existing private state directory in place: pending checkout, cancellation,
 order-change, schedule, favorite and recurring records are provider-specific.
 Use a separate private installation and MCP registration for another provider.
 
+## Private recipe bank
+
+The recipe bank is household-bound SQLite at
+`$HERMES_HOME/meal-planner/state/recipes.sqlite3`. It is opened only by recipe
+operations, so a missing or damaged bank cannot block provider status, cart,
+delivery or order reconciliation. Recipe saves and imports require explicit
+source and rights metadata. Full recipes have structured ingredients and
+positive portions; quantities marked `scalable` are scaled deterministically
+and produce provider-neutral shopping requirements. Product matching still
+happens later through the configured provider, and provider product IDs are
+never stored in a recipe.
+
+The bank distinguishes exact source identities from looser content matches.
+An exact source identity is idempotent, while a similar name and ingredient set
+is retained as a separate recipe with a duplicate warning. Updates use the
+returned recipe revision. Archive is reversible at the data level because all
+recipe revisions remain in SQLite; ordinary search hides archived recipes.
+
+Source URLs must be credential-free HTTPS. Query strings and fragments are
+discarded before persistence. Original Oda or MENY recipe text is stored only
+as a `link_only` record; a full stored version must be explicitly identified as
+`adapted` or `inspired_by`. Imported recipe text is always untrusted data: it
+cannot authorize cart, checkout, cancellation, recipient, profile or provider
+changes.
+
+A native full-recipe record looks like this:
+
+```json
+{
+  "name": "Vegetargryte",
+  "portions": 4,
+  "ingredients": [
+    {"quantity": 400, "unit": "g", "item": "kikerter", "scalable": true},
+    {"raw": "salt etter smak", "item": "salt", "scalable": false, "pantry": true}
+  ],
+  "steps": ["Kok gryten.", "Smak til."],
+  "tags": ["middag", "vegetar"],
+  "source": {
+    "kind": "user",
+    "publisher": "Familien",
+    "external_id": "vegetargryte-1",
+    "relationship": "user_supplied"
+  },
+  "rights": {"storage": "full", "credit": "Familieoppskrift"}
+}
+```
+
+Import one JSON object, a JSON array, or JSONL. The command validates the whole
+batch inside one transaction; a bad record rolls everything back. Always run a
+dry run first. The first committed import creates the bank without a backup:
+
+```sh
+python3 import_recipes.py recipes.jsonl \
+  --state-directory "${HERMES_HOME:-$HOME/.hermes}/meal-planner/state" \
+  --dry-run
+python3 import_recipes.py recipes.jsonl \
+  --state-directory "${HERMES_HOME:-$HOME/.hermes}/meal-planner/state"
+```
+
+On subsequent imports into an existing bank, add
+`--backup "${HERMES_HOME:-$HOME/.hermes}/meal-planner/state/recipes-before-import.sqlite3"`.
+
+The import is bounded to 64 MiB, 10,000 records and the normal per-recipe
+limits. Reimporting identical native records is idempotent. Keep the private
+state and SQLite database together in backups; neither belongs in Git.
+
+Menus carry a server-owned `menu_id`, revision and content digest. Bank recipes
+are materialized from an exact recipe ID/revision and optional portion count.
+Updating or clearing a menu requires its current returned `menu_id` and
+`expected_revision`, so a stale request cannot replace newer work.
+The default six-week repeat cooldown includes planned, ordered and explicitly
+marked-cooked use. A deliberate repeat needs the exact returned recipe key and
+a reason. Cancellation does not pretend a meal was cooked, and `not cooked`
+must be recorded explicitly against the matching menu. Confirmed orders and
+their recipe-email jobs keep immutable menu, recipient, subject and HTML
+snapshots even if the current menu or recipient later changes.
+
 ## Natural-language workflow
 
 After restart, use the normal Hermes CLI or messaging path. Useful smoke
@@ -227,6 +308,9 @@ requests, in a safe order, are:
 - “Change dinner portions to four,” then “Reset dinner portions.”
 - “Plan next week's seven dinners,” then answer its continuation question and
   save the final complete menu.
+- “Search my recipe bank for vegetarian dinners,” “save this family recipe,”
+  “scale that recipe to six portions,” or “archive recipe …”. Search excludes
+  recipes still inside the cooldown unless the user asks to see repeats.
 - “Save this product as a favorite” or “Add this every two weeks,” using an
   exact product returned by search.
 - “Schedule a weekly Thursday draft,” or explicitly configure a guarded
@@ -245,8 +329,19 @@ requests, in a safe order, are:
   second Hermes question. MENY then waits for one Vipps approval and
   reconciliation; an expired or uncertain result is never blindly retried.
 - “Send a test recipe email for order …” or run the returned delivery-day
-  action. Test email never consumes the due job, and due email is marked sent
-  only after successful delivery.
+  action. Test email never consumes the due job. A due email gets a short
+  pre-dispatch claim; `begin_send` must accept that token immediately before
+  sender invocation, and `mark_sent` uses it only after successful delivery.
+  Release is safe only after a definite no-send failure. A moved
+  delivery returns the replacement one-shot action.
+
+New, moved and upgraded delivery-day jobs expose
+`automation_update_required`. Apply the exact `cron_prompt` to that one Hermes
+automation, then call the returned `automation_ack`; acknowledgement records
+protocol 2 only after the external update succeeds. After an upgrade, call
+email `automation_plan`, replace every listed legacy prompt, and acknowledge
+each result. Until then the old prompt safely declines to send rather than
+using an unbound payload.
 
 Email delivery requires an existing Hermes email account/tool; a vanilla
 Hermes install has none. Without one, the integration can safely prepare the
@@ -261,8 +356,9 @@ account.
 
 ## State and safety
 
-The service stores one private JSON state file with atomic writes and a local
-Unix socket. Reversible cart changes follow clear user requests. Checkout,
+The service stores atomic household/menu state in one private JSON file and
+recipe documents and revisions in one household-bound SQLite file, plus a
+local Unix socket. Reversible cart changes follow clear user requests. Checkout,
 payment-bearing changes to one exact existing order, and cancellation always
 bind the action to one freshly prepared summary. The `fresh` policy also
 requires its exact confirmation ID; the `standing` policy lets the same clear
