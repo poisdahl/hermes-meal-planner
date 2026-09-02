@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Mapping
 
 from core import HouseholdError, cart_summary
@@ -42,25 +43,28 @@ class OdaClient:
         self.token_directory = Path(token_directory)
 
     def probe(self) -> dict[str, Any]:
-        return self._run(None, {})
+        return self._run(None, {}, 90.0)
 
-    def call(self, tool: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    def call(self, tool: str, arguments: Mapping[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         if not isinstance(tool, str) or not tool:
             raise HouseholdError("Oda tool is missing")
-        return self._run(tool, dict(arguments))
+        timeout = 90.0 if deadline is None else deadline - time.monotonic()
+        if timeout <= 0:
+            raise HouseholdError("Oda operation deadline reached")
+        return self._run(tool, dict(arguments), min(timeout, 90.0))
 
-    def _run(self, tool: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _run(self, tool: str | None, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
         if not self.token_directory.is_dir():
             raise HouseholdError("Oda login is required")
         with self._lock():
             try:
-                return asyncio.run(self._run_async(tool, arguments))
+                return asyncio.run(self._run_async(tool, arguments, timeout))
             except HouseholdError:
                 raise
             except Exception as exc:
                 raise HouseholdError("Oda MCP is unavailable") from exc
 
-    async def _run_async(self, tool: str | None, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _run_async(self, tool: str | None, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
         try:
             import httpx2 as httpx
             from mcp import ClientSession
@@ -105,7 +109,7 @@ class OdaClient:
             client_metadata=_build_client_metadata(oauth_config),
             storage=storage,
             redirect_handler=_make_redirect_handler(port),
-            callback_handler=_make_callback_waiter(port, timeout=30.0),
+            callback_handler=_make_callback_waiter(port, timeout=min(30.0, timeout)),
         )
         provider._hermes_home = str(token_directory.parent.resolve())
         original = httpx.URL(ODA_ENDPOINT)
@@ -120,12 +124,12 @@ class OdaClient:
             auth=provider,
             follow_redirects=True,
             headers={"mcp-protocol-version": LATEST_PROTOCOL_VERSION},
-            timeout=httpx.Timeout(90.0, read=60.0),
+            timeout=httpx.Timeout(timeout, read=min(60.0, timeout)),
             event_hooks={"response": [same_origin]},
         ) as client:
             async with streamable_http_client(ODA_ENDPOINT, http_client=client, terminate_on_close=False) as streams:
-                async with ClientSession(streams[0], streams[1], read_timeout_seconds=90.0) as session:
-                    async with asyncio.timeout(90.0):
+                async with ClientSession(streams[0], streams[1], read_timeout_seconds=timeout) as session:
+                    async with asyncio.timeout(timeout):
                         initialized = await session.initialize()
                         tools: list[Any] = []
                         cursor: str | None = None

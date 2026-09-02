@@ -28,6 +28,10 @@ class CancellationPreconditionError(HouseholdError):
     """Cancellation stopped before the final provider control was dispatched."""
 
 
+RECIPE_SOURCE_IDS = ("internal", "oda", "meny", "themealdb", "wikibooks")
+DEFAULT_RECIPE_SOURCES = {source: True for source in RECIPE_SOURCE_IDS}
+
+
 DEFAULT_PROFILE: dict[str, Any] = {
     "meals": {
         "dinner_days": 7,
@@ -86,6 +90,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
     },
     "recipes": {
         "repeat_cooldown_weeks": 6,
+        "sources": deepcopy(DEFAULT_RECIPE_SOURCES),
     },
 }
 
@@ -114,7 +119,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 4,
+        "version": 5,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -124,6 +129,12 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "email_recipient": None,
         "menu": None,
         "cart_plan": None,
+        "setup": {
+            "version": 1,
+            "status": "needs_review",
+            "reviewed_at": None,
+            "noninteractive_defaults_applied_at": None,
+        },
         "pending_checkout": None,
         "pending_cancellation": None,
         "order_change": None,
@@ -263,7 +274,7 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 4:
+    if version > 5:
         raise HouseholdError("household state is newer than this meal planner")
     if version == 1:
         profile = state.get("profile")
@@ -335,6 +346,21 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     if state["version"] == 3:
         state.setdefault("cart_plan", None)
         state["version"] = 4
+    if state["version"] == 4:
+        profile = state.get("profile")
+        recipes = profile.get("recipes") if isinstance(profile, dict) else None
+        configured = config.get("profile_overrides") if isinstance(config.get("profile_overrides"), Mapping) else {}
+        configured_recipes = configured.get("recipes") if isinstance(configured.get("recipes"), Mapping) else {}
+        configured_sources = configured_recipes.get("sources") if isinstance(configured_recipes.get("sources"), Mapping) else {}
+        if isinstance(recipes, dict) and "sources" not in recipes:
+            recipes["sources"] = {**deepcopy(DEFAULT_RECIPE_SOURCES), **deepcopy(dict(configured_sources))}
+        state.setdefault("setup", {
+            "version": 1,
+            "status": "needs_review",
+            "reviewed_at": None,
+            "noninteractive_defaults_applied_at": None,
+        })
+        state["version"] = 5
     state.setdefault("recipe_usage", {})
     state.setdefault("recipe_usage_requests", {})
     state.setdefault("order_snapshots", {})
@@ -343,6 +369,12 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     state.setdefault("protected_results", {})
     state.setdefault("protected_requests", {})
     state.setdefault("cart_plan", None)
+    state.setdefault("setup", {
+        "version": 1,
+        "status": "needs_review",
+        "reviewed_at": None,
+        "noninteractive_defaults_applied_at": None,
+    })
     recipient = state.get("email_recipient")
     if recipient is not None and not valid_email_address(recipient):
         state["email_recipient"] = None
@@ -375,6 +407,19 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     cooldown = recipe_profile.get("repeat_cooldown_weeks")
     if isinstance(cooldown, bool) or not isinstance(cooldown, int) or not 0 <= cooldown <= 260:
         raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
+    sources = recipe_profile.setdefault("sources", deepcopy(DEFAULT_RECIPE_SOURCES))
+    if (
+        not isinstance(sources, dict)
+        or set(sources) != set(RECIPE_SOURCE_IDS)
+        or any(not isinstance(sources[source], bool) for source in RECIPE_SOURCE_IDS)
+    ):
+        raise HouseholdError("recipe sources must name the five supported sources as true or false")
+    setup = state.get("setup")
+    if not isinstance(setup, dict) or setup.get("version") != 1 or setup.get("status") not in {"needs_review", "complete"}:
+        raise HouseholdError("household first-run setup state is invalid")
+    for field in ("reviewed_at", "noninteractive_defaults_applied_at"):
+        if setup.get(field) is not None and (not isinstance(setup[field], str) or len(setup[field]) > 100):
+            raise HouseholdError("household first-run setup timestamp is invalid")
     if not isinstance(state["recipe_usage"], dict) or not isinstance(state["recipe_usage_requests"], dict) or not isinstance(state["order_snapshots"], dict) or not isinstance(state["order_snapshot_times"], dict) or not isinstance(state["order_snapshot_providers"], dict) or not isinstance(state["protected_results"], dict) or not isinstance(state["protected_requests"], dict):
         raise HouseholdError("household recipe lifecycle state is invalid")
     if any(
@@ -432,7 +477,7 @@ class StateStore:
             if (
                 not isinstance(source_version, bool)
                 and isinstance(source_version, int)
-                and source_version in {1, 2, 3}
+                and source_version in {1, 2, 3, 4}
             ):
                 backup = self.directory / f"state-v{source_version}.backup.json"
                 if not backup.exists():
@@ -592,6 +637,8 @@ def masked_status(state: Mapping[str, Any], integration: Mapping[str, Any]) -> d
         "pending_checkout_status": (state.get("pending_checkout") or {}).get("status"),
         "pending_cancellation_status": (state.get("pending_cancellation") or {}).get("status"),
         "order_change_status": (state.get("order_change") or {}).get("status"),
+        "configuration_status": (state.get("setup") or {}).get("status"),
+        "recipe_sources": deepcopy((state.get("profile") or {}).get("recipes", {}).get("sources", {})),
     }
 
 

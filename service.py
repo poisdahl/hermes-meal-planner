@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
@@ -40,6 +41,13 @@ from core import (
 from oda import OdaClient
 from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, MenyOrderChangeDispatchError, meny_checkout_reviews_match, normalize_product_ref
 from recipes import RecipeError, RecipeStore, normalize_recipe, normalize_source_url, recipe_key, scale_recipe, validate_week
+from recipe_sources import (
+    SOURCE_IDS,
+    TheMealDBSource,
+    WikibooksSource,
+    provider_recipe_candidates,
+    validate_source_settings,
+)
 
 
 MAX_REQUEST = 2 * 1024 * 1024
@@ -290,8 +298,31 @@ def menu_email_html(menu: Mapping[str, Any], *, test: bool = False) -> str:
         elif relationship == "user_supplied" and publisher.casefold() in {"unknown", "user", "bruker"}:
             text = "Familiens egen oppskrift"
         rendered = f'<a href="{escape(url)}">{escape(text)}</a>' if url else escape(text)
-        credit = (value.get("rights") or {}).get("credit") if isinstance(value.get("rights"), Mapping) else None
-        suffix = f". {escape(credit)}" if credit else ""
+        rights = value.get("rights") if isinstance(value.get("rights"), Mapping) else {}
+        snapshot = value.get("external_snapshot") if isinstance(value.get("external_snapshot"), Mapping) else {}
+        credit = rights.get("credit")
+        license_name = str(rights.get("license") or "").strip()
+        try:
+            license_url = normalize_source_url(rights.get("license_url"))
+        except RecipeError:
+            license_url = None
+        try:
+            permanent_url = normalize_source_url(snapshot.get("permanent_url"))
+        except RecipeError:
+            permanent_url = None
+        details = []
+        if credit:
+            details.append(escape(credit))
+        if license_name:
+            details.append(
+                f'<a href="{escape(license_url)}">{escape(license_name)}</a>'
+                if license_url else escape(license_name)
+            )
+        if permanent_url:
+            details.append(f'<a href="{escape(permanent_url)}">Frosset kilderevisjon</a>')
+        if snapshot.get("changes"):
+            details.append(f"Endringer: {escape(snapshot['changes'])}")
+        suffix = f". {' · '.join(details)}" if details else ""
         return f"<p><strong>{escape(label)}:</strong> {rendered}{suffix}</p>"
 
     week = menu_email_period(menu)
@@ -704,6 +735,7 @@ class Application:
     def __init__(
         self, store: StateStore, provider_client: Any, browser: OdaBrowser,
         *, email_provider_clients: Mapping[str, Any] | None = None,
+        external_recipe_sources: Mapping[str, Any] | None = None,
     ):
         self.store = store
         self.recipes = RecipeStore(store.directory / "recipes.sqlite3", str(store.config["household"]))
@@ -714,6 +746,10 @@ class Application:
         self.browser = provider_client if self.provider == "meny" else browser
         self.browser_lock = threading.Lock()
         self.email_automation_profile = str(store.config.get("email_automation_profile") or "").strip()
+        self.external_recipe_sources = dict(external_recipe_sources or {
+            "themealdb": TheMealDBSource(api_key=os.environ.get("THEMEALDB_API_KEY", "1")),
+            "wikibooks": WikibooksSource(),
+        })
         self.integration: dict[str, Any]
         if self.provider == "meny":
             # MENY readiness can require a full browser navigation. Keep the
@@ -852,10 +888,10 @@ class Application:
         if operation == "health":
             return {"ok": True, "integration": self.integration}
         if operation == "status":
+            state = self.store.read()
             if self.provider == "meny" and self.integration.get("status") != "ready":
                 deadline = time.monotonic() + MENY_READ_TIMEOUT
                 with self._browser_operation(deadline):
-                    state = self.store.read()
                     pending_status = (state.get("pending_checkout") or {}).get("status")
                     if pending_status not in UNRESOLVED_CHECKOUT_STATUSES:
                         safe = not state.get("pending_checkout") and not state.get("pending_cancellation") and not state.get("order_change")
@@ -864,6 +900,8 @@ class Application:
                 **masked_status(self.store.read(), self.integration),
                 "confirmation_policy": self.confirmation_policy,
             }
+        if operation == "setup":
+            return self._setup(request)
         if operation == "profile":
             return self._profile(request)
         if operation == "favorites":
@@ -936,6 +974,12 @@ class Application:
                 cooldown = recipe_changes["repeat_cooldown_weeks"]
                 if isinstance(cooldown, bool) or not isinstance(cooldown, int) or not 0 <= cooldown <= 260:
                     raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
+            if isinstance(recipe_changes, Mapping) and "sources" in recipe_changes:
+                current = self.store.read()["profile"]["recipes"]["sources"]
+                source_changes = recipe_changes["sources"]
+                if not isinstance(source_changes, Mapping) or not set(source_changes).issubset(SOURCE_IDS):
+                    raise HouseholdError("recipe source changes contain unknown sources")
+                validate_source_settings({**current, **dict(source_changes)})
             return {"profile": self.store.update_profile(changes)}
         if action == "reset":
             paths = request.get("paths")
@@ -951,6 +995,107 @@ class Application:
                 state["email_recipient"] = email
             return {"email_recipient": mask_email(email)}
         raise HouseholdError("unknown profile action")
+
+    def _setup_summary(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        profile = state["profile"]
+        meals = profile["meals"]
+        return {
+            "household": state["household"],
+            "provider": self.provider,
+            "people": meals["people"],
+            "portions": meals["portions"],
+            "diet": deepcopy(profile["diet"]),
+            "confirmation_policy": self.confirmation_policy,
+            "weekly_menu": {
+                key: deepcopy(meals[key])
+                for key in ("dinner_days", "dishes", "batch_dishes", "salads", "cook_days", "eat_days")
+            },
+            "recipe_sources": deepcopy(profile["recipes"]["sources"]),
+        }
+
+    def _setup_question(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        required = (state.get("setup") or {}).get("status") != "complete"
+        return {
+            "configuration_required": required,
+            "configuration_status": (state.get("setup") or {}).get("status"),
+            "current": self._setup_summary(state),
+            "question": "Keep all current/default Meal Planner settings? Answer once, or provide only the values you want to change." if required else None,
+            "next": "Call meal_planner_setup action=apply with keep_current=true, or keep_current=false and only the requested changes." if required else "Use action=rerun to review this configuration again.",
+        }
+
+    def _setup_gate(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
+        interactive = request.get("interactive") is True
+        with self.store.locked() as state:
+            setup = state["setup"]
+            if setup["status"] == "complete":
+                return None
+            if not interactive:
+                setup["noninteractive_defaults_applied_at"] = setup.get("noninteractive_defaults_applied_at") or now().isoformat()
+                return None
+            return self._setup_question(state)
+
+    def _setup(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        action = request.get("action", "show")
+        if action == "show":
+            state = self.store.read()
+            return {"setup": deepcopy(state["setup"]), **self._setup_question(state)}
+        if action == "rerun":
+            with self.store.locked() as state:
+                state["setup"]["status"] = "needs_review"
+                state["setup"]["reviewed_at"] = None
+                return {"setup": deepcopy(state["setup"]), **self._setup_question(state)}
+        if action != "apply":
+            raise HouseholdError("unknown setup action")
+        keep_current = request.get("keep_current")
+        changes = request.get("changes") or {}
+        if not isinstance(keep_current, bool) or not isinstance(changes, Mapping):
+            raise HouseholdError("setup apply needs keep_current true or false and an optional changes object")
+        if keep_current and changes:
+            raise HouseholdError("keep_current cannot be combined with setup changes")
+        allowed = {"provider", "confirmation_policy", "people", "portions", "diet", "weekly_menu", "recipe_sources"}
+        if not set(changes).issubset(allowed):
+            raise HouseholdError("setup changes contain unknown fields")
+        requested_provider = str(changes.get("provider") or self.provider).casefold()
+        requested_policy = str(changes.get("confirmation_policy") or self.confirmation_policy).casefold()
+        if requested_provider != self.provider:
+            raise HouseholdError("changing provider requires a separate provider-bound state directory and service restart")
+        if requested_policy != self.confirmation_policy:
+            raise HouseholdError("changing confirmation_policy requires updating the private config and restarting the service")
+        with self.store.locked() as state:
+            before = self._setup_summary(state)
+            profile = state["profile"]
+            meals = profile["meals"]
+            for field in ("people", "portions"):
+                if field in changes:
+                    value = changes[field]
+                    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+                        raise HouseholdError(f"setup {field} must be an integer from one to 100")
+                    meals[field] = value
+            if "diet" in changes:
+                diet = changes["diet"]
+                if not isinstance(diet, Mapping) or not set(diet).issubset(profile["diet"]):
+                    raise HouseholdError("setup diet contains unknown fields")
+                profile["diet"].update(deepcopy(dict(diet)))
+            if "weekly_menu" in changes:
+                weekly = changes["weekly_menu"]
+                editable = {"dinner_days", "dishes", "batch_dishes", "salads", "cook_days", "eat_days"}
+                if not isinstance(weekly, Mapping) or not set(weekly).issubset(editable):
+                    raise HouseholdError("setup weekly_menu contains unknown fields")
+                meals.update(deepcopy(dict(weekly)))
+            if "recipe_sources" in changes:
+                source_changes = changes["recipe_sources"]
+                if not isinstance(source_changes, Mapping) or not set(source_changes).issubset(SOURCE_IDS):
+                    raise HouseholdError("setup recipe_sources contains unknown sources")
+                profile["recipes"]["sources"] = validate_source_settings({
+                    **profile["recipes"]["sources"], **dict(source_changes),
+                })
+            setup = state["setup"]
+            current = self._setup_summary(state)
+            if setup["status"] == "complete" and canonical(current) == canonical(before):
+                return {"configured": True, "idempotent": True, "setup": deepcopy(setup), "current": current}
+            setup["status"] = "complete"
+            setup["reviewed_at"] = now().isoformat()
+            return {"configured": True, "setup": deepcopy(setup), "current": current}
 
     def _items(self, request: Mapping[str, Any], key: str) -> dict[str, Any]:
         action = request.get("action", "list")
@@ -1072,8 +1217,146 @@ class Application:
         while len(requests) > 200:
             requests.pop(next(iter(requests)))
 
+    def _internal_recipe_candidates(
+        self, query: str, limit: int, state: Mapping[str, Any], week: str,
+    ) -> list[dict[str, Any]]:
+        results = []
+        for row in self.recipes.search(query, limit=limit, include_archived=False):
+            recipe = self.recipes.get(row["id"], row["revision"])
+            recipe["usage"] = self._usage_summary(state, recipe["recipe_key"], week)
+            if recipe["usage"]["eligible"]:
+                results.append(recipe)
+        return results
+
+    def _provider_recipe_candidates(self, provider: str, query: str, limit: int) -> list[dict[str, Any]]:
+        if not query:
+            return []
+        client = self.oda if provider == self.provider else self.email_provider_clients.get(provider)
+        if client is None:
+            raise HouseholdError(f"{provider.upper()} recipe source has no configured provider session")
+        arguments = {"query": query, "page": 1, "size": limit}
+        if provider == "meny":
+            response = client.call(
+                "recipe_search", arguments,
+                deadline=time.monotonic() + 10,
+                allow_recovery=True,
+            )
+        else:
+            response = client.call("recipe_search", arguments, deadline=time.monotonic() + 10)
+        return provider_recipe_candidates(provider, response, limit)
+
+    @staticmethod
+    def _discovery_identities(recipe: Mapping[str, Any]) -> set[str]:
+        source = recipe.get("source") if isinstance(recipe.get("source"), Mapping) else {}
+        publisher = " ".join(str(source.get("publisher") or source.get("kind") or "").casefold().split())
+        external_id = " ".join(str(source.get("external_id") or "").casefold().split())
+        identities = set()
+        if publisher and external_id:
+            identities.add(f"source:{publisher}:{external_id}")
+        url = str(source.get("url") or "")
+        if url:
+            identities.add(f"url:{url}")
+        ingredients = recipe.get("ingredients") if isinstance(recipe.get("ingredients"), list) else []
+        name = " ".join(str(recipe.get("name") or "").casefold().split())
+        normalized_ingredients = [
+                " ".join(str(item.get("item") if isinstance(item, Mapping) else item).casefold().split())
+                for item in ingredients
+        ]
+        if name and normalized_ingredients:
+            exact = {"name": name, "ingredients": normalized_ingredients}
+            identities.add("content:" + hashlib.sha256(canonical(exact).encode()).hexdigest())
+        return identities or {"fallback:" + hashlib.sha256(canonical(recipe).encode()).hexdigest()}
+
+    def _discover_recipes(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        gate = self._setup_gate(request)
+        if gate is not None:
+            return gate
+        query_value = request.get("query", "")
+        if not isinstance(query_value, str):
+            raise HouseholdError("recipe discovery query must be text")
+        query = " ".join(query_value.split())
+        if len(query) > 200:
+            raise HouseholdError("recipe discovery query is too long")
+        total_limit = bounded_limit(request.get("limit"), default=10)
+        state = self.store.read()
+        week = validate_week(request.get("week") or self._household_today(state).strftime("%G-W%V"))
+        sources = validate_source_settings(state["profile"]["recipes"]["sources"])
+        enabled = [source for source in SOURCE_IDS if sources[source]]
+        if not enabled:
+            raise HouseholdError("no recipe sources are enabled")
+        per_source = min(5, max(1, math.ceil(total_limit / len(enabled))))
+        busy = bool(state.get("pending_checkout") or state.get("pending_cancellation") or state.get("order_change"))
+        tasks: dict[str, Any] = {}
+        for source in enabled:
+            if source == "internal":
+                tasks[source] = lambda q=query, n=per_source: self._internal_recipe_candidates(q, n, state, week)
+            elif source in {"themealdb", "wikibooks"}:
+                adapter = self.external_recipe_sources.get(source)
+                if adapter is not None:
+                    tasks[source] = lambda adapter=adapter, q=query, n=per_source: adapter.search(q, n)
+            elif not busy:
+                tasks[source] = lambda source=source, q=query, n=per_source: self._provider_recipe_candidates(source, q, n)
+        executor = ThreadPoolExecutor(max_workers=min(5, max(1, len(tasks))))
+        futures = {executor.submit(call): source for source, call in tasks.items()}
+        done, pending = wait(futures, timeout=12)
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        by_source: dict[str, list[dict[str, Any]]] = {source: [] for source in SOURCE_IDS}
+        statuses = []
+        for source in SOURCE_IDS:
+            if not sources[source]:
+                statuses.append({"source": source, "enabled": False, "status": "disabled", "count": 0})
+                continue
+            future = next((candidate for candidate, name in futures.items() if name == source), None)
+            if future is None:
+                reason = "provider operation is pending" if source in {"oda", "meny"} and busy else "source session is unavailable"
+                statuses.append({"source": source, "enabled": True, "status": "unavailable", "count": 0, "reason": reason})
+                continue
+            if future not in done:
+                statuses.append({"source": source, "enabled": True, "status": "timeout", "count": 0})
+                continue
+            try:
+                values = future.result()
+                if not isinstance(values, list):
+                    raise HouseholdError("recipe source result is invalid")
+                by_source[source] = [deepcopy(value) for value in values[:per_source] if isinstance(value, Mapping)]
+                status = "ready" if by_source[source] else "empty"
+                statuses.append({"source": source, "enabled": True, "status": status, "count": len(by_source[source])})
+            except (HouseholdError, OSError, ValueError, TypeError, RecursionError):
+                statuses.append({"source": source, "enabled": True, "status": "unavailable", "count": 0})
+        results = []
+        seen = set()
+        for index in range(per_source):
+            for source in SOURCE_IDS:
+                values = by_source[source]
+                if index >= len(values):
+                    continue
+                recipe = values[index]
+                identities = self._discovery_identities(recipe)
+                if identities & seen:
+                    continue
+                seen.update(identities)
+                recipe["discovery_source"] = source
+                results.append(recipe)
+                if len(results) == total_limit:
+                    break
+            if len(results) == total_limit:
+                break
+        if not results:
+            raise HouseholdError("no enabled recipe source returned a usable candidate")
+        return {
+            "week": week,
+            "query": query,
+            "recipes": results,
+            "sources": statuses,
+            "balanced_limit_per_source": per_source,
+        }
+
     def _recipes(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "search")
+        if action == "discover":
+            return self._discover_recipes(request)
         if action == "search":
             state = self.store.read()
             week = validate_week(request.get("week") or self._household_today(state).strftime("%G-W%V"))
@@ -1275,6 +1558,9 @@ class Application:
                 state["cart_plan"] = None
                 return {"menu": None}
         if action == "save":
+            setup_gate = self._setup_gate(request)
+            if setup_gate is not None:
+                return setup_gate
             baseline_menu = deepcopy(self.store.read().get("menu"))
             menu = self._materialize_menu(request.get("menu"))
             supplied_menu_id = str(request.get("menu_id") or "") or None

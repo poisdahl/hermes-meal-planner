@@ -3,8 +3,9 @@
 Hermes Meal Planner adds weekly meal planning and grocery ordering to Hermes
 Agent for a single household. It stores a private searchable recipe bank,
 household preferences, weekly menus, favorites, and recurring items locally,
-while using either Oda or MENY for
-product search, cart management, delivery, and orders. By default, it plans
+discovers recipes through that bank, Oda, MENY, TheMealDB and Wikibooks
+Cookbook, and uses either Oda or MENY for product search, cart management,
+delivery, and orders. By default, it plans
 seven different dinners per week for two people. Adjust the household profile
 through Hermes Agent or with `profile_overrides` in your private configuration.
 
@@ -124,6 +125,22 @@ Vipps, bank, device or platform approval, and an uncertain result is never
 retried automatically.
 Each standing submit/cancel intent uses one explicit idempotency key. Reuse it
 only to recover that same lost response; use a new key for a later user intent.
+
+## First-run configuration
+
+The first interactive menu or recipe-discovery request returns one setup
+question with the current household, provider, people, portions, diet,
+confirmation policy, weekly-menu fields and five recipe-source switches. Keep
+all values once, or send only the values to change. The operation is
+idempotent, and `setup rerun` makes the same review available later. It never
+asks for or returns provider credentials, API keys, Vipps details or recipient
+addresses. A non-interactive weekly run proceeds with the saved/default values
+and leaves an explicit `needs_review` status instead of blocking automation.
+
+All five recipe sources are enabled by default. Disable a source with the setup
+tool, the profile tool, or a private `profile_overrides.recipes.sources` value.
+Provider selection and confirmation policy remain config-bound and require a
+separate state/service change rather than an in-place setup edit.
 
 ## Manual cart goods during a weekly menu
 
@@ -261,7 +278,8 @@ The recipe bank is household-bound SQLite at
 operations, so a missing or damaged bank cannot block provider status, cart,
 delivery or order reconciliation. Recipe saves and imports require explicit
 source and rights metadata. Full recipes have structured ingredients and
-positive portions; quantities marked `scalable` are scaled deterministically
+positive portions when the source states a serving count; quantities marked
+`scalable` are scaled deterministically
 and produce provider-neutral shopping requirements. Product matching still
 happens later through the configured provider, and provider product IDs are
 never stored in a recipe.
@@ -276,6 +294,23 @@ Source URLs must be credential-free HTTPS. Query strings and fragments are
 discarded before persistence. Original Oda or MENY recipe text is stored only
 as a `link_only` record; a full stored version must be explicitly identified as
 `adapted` or `inspired_by`.
+
+Recipe `discover` fetches enabled sources concurrently with bounded result,
+response-size and time limits. A slow, empty or failed source is reported per
+source and does not suppress usable results from another source. Results are
+round-robin balanced and conservatively deduplicated by exact source identity
+or exact normalized name-and-ingredient content. No arbitrary recipe URL is
+fetched.
+
+TheMealDB uses its official V1 API with the public/private-use test key `1` by
+default; a private key can be supplied only through `THEMEALDB_API_KEY`. Review
+TheMealDB's current terms before using this integration in a public app.
+Wikibooks Cookbook recipes pass a strict ingredients-plus-procedure gate and
+are stored with CC BY-SA 4.0 attribution, the exact permanent revision URL, a
+content hash and a change statement. Images are never copied. Selected full
+external recipes are embedded as immutable menu snapshots, so a later source
+edit cannot change an active or ordered menu, its shopping requirements or its
+recipe email.
 
 A native full-recipe record looks like this:
 
@@ -335,10 +370,12 @@ After restart, use the normal Hermes CLI or messaging path. Useful smoke
 requests, in a safe order, are:
 
 - “Show my meal-planner status and household profile.”
+- On the first interactive run, answer the one setup question by keeping all
+  values or changing only the named values.
 - “Change dinner portions to four,” then “Reset dinner portions.”
 - “Plan next week's seven dinners,” then answer its continuation question and
   save the final complete menu.
-- “Search my recipe bank for vegetarian dinners,” “save this family recipe,”
+- “Discover vegetarian dinners,” “search my recipe bank,” “save this family recipe,”
   “scale that recipe to six portions,” or “archive recipe …”. Search excludes
   recipes still inside the cooldown unless the user asks to see repeats.
 - “Save this product as a favorite” or “Add this every two weeks,” using an

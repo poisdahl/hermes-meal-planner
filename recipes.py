@@ -197,6 +197,33 @@ def _rights(value: Any) -> dict[str, Any]:
     }
 
 
+def _external_snapshot(value: Any, source: Mapping[str, Any]) -> dict[str, Any] | None:
+    required = str(source.get("kind") or "").casefold() in {"themealdb", "wikibooks"}
+    if value is None and not required:
+        return None
+    if not isinstance(value, Mapping):
+        raise RecipeError("external_snapshot metadata is required")
+    fetched_at = _bounded_text(value.get("fetched_at"), "external_snapshot.fetched_at", required=True, maximum=100)
+    try:
+        parsed_at = datetime.fromisoformat(fetched_at)
+    except ValueError as exc:
+        raise RecipeError("external_snapshot.fetched_at must be an ISO timestamp") from exc
+    if parsed_at.tzinfo is None:
+        raise RecipeError("external_snapshot.fetched_at must include a timezone")
+    content_hash = _bounded_text(value.get("content_hash"), "external_snapshot.content_hash", required=True, maximum=64)
+    if re.fullmatch(r"[a-f0-9]{64}", content_hash or "") is None:
+        raise RecipeError("external_snapshot.content_hash must be a SHA-256 digest")
+    return {
+        "fetched_at": fetched_at,
+        "content_hash": content_hash,
+        "source_revision_id": _bounded_text(
+            value.get("source_revision_id"), "external_snapshot.source_revision_id", maximum=200,
+        ),
+        "permanent_url": normalize_source_url(value.get("permanent_url")),
+        "changes": _bounded_text(value.get("changes"), "external_snapshot.changes", required=required, maximum=1_000),
+    }
+
+
 def _format_number(value: float) -> str:
     if value.is_integer():
         return str(int(value))
@@ -269,6 +296,9 @@ def normalize_recipe(value: Any) -> dict[str, Any]:
         "rights": rights,
         "notes": _bounded_text(cleaned.get("notes"), "notes", maximum=MAX_TEXT),
     }
+    external_snapshot = _external_snapshot(cleaned.get("external_snapshot"), source)
+    if external_snapshot is not None:
+        result["external_snapshot"] = external_snapshot
     if rights["storage"] == "link_only":
         if not source.get("url"):
             raise RecipeError("link_only recipes require a source URL")
@@ -291,7 +321,7 @@ def normalize_recipe(value: Any) -> dict[str, Any]:
         )
         if restricted_source and source["relationship"] not in {"adapted", "inspired_by"}:
             raise RecipeError("original Oda or MENY content is link_only; store only an adapted or inspired recipe as full")
-        portions = _finite_positive(cleaned.get("portions"), "portions")
+        portions = None if cleaned.get("portions") is None else _finite_positive(cleaned.get("portions"), "portions")
         ingredients = cleaned.get("ingredients")
         steps = cleaned.get("steps")
         if not isinstance(ingredients, list) or not 1 <= len(ingredients) <= 200:
@@ -361,8 +391,23 @@ def scale_recipe(recipe: Mapping[str, Any], portions: Any | None = None) -> dict
     result = deepcopy(dict(recipe))
     if (result.get("rights") or {}).get("storage") != "full":
         raise RecipeError("link_only recipes cannot be materialized into a menu")
-    base = _finite_positive(result.get("portions"), "portions")
+    base = None if result.get("portions") is None else _finite_positive(result.get("portions"), "portions")
+    if base is None and portions is not None:
+        raise RecipeError("a recipe with unknown portions cannot be scaled")
     target = base if portions is None else _finite_positive(portions, "target portions")
+    if base is None:
+        result["shopping_requirements"] = [
+            {
+                "query": value.get("item"), "item": value.get("item"),
+                "quantity": value.get("quantity"), "unit": value.get("unit"),
+                "optional": value.get("optional", False), "pantry": value.get("pantry", False),
+            }
+            for value in result.get("ingredients", [])
+        ]
+        result["recipe_key"] = recipe_key(result)
+        if result.get("id"):
+            result["recipe_ref"] = {"id": result["id"], "revision": result["revision"]}
+        return result
     factor = target / base
     if not math.isfinite(factor) or factor <= 0:
         raise RecipeError("portion scaling factor must be positive and finite")
