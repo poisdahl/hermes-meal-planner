@@ -93,6 +93,8 @@ DEFAULT_BROWSER_ARGS = "--disable-gpu,--disable-quic"
 MENY_READ_TIMEOUT = 110
 MENY_CART_TIMEOUT = 240
 MENY_ORDER_TIMEOUT = 240
+MENY_LOGIN_POLL_ATTEMPTS = 40
+MENY_LOGIN_POLL_INTERVAL = 0.75
 MAX_CART_CLICKS = 2
 MENY_VIEWPORT = (1280, 900)
 
@@ -659,7 +661,7 @@ class MenyClient:
         self._open(STORE_URL)
         result: dict[str, Any] = {}
         for attempt in range(2):
-            for _ in range(120):
+            for _ in range(MENY_LOGIN_POLL_ATTEMPTS):
                 result = self._eval(r"""
 (() => {
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -673,7 +675,7 @@ class MenyClient:
 """)
                 if result.get("ready") is True and result.get("authenticated") is True:
                     return
-                self._sleep(0.25)
+                self._sleep(MENY_LOGIN_POLL_INTERVAL)
             if attempt == 0:
                 self._invoke("reload")
         if result.get("ready") is not True:

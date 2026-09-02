@@ -1316,8 +1316,9 @@ class MenyClientTests(unittest.TestCase):
         client._eval = mock.Mock(return_value={"ready": True, "authenticated": False})
         with self.assertRaisesRegex(HouseholdError, "login is required"):
             client.probe()
-        self.assertEqual(client._eval.call_count, 240)
-        self.assertEqual(client._sleep.call_count, 240)
+        self.assertEqual(client._eval.call_count, 80)
+        self.assertEqual(client._sleep.call_count, 80)
+        client._sleep.assert_called_with(0.75)
         client._invoke.assert_called_once_with("reload")
         client._eval.return_value = {"ready": True, "authenticated": True}
         probe = client.probe()
@@ -1333,7 +1334,7 @@ class MenyClientTests(unittest.TestCase):
             {"ready": True, "authenticated": True},
         ])
         client._require_login()
-        client._sleep.assert_called_once_with(0.25)
+        client._sleep.assert_called_once_with(0.75)
         self.assertIn("location.pathname === '/varer'", client._eval.call_args_list[0].args[0])
 
     def test_login_check_allows_a_slow_authenticated_shell_to_hydrate(self):
@@ -1341,14 +1342,14 @@ class MenyClientTests(unittest.TestCase):
         client._open = mock.Mock()
         client._sleep = mock.Mock()
         client._eval = mock.Mock(side_effect=[
-            *([{"ready": True, "authenticated": False}] * 72),
+            *([{"ready": True, "authenticated": False}] * 24),
             {"ready": True, "authenticated": True},
         ])
 
         client._require_login()
 
-        self.assertEqual(client._eval.call_count, 73)
-        self.assertEqual(client._sleep.call_count, 72)
+        self.assertEqual(client._eval.call_count, 25)
+        self.assertEqual(client._sleep.call_count, 24)
 
     def test_login_check_reloads_one_stuck_store_shell(self):
         client = self.client()
@@ -1356,12 +1357,12 @@ class MenyClientTests(unittest.TestCase):
         client._sleep = mock.Mock()
         client._invoke = mock.Mock()
         stuck = {"ready": False, "authenticated": False}
-        client._eval = mock.Mock(side_effect=[*([stuck] * 120), {"ready": True, "authenticated": True}])
+        client._eval = mock.Mock(side_effect=[*([stuck] * 40), {"ready": True, "authenticated": True}])
 
         client._require_login()
 
-        self.assertEqual(client._eval.call_count, 121)
-        self.assertEqual(client._sleep.call_count, 120)
+        self.assertEqual(client._eval.call_count, 41)
+        self.assertEqual(client._sleep.call_count, 40)
         client._invoke.assert_called_once_with("reload")
 
     def test_cdp_is_restricted_to_an_explicit_loopback_endpoint(self):
