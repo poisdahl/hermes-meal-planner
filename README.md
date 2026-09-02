@@ -243,9 +243,7 @@ recipe revisions remain in SQLite; ordinary search hides archived recipes.
 Source URLs must be credential-free HTTPS. Query strings and fragments are
 discarded before persistence. Original Oda or MENY recipe text is stored only
 as a `link_only` record; a full stored version must be explicitly identified as
-`adapted` or `inspired_by`. Imported recipe text is always untrusted data: it
-cannot authorize cart, checkout, cancellation, recipient, profile or provider
-changes.
+`adapted` or `inspired_by`.
 
 A native full-recipe record looks like this:
 
