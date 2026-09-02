@@ -41,6 +41,8 @@ def migrate(config: dict[str, Any], planning: dict[str, Any], schedule: dict[str
             for key in ("enabled", "weekday", "time", "timezone", "mode", "delivery", "maximum_total", "auto_checkout"):
                 if key in source:
                     result["schedule"][key] = source[key]
+            if isinstance(result["schedule"].get("delivery"), dict):
+                result["schedule"]["delivery"].setdefault("strategy", "cheapest")
     # Deliberately omit menu/history/checkpoints/leases/attempts/generations.
     return result
 

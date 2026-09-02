@@ -1,0 +1,13 @@
+{
+  "captured_at": "2026-09-02",
+  "provider": "meny",
+  "source": "sanitized authenticated read-only E2E observation",
+  "slots": [
+    {
+      "aria_label": "fra 0 kr fra 0 kroner, 3. september klokka 07:00 til 08:00",
+      "delivery_date": "2026-09-03",
+      "selected": true,
+      "stable_provider_or_dom_id": null
+    }
+  ]
+}

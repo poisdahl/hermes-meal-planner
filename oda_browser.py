@@ -34,6 +34,184 @@ CANCELLATION_BROWSER_TIMEOUT = 105
 FINAL_CLICK_MARGIN = 15
 DEFAULT_BROWSER_ARGS = "--disable-quic"
 CANCELLATION_BROWSER_ARGS = "--disable-quic,--disable-http2,--blink-settings=imagesEnabled=false"
+ODA_CHECKOUT_AMOUNT_LABELS = {
+    "discounts": "Du sparer",
+    "discounted_subtotal": "Delsum",
+    "bags": "Leveringsemballasje",
+    "delivery_price": "Levering",
+    "other_fee": "Tillegg for mindre bestilling",
+    "provider_total": "Total inkl. MVA",
+}
+ODA_CHECKOUT_PRODUCT_LABEL = re.compile(r"(?:0|[1-9]\d{0,6}) varer")
+ODA_CHECKOUT_AMOUNT_KEYS = (
+    "product_subtotal",
+    "delivery_price",
+    "discounts",
+    "deposits",
+    "bags",
+    "other_fees",
+    "provider_total",
+)
+
+
+def oda_checkout_amount_minor(label: Any, amount_text: Any) -> int:
+    """Parse one exact fixture-backed Oda checkout label/value row."""
+
+    product_label = isinstance(label, str) and ODA_CHECKOUT_PRODUCT_LABEL.fullmatch(label) is not None
+    if (label not in ODA_CHECKOUT_AMOUNT_LABELS.values() and not product_label) or not isinstance(amount_text, str):
+        raise HouseholdError("Oda checkout amount row changed")
+    normalized = " ".join(unicodedata.normalize("NFC", amount_text).split())
+    match = re.fullmatch(
+        r"([−-])?(\d+(?:[ .]\d{3})*),(\d{2}) (?:kr|NOK)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise HouseholdError("Oda checkout amount row changed")
+    minor = int(match[2].replace(" ", "").replace(".", "")) * 100 + int(match[3])
+    signed = -minor if match[1] else minor
+    if (label == ODA_CHECKOUT_AMOUNT_LABELS["discounts"] and signed > 0) or (
+        label != ODA_CHECKOUT_AMOUNT_LABELS["discounts"] and signed < 0
+    ):
+        raise HouseholdError("Oda checkout amount row changed")
+    return signed
+
+
+def _oda_checkout_amounts_minor(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != set(ODA_CHECKOUT_AMOUNT_KEYS):
+        raise HouseholdError("Oda checkout amounts changed")
+    result: dict[str, Any] = {}
+    for key in ODA_CHECKOUT_AMOUNT_KEYS:
+        amount = value.get(key)
+        if key == "other_fees":
+            if amount is None:
+                result[key] = None
+                continue
+            expected_name = ODA_CHECKOUT_AMOUNT_LABELS["other_fee"]
+            if not isinstance(amount, Mapping) or set(amount) != {expected_name}:
+                raise HouseholdError("Oda checkout amounts changed")
+            amount = amount[expected_name]
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+                raise HouseholdError("Oda checkout amounts changed")
+            minor = round(float(amount) * 100)
+            if not math.isfinite(float(amount)) or not math.isclose(float(amount) * 100, minor, abs_tol=1e-7) or minor < 0:
+                raise HouseholdError("Oda checkout amounts changed")
+            result[key] = {expected_name: minor}
+            continue
+        if amount is None:
+            result[key] = None
+            continue
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            raise HouseholdError("Oda checkout amounts changed")
+        minor = round(float(amount) * 100)
+        if (
+            not math.isfinite(float(amount))
+            or not math.isclose(float(amount) * 100, minor, abs_tol=1e-7)
+            or (key == "discounts" and minor > 0)
+            or (key != "discounts" and minor < 0)
+        ):
+            raise HouseholdError("Oda checkout amounts changed")
+        result[key] = minor
+    return result
+
+
+def _oda_checkout_amount_script(
+    expected_total: int,
+    *,
+    expected_product_count: int,
+    expected_amounts: Mapping[str, Any] | None = None,
+    expected_url: str | None = None,
+) -> str:
+    """Build the shared read/final-click parser from the fixture-backed labels."""
+
+    click_mode = expected_amounts is not None or expected_url is not None
+    if click_mode and (expected_amounts is None or expected_url is None):
+        raise HouseholdError("Oda final checkout amount binding is incomplete")
+    if isinstance(expected_product_count, bool) or not isinstance(expected_product_count, int) or not 0 < expected_product_count <= 1_000_000:
+        raise HouseholdError("Oda checkout product count is invalid")
+    script = r"""
+(() => {
+ const amountLabels=AMOUNT_LABELS;
+ const productLabel=String(PRODUCT_COUNT)+' varer';
+ const knownLabels=[productLabel,...Object.values(amountLabels)];
+ const norm=v=>(v||'').normalize('NFC').replace(/\s+/g,' ').trim();
+ const visible=x=>{const style=getComputedStyle(x),box=x.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&box.width>0&&box.height>0};
+ const parseAmount=value=>{const match=norm(value).match(/^([−-])?(\d+(?:[ .]\d{3})*),(\d{2}) (?:kr|NOK)$/i);if(!match)return null;const minor=Number(match[2].replace(/[ .]/g,''))*100+Number(match[3]);return match[1]?-minor:minor;};
+ const labelNodes=label=>[...document.querySelectorAll('*')].filter(visible).filter(node=>norm(node.innerText||'')===label).filter(node=>![...node.children].some(child=>visible(child)&&norm(child.innerText||'')===label));
+ const rowState=label=>{
+   const labels=labelNodes(label);
+   const candidates=[...document.querySelectorAll('div')].filter(visible).filter(root=>{
+     const lines=(root.innerText||'').split(/\n+/).map(norm).filter(Boolean);
+     if(lines.length!==2||lines[0]!==label||parseAmount(lines[1])===null)return false;
+     const own=norm(root.innerText||'');
+     return ![...root.children].some(child=>visible(child)&&norm(child.innerText||'')===own);
+   });
+   if(labels.length===0&&candidates.length===0)return {state:'absent',value:null,root:null};
+   if(labels.length!==1||candidates.length!==1||!candidates[0].contains(labels[0]))return {state:'invalid',value:null,root:null};
+   const lines=(candidates[0].innerText||'').split(/\n+/).map(norm).filter(Boolean);
+   return {state:'value',value:parseAmount(lines[1]),root:candidates[0]};
+ };
+ const states={
+   product_subtotal:rowState(productLabel),
+   delivery_price:rowState(amountLabels.delivery_price),
+   discounts:rowState(amountLabels.discounts),
+   discounted_subtotal:rowState(amountLabels.discounted_subtotal),
+   bags:rowState(amountLabels.bags),
+   other_fee:rowState(amountLabels.other_fee),
+   provider_total:rowState(amountLabels.provider_total),
+ };
+ const required=[states.product_subtotal,states.discounted_subtotal,states.delivery_price,states.provider_total];
+ let summaryRoot=null;
+ if(required.every(row=>row.state==='value')){
+   summaryRoot=required[0].root;
+   while(summaryRoot&&!required.every(row=>summaryRoot.contains(row.root)))summaryRoot=summaryRoot.parentElement;
+ }
+ const knownRoots=Object.values(states).filter(row=>row.root).map(row=>row.root);
+ const contained=Boolean(summaryRoot)&&Object.values(states).every(row=>row.state!=='value'||summaryRoot.contains(row.root));
+ const currencyLine=line=>/(?:^|\s)(?:kr|NOK)$/i.test(line);
+ const unknownRows=summaryRoot?[...summaryRoot.querySelectorAll('*')].filter(visible).filter(root=>{
+   if(knownRoots.some(known=>known.contains(root)))return false;
+   const lines=(root.innerText||'').split(/\n+/).map(norm).filter(Boolean);
+   if(!lines.some(currencyLine)||knownLabels.includes(lines[0]))return false;
+   return ![...root.children].some(child=>visible(child)&&(child.innerText||'').split(/\n+/).map(norm).filter(Boolean).some(currencyLine));
+ }):['missing-summary-root'];
+ const amounts={
+   product_subtotal:states.product_subtotal.value,
+   delivery_price:states.delivery_price.value,
+   discounts:states.discounts.value,
+   deposits:null,
+   bags:states.bags.value,
+   other_fees:states.other_fee.state==='absent'?null:{[amountLabels.other_fee]:states.other_fee.value},
+   provider_total:states.provider_total.value,
+ };
+ const optionalValid=[states.discounts,states.bags,states.other_fee].every(row=>row.state!=='invalid');
+ const signsValid=required.every(row=>row.value>=0)&&[states.bags,states.other_fee].every(row=>row.state!=='value'||row.value>=0)&&(states.discounts.state!=='value'||states.discounts.value<=0);
+ const discountedValid=states.discounted_subtotal.value===states.product_subtotal.value+(states.discounts.value||0);
+ const totalValid=amounts.provider_total===amounts.product_subtotal+(amounts.discounts||0)+(amounts.delivery_price||0)+(amounts.bags||0)+(states.other_fee.value||0);
+ const amountsValid=required.every(row=>row.state==='value')&&optionalValid&&signsValid&&contained&&discountedValid&&totalValid&&unknownRows.length===0&&amounts.provider_total===TOTAL;
+ if(!CLICK_MODE)return JSON.stringify({amounts,amounts_valid:amountsValid});
+ const expectedAmounts=EXPECTED_AMOUNTS;
+ const money=value=>[...norm(value).matchAll(/\b(\d+(?:[ .]\d{3})*),(\d{2})\s*(?:kr|NOK)\b/gi)].map(match=>Number(match[1].replace(/[ .]/g,''))*100+Number(match[2]));
+ const labels=[...document.querySelectorAll('button')].filter(visible).filter(x=>!x.disabled&&x.getAttribute('aria-disabled')!=='true').filter(x=>/^(Bekreft og betal|Confirm and pay)\s+\d+(?:[ .]\d{3})*,\d{2}\s*(?:kr|NOK)$/i.test(norm(x.innerText||x.getAttribute('aria-label')||''))).filter(x=>{const values=money(x.innerText||x.getAttribute('aria-label')||'');return values.length===1&&values[0]===TOTAL;});
+ const ready=location.href===EXPECTED_URL&&labels.length===1&&amountsValid&&JSON.stringify(amounts)===JSON.stringify(expectedAmounts);
+ if(!ready)return JSON.stringify({clicked:false});
+ labels[0].click();return JSON.stringify({clicked:true});
+})()
+"""
+    return (
+        script.replace(
+            "AMOUNT_LABELS",
+            json.dumps(ODA_CHECKOUT_AMOUNT_LABELS, ensure_ascii=False, separators=(",", ":")),
+        )
+        .replace("TOTAL", json.dumps(expected_total))
+        .replace("PRODUCT_COUNT", json.dumps(expected_product_count))
+        .replace("CLICK_MODE", "true" if click_mode else "false")
+        .replace(
+            "EXPECTED_AMOUNTS",
+            json.dumps(expected_amounts, ensure_ascii=False, separators=(",", ":")),
+        )
+        .replace("EXPECTED_URL", json.dumps(expected_url))
+    )
 
 
 def identity_tokens(value: str) -> tuple[str, ...]:
@@ -223,6 +401,7 @@ class OdaBrowser:
             self._settle(0.25)
         else:
             raise HouseholdError("Oda checkout items did not finish rendering")
+        self._expand_checkout_amount_summary()
         script = r"""
 (() => {
  const expected=EXPECTED;
@@ -255,9 +434,55 @@ class OdaBrowser:
         result["delivery_matches"] = checkout_delivery_matches(expected["delivery_text"], result.pop("delivery_roots"))
         if not all(result[key] is True for key in ("authenticated", "available", "line_matches", "total_matches", "delivery_matches", "address_matches", "masked_payment")) or result["submit_controls"] != 1:
             raise OdaCheckoutMismatchError("Oda checkout does not match the reviewed cart")
+        result["amounts"] = self._read_checkout_amounts(
+            expected["total_minor"], expected["product_count"],
+        )
         if re.fullmatch(r"•••• \d{4}", str(result.get("payment_display") or "")) is None:
             raise HouseholdError("Oda checkout payment identity is unavailable")
         return result
+
+    def _expand_checkout_amount_summary(self) -> None:
+        amounts_expanded = self._eval(r"""
+(() => {
+ const norm=v=>(v||'').normalize('NFC').replace(/\s+/g,' ').trim();
+ const visible=x=>{const style=getComputedStyle(x),box=x.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&box.width>0&&box.height>0};
+ const buttons=[...document.querySelectorAll('button')].filter(visible).filter(x=>!x.disabled&&x.getAttribute('aria-disabled')!=='true');
+ const show=buttons.filter(x=>norm(x.innerText||x.getAttribute('aria-label')||'')==='Vis oppsummering');
+ const hide=buttons.filter(x=>norm(x.innerText||x.getAttribute('aria-label')||'')==='Skjul oppsummering');
+ if(show.length===1&&hide.length===0){show[0].click();return JSON.stringify({expanded:true});}
+ return JSON.stringify({expanded:show.length===0&&hide.length===1});
+})()
+""")
+        if amounts_expanded != {"expanded": True}:
+            raise HouseholdError("Oda checkout amount summary changed")
+        self._settle(0.25)
+
+    def _read_checkout_amounts(self, expected_total: int, expected_product_count: int) -> dict[str, Any]:
+        amount_result = self._eval(_oda_checkout_amount_script(
+            expected_total, expected_product_count=expected_product_count,
+        ))
+        if not isinstance(amount_result, Mapping) or set(amount_result) != {"amounts", "amounts_valid"} or amount_result["amounts_valid"] is not True:
+            raise OdaCheckoutMismatchError("Oda checkout amount summary changed")
+        raw_amounts = amount_result["amounts"]
+        if not isinstance(raw_amounts, Mapping) or set(raw_amounts) != set(ODA_CHECKOUT_AMOUNT_KEYS):
+            raise HouseholdError("Oda checkout amounts changed")
+        amounts: dict[str, Any] = {}
+        for key in ODA_CHECKOUT_AMOUNT_KEYS:
+            value = raw_amounts[key]
+            if key == "other_fees" and isinstance(value, Mapping):
+                amounts[key] = {str(name): minor / 100 for name, minor in value.items() if type(minor) is int}
+                if len(amounts[key]) != len(value):
+                    raise HouseholdError("Oda checkout amounts changed")
+            elif value is None:
+                amounts[key] = None
+            elif type(value) is int:
+                amounts[key] = value / 100
+            else:
+                raise HouseholdError("Oda checkout amounts changed")
+        normalized_minor = _oda_checkout_amounts_minor(amounts)
+        if normalized_minor["provider_total"] != expected_total:
+            raise HouseholdError("Oda checkout amounts changed")
+        return amounts
 
     def _navigate_to_checkout(self, order_id: str | None = None) -> None:
         for attempt in range(3):
@@ -461,12 +686,19 @@ class OdaBrowser:
                 raise CheckoutPreconditionError(str(exc)) from exc
             if current != dict(review):
                 raise CheckoutPreconditionError("Oda order change changed after confirmation")
-            expected_total = self._cart_expectation(cart)["total_minor"]
-            self._click_checkout_submit(expected_total, f"{CHECKOUT_URL}?orderNumber={order_id}", before_click)
+            expected_cart = self._cart_expectation(cart)
+            self._click_checkout_submit(
+                expected_cart["total_minor"],
+                f"{CHECKOUT_URL}?orderNumber={order_id}",
+                before_click,
+                expected_product_count=expected_cart["product_count"],
+                expected_amounts=review.get("amounts"),
+            )
 
     def review_delivery_change(self, order_id: str, order: Mapping[str, Any], delivery: Mapping[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         with self._checkout_operation(deadline):
             expected_order = self._order_expectation(order_id, order)
+            expected_product_count = self._order_product_count(order)
             target = str(delivery.get("display") or "")
             signature = delivery_signature(target)
             if signature is None:
@@ -524,12 +756,17 @@ class OdaBrowser:
                     payment_display = str(surface.get("payment_display") or "")
                     if not isinstance(amounts, list) or len(amounts) != 1 or not checkout_delivery_matches(target, roots) or re.fullmatch(r"•••• \d{4}", payment_display) is None or surface.get("submit_controls") != 1:
                         raise HouseholdError("Oda delivery change review does not match the requested slot")
+                    self._expand_checkout_amount_summary()
+                    checkout_amounts = self._read_checkout_amounts(
+                        amounts[0], expected_product_count,
+                    )
                     summary = {
                         "items": [],
                         "count": 0,
                         "total": amounts[0] / 100,
                         "delivery": {"slot_id": delivery.get("slot_id"), "display": target},
                         "payment": payment_display,
+                        "amounts": checkout_amounts,
                     }
                     return {"page_digest": hashlib.sha256(json.dumps(summary, ensure_ascii=False, sort_keys=True).encode()).hexdigest(), "summary": summary, "target_order_id": order_id, "before_delivery": expected_order["delivery_text"]}
                 if action == "slot":
@@ -558,6 +795,8 @@ class OdaBrowser:
                 int(round(float(review["summary"]["total"]) * 100)),
                 f"{CHECKOUT_URL}?orderNumber={order_id}",
                 before_click,
+                expected_product_count=self._order_product_count(order),
+                expected_amounts=review["summary"].get("amounts"),
             )
 
     def _submit_checkout(self, cart: Mapping[str, Any], review: Mapping[str, Any], before_click: Callable[[], None] | None = None) -> None:
@@ -567,14 +806,28 @@ class OdaBrowser:
             raise CheckoutPreconditionError(str(exc)) from exc
         if current != dict(review):
             raise CheckoutPreconditionError("Oda checkout changed after confirmation")
-        expected_total = self._cart_expectation(cart)["total_minor"]
+        expected_cart = self._cart_expectation(cart)
         try:
             self._require_checkout_time(FINAL_CLICK_MARGIN)
         except HouseholdError as exc:
             raise CheckoutPreconditionError(str(exc)) from exc
-        self._click_checkout_submit(expected_total, CHECKOUT_URL, before_click)
+        self._click_checkout_submit(
+            expected_cart["total_minor"],
+            CHECKOUT_URL,
+            before_click,
+            expected_product_count=expected_cart["product_count"],
+            expected_amounts=review.get("amounts"),
+        )
 
-    def _click_checkout_submit(self, expected_total: int, expected_url: str, before_click: Callable[[], None] | None = None) -> None:
+    def _click_checkout_submit(
+        self,
+        expected_total: int,
+        expected_url: str,
+        before_click: Callable[[], None] | None = None,
+        *,
+        expected_product_count: int,
+        expected_amounts: Any,
+    ) -> None:
         try:
             self._require_checkout_time(FINAL_CLICK_MARGIN)
         except HouseholdError as exc:
@@ -588,16 +841,16 @@ class OdaBrowser:
             self._require_checkout_time(FINAL_CLICK_MARGIN)
         except HouseholdError as exc:
             raise CheckoutPreconditionError(str(exc)) from exc
-        script = r"""
-(() => {
- const norm=v=>(v||'').normalize('NFC').replace(/\s+/g,' ').trim();
- const visible=x=>{const style=getComputedStyle(x),box=x.getBoundingClientRect();return style.display!=='none'&&style.visibility!=='hidden'&&box.width>0&&box.height>0};
- const money=value=>[...norm(value).matchAll(/\b(\d+(?:[ .]\d{3})*),(\d{2})\s*(?:kr|NOK)\b/gi)].map(match=>Number(match[1].replace(/[ .]/g,''))*100+Number(match[2]));
- const labels=[...document.querySelectorAll('button')].filter(visible).filter(x=>!x.disabled&&x.getAttribute('aria-disabled')!=='true').filter(x=>/^(Bekreft og betal|Confirm and pay)\s+\d+(?:[ .]\d{3})*,\d{2}\s*(?:kr|NOK)$/i.test(norm(x.innerText||x.getAttribute('aria-label')||''))).filter(x=>{const amounts=money(x.innerText||x.getAttribute('aria-label')||'');return amounts.length===1&&amounts[0]===TOTAL;});
- if(location.href!==URL||labels.length!==1)return JSON.stringify({clicked:false});
- labels[0].click(); return JSON.stringify({clicked:true});
-})()
-""".replace("URL", json.dumps(expected_url)).replace("TOTAL", json.dumps(expected_total))
+        try:
+            amounts_minor = _oda_checkout_amounts_minor(expected_amounts)
+        except HouseholdError as exc:
+            raise CheckoutPreconditionError(str(exc)) from exc
+        script = _oda_checkout_amount_script(
+            expected_total,
+            expected_product_count=expected_product_count,
+            expected_amounts=amounts_minor,
+            expected_url=expected_url,
+        )
         if self._eval(script) != {"clicked": True}:
             raise CheckoutPreconditionError("Oda checkout button changed before click")
 
@@ -873,6 +1126,19 @@ class OdaBrowser:
         return {"order_id": order_id, "total_text": total_text, "total_minor": total_minor, "delivery_text": delivery}
 
     @staticmethod
+    def _order_product_count(order: Mapping[str, Any]) -> int:
+        count = order.get("productQuantityCount")
+        if (
+            isinstance(count, bool)
+            or not isinstance(count, (int, float))
+            or not math.isfinite(float(count))
+            or not float(count).is_integer()
+            or not 0 < int(count) <= 1_000_000
+        ):
+            raise HouseholdError("Oda order product count is unavailable")
+        return int(count)
+
+    @staticmethod
     def _cart_expectation(cart: Mapping[str, Any]) -> dict[str, Any]:
         summary = cart_summary(cart)
         if not summary["items"]:
@@ -907,12 +1173,23 @@ class OdaBrowser:
             if not identity:
                 raise HouseholdError("cart line identity is unavailable")
             lines.append({"name": name, "identity": identity, "quantity": quantity})
+        product_count = sum(line["quantity"] for line in lines)
+        provider_count = summary.get("count")
+        if (
+            isinstance(provider_count, bool)
+            or not isinstance(provider_count, (int, float))
+            or not math.isfinite(float(provider_count))
+            or not float(provider_count).is_integer()
+            or int(provider_count) != product_count
+        ):
+            raise HouseholdError("Oda cart product count changed")
         delivery = summary.get("delivery") or {}
         address = delivery.get("address")
         if not isinstance(address, str) or not address.strip():
             raise HouseholdError("Oda checkout delivery address is unavailable")
         return {
             "lines": lines,
+            "product_count": product_count,
             "total_text": f"{summary['total']:.2f}".replace(".", ","),
             "total_minor": int(round(summary["total"] * 100)),
             "delivery_text": str(delivery.get("display") or ""),

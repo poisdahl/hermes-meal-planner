@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 import fcntl
 import hashlib
 import json
@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import secrets
 from typing import Any, Callable, Iterator, Mapping
+from zoneinfo import ZoneInfo
 
 
 class HouseholdError(RuntimeError):
@@ -101,7 +102,12 @@ DEFAULT_SCHEDULE: dict[str, Any] = {
     "time": "15:00",
     "timezone": "Europe/Oslo",
     "mode": "draft",
-    "delivery": {"weekday": "Saturday", "preferred_end": "15:00", "latest_end": "18:00"},
+    "delivery": {
+        "weekday": "Saturday",
+        "preferred_end": "15:00",
+        "latest_end": "18:00",
+        "strategy": "cheapest",
+    },
     "maximum_total": None,
     "auto_checkout": False,
     "cron_job_id": None,
@@ -119,7 +125,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 6,
+        "version": 7,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -136,6 +142,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
             "noninteractive_defaults_applied_at": None,
         },
         "pending_checkout": None,
+        "delivery_selection": None,
         "pending_cancellation": None,
         "order_change": None,
         "email_jobs": [],
@@ -283,18 +290,176 @@ def _validate_product_items(value: Any, field: str) -> None:
             raise HouseholdError(f"household {field} item requires a product name and positive integer quantity")
 
 
+DELIVERY_SLOT_KEYS = {
+    "slot_ref", "provider_slot_id", "start_at", "end_at",
+    "price_ore", "price_kind", "selected",
+}
+RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?"
+    r"(?:Z|[+-](?:(?:0\d|1[0-3]):[0-5]\d|14:00))$"
+)
+
+
+def validate_delivery_slot(value: Any) -> dict[str, Any]:
+    """Return one exact, bounded provider-neutral delivery slot."""
+
+    if not isinstance(value, Mapping) or set(value) != DELIVERY_SLOT_KEYS:
+        raise HouseholdError("delivery slot does not match the normalized contract")
+    slot = dict(value)
+    reference = slot.get("slot_ref")
+    if not isinstance(reference, str) or not reference or len(reference.encode("utf-8")) > 500:
+        raise HouseholdError("delivery slot reference is invalid")
+    provider_id = slot.get("provider_slot_id")
+    if provider_id is not None and (
+        isinstance(provider_id, bool)
+        or not isinstance(provider_id, (str, int))
+        or len(str(provider_id).encode("utf-8")) > 500
+    ):
+        raise HouseholdError("delivery provider slot id is invalid")
+    timestamps = []
+    for field in ("start_at", "end_at"):
+        raw = slot.get(field)
+        if (
+            not isinstance(raw, str)
+            or len(raw) > 64
+            or RFC3339_TIMESTAMP.fullmatch(raw) is None
+        ):
+            raise HouseholdError("delivery slot timestamp is invalid")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HouseholdError("delivery slot timestamp is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise HouseholdError("delivery slot timestamp must include an offset")
+        timestamps.append(parsed)
+    if timestamps[1] <= timestamps[0]:
+        raise HouseholdError("delivery slot must end after it starts")
+    kind = slot.get("price_kind")
+    price = slot.get("price_ore")
+    if kind not in {"exact", "from", "unavailable"}:
+        raise HouseholdError("delivery slot price kind is invalid")
+    if kind == "unavailable":
+        if price is not None:
+            raise HouseholdError("unavailable delivery price must be null")
+    elif isinstance(price, bool) or not isinstance(price, int) or price < 0:
+        raise HouseholdError("delivery slot price must be non-negative integer ore")
+    if not isinstance(slot.get("selected"), bool):
+        raise HouseholdError("delivery slot selected state is invalid")
+    return slot
+
+
+def oslo_local_timestamp(day: date, clock: str) -> str:
+    """Create an unambiguous Europe/Oslo RFC3339 timestamp."""
+
+    if not isinstance(clock, str) or re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", clock) is None:
+        raise HouseholdError("delivery slot local time is invalid")
+    hour, minute = (int(part) for part in clock.split(":"))
+    naive = datetime(day.year, day.month, day.day, hour, minute)
+    zone = ZoneInfo("Europe/Oslo")
+    candidates = []
+    for fold in (0, 1):
+        candidate = naive.replace(tzinfo=zone, fold=fold)
+        if candidate.astimezone(ZoneInfo("UTC")).astimezone(zone).replace(tzinfo=None) == naive:
+            candidates.append(candidate)
+    offsets = {candidate.utcoffset() for candidate in candidates}
+    if len(offsets) != 1:
+        raise HouseholdError("delivery slot local time is impossible or ambiguous")
+    return candidates[0].isoformat()
+
+
+def delivery_price_display(slot: Mapping[str, Any]) -> str:
+    normalized = validate_delivery_slot(slot)
+    if normalized["price_kind"] == "unavailable":
+        return "pris ikke tilgjengelig"
+    amount = normalized["price_ore"]
+    whole, remainder = divmod(amount, 100)
+    rendered = f"{whole} kr" if remainder == 0 else f"{whole},{remainder:02d} kr"
+    return f"fra {rendered}" if normalized["price_kind"] == "from" else rendered
+
+
+def delivery_candidate_digest(slots: list[Mapping[str, Any]]) -> str:
+    normalized = [validate_delivery_slot(slot) for slot in slots]
+    if len({slot["slot_ref"] for slot in normalized}) != len(normalized):
+        raise HouseholdError("delivery slot references are not unique")
+    candidates = sorted(
+        ({**slot, "selected": False} for slot in normalized),
+        key=lambda slot: slot["slot_ref"].encode("utf-8"),
+    )
+    encoded = json.dumps(candidates, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def cheapest_delivery_slot(
+    slots: list[Mapping[str, Any]],
+    *,
+    preferred_end: str | None,
+    timezone_name: str = "Europe/Oslo",
+) -> dict[str, Any]:
+    normalized = [validate_delivery_slot(slot) for slot in slots]
+    if not normalized:
+        raise HouseholdError("no eligible delivery slots are available")
+    if any(slot["price_kind"] != "exact" for slot in normalized):
+        raise HouseholdError("eligible delivery prices are not all exact")
+    preferred_minutes = None
+    if preferred_end is not None:
+        if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", preferred_end) is None:
+            raise HouseholdError("preferred delivery end is invalid")
+        preferred_minutes = int(preferred_end[:2]) * 60 + int(preferred_end[3:])
+
+    zone = ZoneInfo(timezone_name)
+
+    def rank(slot: Mapping[str, Any]) -> tuple[Any, ...]:
+        end = datetime.fromisoformat(str(slot["end_at"]).replace("Z", "+00:00")).astimezone(zone)
+        start = datetime.fromisoformat(str(slot["start_at"]).replace("Z", "+00:00")).astimezone(zone)
+        end_minutes = end.hour * 60 + end.minute
+        distance = abs(end_minutes - preferred_minutes) if preferred_minutes is not None else 0
+        return (slot["price_ore"], distance, start, slot["slot_ref"].encode("utf-8"))
+
+    return deepcopy(min(normalized, key=rank))
+
+
+def _validate_delivery_selection(value: Any) -> None:
+    if value is None:
+        return
+    required = {"provider", "scope", "origin", "slot", "candidate_digest", "observed_at"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise HouseholdError("household delivery selection observation is invalid")
+    if value.get("provider") not in {"oda", "meny"} or value.get("origin") not in {"explicit", "cheapest"}:
+        raise HouseholdError("household delivery selection observation is invalid")
+    scope = value.get("scope")
+    if not isinstance(scope, Mapping) or set(scope) != {"cart_id", "order_id", "occurrence"}:
+        raise HouseholdError("household delivery selection scope is invalid")
+    for identity in scope.values():
+        if identity is not None and (not isinstance(identity, str) or not identity or len(identity) > 128):
+            raise HouseholdError("household delivery selection scope is invalid")
+    validate_delivery_slot(value.get("slot"))
+    digest = value.get("candidate_digest")
+    if digest is not None and (not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None):
+        raise HouseholdError("household delivery candidate digest is invalid")
+    observed = value.get("observed_at")
+    if not isinstance(observed, str) or len(observed) > 64:
+        raise HouseholdError("household delivery selection timestamp is invalid")
+    try:
+        parsed = datetime.fromisoformat(observed.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HouseholdError("household delivery selection timestamp is invalid") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HouseholdError("household delivery selection timestamp is invalid")
+
+
 def _migrate_state(
     state: dict[str, Any],
     config: Mapping[str, Any],
     before_v6: Callable[[Mapping[str, Any]], None] | None = None,
+    before_v7: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 6:
+    if version > 7:
         raise HouseholdError("household state is newer than this meal planner")
-    if version == 6 and "favorites" in state:
-        raise HouseholdError("household v6 state contains the retired favorites key")
+    if version >= 6 and "favorites" in state:
+        raise HouseholdError("household state contains the retired favorites key")
     if version == 1:
         profile = state.get("profile")
         if not isinstance(profile, dict):
@@ -397,6 +562,27 @@ def _migrate_state(
         state["product_favorites"] = deepcopy(old_items)
         del state["favorites"]
         state["version"] = 6
+    if state["version"] == 6:
+        if version < 6 and "schedule" not in state:
+            state["schedule"] = deepcopy(DEFAULT_SCHEDULE)
+        schedule = state.get("schedule")
+        if version < 6 and isinstance(schedule, dict) and "delivery" not in schedule:
+            schedule["delivery"] = deepcopy(DEFAULT_SCHEDULE["delivery"])
+        delivery = schedule.get("delivery") if isinstance(schedule, Mapping) else None
+        if not isinstance(delivery, dict):
+            raise HouseholdError("household v6 delivery preference is invalid")
+        if version < 6:
+            delivery.pop("strategy", None)
+            state.pop("delivery_selection", None)
+        if "strategy" in delivery and delivery.get("strategy") != "keep_selected":
+            raise HouseholdError("household v6 delivery strategy conflicts with the migration")
+        if state.get("delivery_selection") is not None:
+            raise HouseholdError("household v6 delivery selection conflicts with the migration")
+        if before_v7 is not None:
+            before_v7(state)
+        delivery["strategy"] = "keep_selected"
+        state["delivery_selection"] = None
+        state["version"] = 7
     _validate_product_items(state.get("product_favorites"), "product_favorites")
     state.setdefault("recipe_usage", {})
     state.setdefault("recipe_usage_requests", {})
@@ -406,6 +592,7 @@ def _migrate_state(
     state.setdefault("protected_results", {})
     state.setdefault("protected_requests", {})
     state.setdefault("cart_plan", None)
+    state.setdefault("delivery_selection", None)
     state.setdefault("setup", {
         "version": 1,
         "status": "needs_review",
@@ -464,6 +651,15 @@ def _migrate_state(
         for provider in state["order_snapshot_providers"].values()
     ):
         raise HouseholdError("household order snapshot providers are invalid")
+    schedule = state.get("schedule")
+    delivery = schedule.get("delivery") if isinstance(schedule, Mapping) else None
+    if (
+        not isinstance(delivery, Mapping)
+        or not set(delivery).issubset({"weekday", "preferred_end", "latest_end", "strategy"})
+        or delivery.get("strategy") not in {"keep_selected", "cheapest"}
+    ):
+        raise HouseholdError("household delivery preference is invalid")
+    _validate_delivery_selection(state.get("delivery_selection"))
     cart_plan = state.get("cart_plan")
     if cart_plan is not None:
         if not isinstance(cart_plan, dict) or cart_plan.get("provider") not in {"oda", "meny"}:
@@ -524,7 +720,14 @@ class StateStore:
                 if not backup.exists():
                     _atomic_json(backup, value)
 
-            _migrate_state(state, self.config, before_v6=backup_v5)
+            def backup_v6(value: Mapping[str, Any]) -> None:
+                if source_version != 6:
+                    return
+                backup = self.directory / "state-v6.backup.json"
+                if not backup.exists():
+                    _atomic_json(backup, value)
+
+            _migrate_state(state, self.config, before_v6=backup_v5, before_v7=backup_v6)
             state_household = state.get("household")
             configured_household = str(self.config["household"])
             if state_household is None:
@@ -666,6 +869,7 @@ def due_recurring(item: Mapping[str, Any], when: date) -> bool:
 
 def masked_status(state: Mapping[str, Any], integration: Mapping[str, Any]) -> dict[str, Any]:
     return {
+        "state_version": state["version"],
         "household": state["household"],
         "integration": dict(integration),
         "auto_checkout": state["schedule"]["auto_checkout"],
@@ -740,9 +944,70 @@ def cart_summary(cart: Mapping[str, Any]) -> dict[str, Any]:
         }
     else:
         delivery = None
-    return {
+    result = {
         "items": lines,
         "count": cart.get("productQuantityCount", cart.get("count")),
         "total": numeric_total,
         "delivery": delivery,
     }
+    raw_amounts = cart.get("amounts")
+    if raw_amounts is not None:
+        amount_keys = {
+            "product_subtotal", "delivery_price", "discounts",
+            "deposits", "bags", "other_fees", "provider_total",
+        }
+        if not isinstance(raw_amounts, Mapping) or set(raw_amounts) != amount_keys:
+            raise HouseholdError("provider checkout amounts are invalid")
+        amounts: dict[str, Any] = {}
+        for key in amount_keys:
+            amount = raw_amounts.get(key)
+            if key == "other_fees":
+                if amount is None:
+                    amounts[key] = None
+                    continue
+                if not isinstance(amount, Mapping):
+                    raise HouseholdError("provider checkout amounts are invalid")
+                if not amount or len(amount) > 20:
+                    raise HouseholdError("provider checkout amounts are invalid")
+                named_fees: dict[str, float] = {}
+                for name, value in amount.items():
+                    if (
+                        not isinstance(name, str)
+                        or not name.strip()
+                        or len(name.encode("utf-8")) > 200
+                        or isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or float(value) < 0
+                    ):
+                        raise HouseholdError("provider checkout amounts are invalid")
+                    normalized_name = " ".join(name.split())
+                    if normalized_name in named_fees:
+                        raise HouseholdError("provider checkout amounts are invalid")
+                    named_fees[normalized_name] = float(value)
+                amounts[key] = named_fees
+            elif amount is None:
+                amounts[key] = None
+            elif isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(float(amount)):
+                raise HouseholdError("provider checkout amounts are invalid")
+            else:
+                numeric_amount = float(amount)
+                if (key == "discounts" and numeric_amount > 0) or (
+                    key != "discounts" and numeric_amount < 0
+                ):
+                    raise HouseholdError("provider checkout amounts are invalid")
+                amounts[key] = numeric_amount
+        if amounts["provider_total"] != numeric_total:
+            raise HouseholdError("provider checkout total is inconsistent")
+        result["amounts"] = amounts
+    elif "totalGrossAmount" in cart:
+        result["amounts"] = {
+            "product_subtotal": None,
+            "delivery_price": None,
+            "discounts": None,
+            "deposits": None,
+            "bags": None,
+            "other_fees": None,
+            "provider_total": numeric_total,
+        }
+    return result

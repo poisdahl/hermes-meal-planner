@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime
 import hashlib
 import http.client
 import json
@@ -18,8 +18,17 @@ import threading
 import time
 from typing import Any, Mapping
 from urllib.parse import quote, urlencode, urlparse
+from zoneinfo import ZoneInfo
 
-from core import CancellationPreconditionError, CheckoutPreconditionError, HouseholdError, cart_summary
+from core import (
+    CancellationPreconditionError,
+    CheckoutPreconditionError,
+    HouseholdError,
+    cart_summary,
+    delivery_price_display,
+    oslo_local_timestamp,
+    validate_delivery_slot,
+)
 
 
 class MenyOrderChangeDispatchError(HouseholdError):
@@ -37,12 +46,15 @@ ORDERS_URL = f"{BASE_URL}/trumf-profil/nettbutikk#/bestillinger"
 ORDER_PATH = re.compile(r"/(?:trumf-)?profil/nettbutikk/bestilling/(\d{1,20})")
 PRODUCT_PATH = re.compile(r"/varer/(?!kampanjer/)[A-Za-z0-9._~%/-]+-\d{4,14}")
 DELIVERY_SLOT = re.compile(
-    r"^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+"
-    r"fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kroner,\s*)?"
+    r"^(?:(?P<price_prefix>[^,\r\n]{1,200}),\s*)?"
     r"(?P<day>0?[1-9]|[12]\d|3[01])\.\s*"
     r"(?P<month>januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+"
     r"klokka\s+(?P<start_hour>[01]?\d|2[0-3]):(?P<start_minute>[0-5]\d)\s+"
     r"til\s+(?P<end_hour>[01]?\d|2[0-3]):(?P<end_minute>[0-5]\d)$",
+    re.IGNORECASE,
+)
+MENY_FROM_PRICE = re.compile(
+    r"^fra\s+(?P<from_kr>\d+)\s+kr\s+fra\s+(?P<from_words>\d+)\s+kroner$",
     re.IGNORECASE,
 )
 MENY_DELIVERY_WINDOW = re.compile(
@@ -185,46 +197,125 @@ def meny_selected_delivery(value: Any) -> dict[str, Any] | None:
         return None
     if len(selected) != 1:
         raise HouseholdError("MENY selected delivery slot is ambiguous")
-    slot = selected[0]
-    slot_id = str(slot.get("slot_id") or "").strip()
-    match = DELIVERY_SLOT.fullmatch(slot_id)
+    slot = validate_delivery_slot(selected[0])
     try:
-        slot_date = date.fromisoformat(str(slot.get("date") or ""))
+        start_at = datetime.fromisoformat(slot["start_at"])
+        end_at = datetime.fromisoformat(slot["end_at"])
     except ValueError as exc:
         raise HouseholdError("MENY selected delivery slot is invalid") from exc
-    start = str(slot.get("start") or "")
-    end = str(slot.get("end") or "")
-    month = match["month"].casefold() if match is not None else ""
-    if (
-        match is None
-        or slot_date.day != int(match["day"])
-        or slot_date.month != MENY_MONTH_NUMBERS.get(month[:3])
-        or start != f"{int(match['start_hour']):02d}:{match['start_minute']}"
-        or end != f"{int(match['end_hour']):02d}:{match['end_minute']}"
-        or start >= end
-    ):
-        raise HouseholdError("MENY selected delivery slot is invalid")
+    slot_date = start_at.date()
+    start = start_at.strftime("%H:%M")
+    end = end_at.strftime("%H:%M")
     display = (
         f"{MENY_WEEKDAY_NAMES[slot_date.weekday()]} {slot_date.day}. "
         f"{MENY_MONTH_NAMES[slot_date.month - 1]} kl. {start}-{end}"
     )
     meny_delivery_window_identity(display)
-    return {"slot_id": slot_id, "display": display}
+    return {**slot, "display": display}
 
 
 def normalize_delivery_slot_ref(value: Any) -> tuple[str, str]:
-    slot_id = str(value or "").strip()
-    if not slot_id or len(slot_id) > 500:
-        raise HouseholdError("MENY delivery slot_id is required")
-    match = DELIVERY_SLOT.fullmatch(slot_id)
-    if match is None:
-        raise HouseholdError("MENY delivery slot_id is invalid; use the exact value returned by delivery list")
-    suffix = (
-        f"{int(match['day'])}. {match['month'].casefold()} klokka "
-        f"{int(match['start_hour']):02d}:{match['start_minute']} til "
-        f"{int(match['end_hour']):02d}:{match['end_minute']}"
+    slot_ref = str(value or "").strip()
+    if not slot_ref or len(slot_ref) > 500:
+        raise HouseholdError("MENY delivery slot_ref is required")
+    match = re.fullmatch(
+        r"meny:(?P<date>\d{4}-\d{2}-\d{2})T(?P<start>(?:[01]\d|2[0-3]):[0-5]\d)/(?P<end>(?:[01]\d|2[0-3]):[0-5]\d)",
+        slot_ref,
     )
-    return slot_id, suffix
+    if match is None:
+        raise HouseholdError("MENY delivery slot_ref is invalid; use the exact value returned by delivery list")
+    try:
+        slot_date = date.fromisoformat(match["date"])
+    except ValueError as exc:
+        raise HouseholdError("MENY delivery slot_ref is invalid; use the exact value returned by delivery list") from exc
+    if match["start"] >= match["end"]:
+        raise HouseholdError("MENY delivery slot_ref is invalid; use the exact value returned by delivery list")
+    suffix = (
+        f"{slot_date.day}. {MENY_MONTH_NAMES[slot_date.month - 1]} klokka "
+        f"{match['start']} til {match['end']}"
+    )
+    return slot_ref, suffix
+
+
+def meny_label_slot_ref(value: Any, *, today: date | None = None) -> tuple[str, str]:
+    """Derive the semantic reference for one supported live MENY label."""
+
+    label = " ".join(str(value or "").split())
+    match = DELIVERY_SLOT.fullmatch(label)
+    if match is None:
+        raise HouseholdError("MENY delivery slot changed")
+    current = today or datetime.now(ZoneInfo("Europe/Oslo")).date()
+    month = MENY_MONTH_NUMBERS[match["month"].casefold()[:3]]
+    year = current.year + (1 if (month, int(match["day"])) < (current.month, current.day) else 0)
+    try:
+        slot_date = date(year, month, int(match["day"]))
+    except ValueError as exc:
+        raise HouseholdError("MENY delivery slot changed") from exc
+    start = f"{int(match['start_hour']):02d}:{match['start_minute']}"
+    end = f"{int(match['end_hour']):02d}:{match['end_minute']}"
+    return normalize_delivery_slot_ref(f"meny:{slot_date.isoformat()}T{start}/{end}")
+
+
+def normalize_meny_delivery_slot(value: Any) -> dict[str, Any]:
+    """Normalize the fixture-backed MENY ARIA slot shape."""
+
+    required = {"slot_id", "date", "start", "end", "display", "selected"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise HouseholdError("MENY delivery slot changed")
+    label = value.get("display")
+    if not isinstance(label, str) or label != value.get("slot_id") or len(label.encode("utf-8")) > 500:
+        raise HouseholdError("MENY delivery slot changed")
+    match = DELIVERY_SLOT.fullmatch(" ".join(label.split()))
+    if match is None:
+        raise HouseholdError("MENY delivery slot changed")
+    try:
+        slot_date = date.fromisoformat(str(value.get("date") or ""))
+    except ValueError as exc:
+        raise HouseholdError("MENY delivery slot changed") from exc
+    start = str(value.get("start") or "")
+    end = str(value.get("end") or "")
+    if (
+        slot_date.day != int(match["day"])
+        or slot_date.month != MENY_MONTH_NUMBERS.get(match["month"].casefold()[:3])
+        or start != f"{int(match['start_hour']):02d}:{match['start_minute']}"
+        or end != f"{int(match['end_hour']):02d}:{match['end_minute']}"
+        or start >= end
+        or not isinstance(value.get("selected"), bool)
+    ):
+        raise HouseholdError("MENY delivery slot changed")
+    price = MENY_FROM_PRICE.fullmatch(str(match["price_prefix"] or ""))
+    price_kind = "from" if price is not None and price["from_kr"] == price["from_words"] else "unavailable"
+    price_ore = int(price["from_kr"]) * 100 if price_kind == "from" else None
+    return validate_delivery_slot({
+        "slot_ref": f"meny:{slot_date.isoformat()}T{start}/{end}",
+        "provider_slot_id": None,
+        "start_at": oslo_local_timestamp(slot_date, start),
+        "end_at": oslo_local_timestamp(slot_date, end),
+        "price_ore": price_ore,
+        "price_kind": price_kind,
+        "selected": value["selected"],
+    })
+
+
+def normalized_selected_meny_slot(slot_ref: str, label: Any) -> dict[str, Any]:
+    normalized_ref, _suffix = normalize_delivery_slot_ref(slot_ref)
+    match = re.fullmatch(
+        r"meny:(?P<date>\d{4}-\d{2}-\d{2})T(?P<start>\d{2}:\d{2})/(?P<end>\d{2}:\d{2})",
+        normalized_ref,
+    )
+    assert match is not None
+    display = " ".join(str(label or "").split())
+    slot = normalize_meny_delivery_slot({
+        "slot_id": display,
+        "date": match["date"],
+        "start": match["start"],
+        "end": match["end"],
+        "display": display,
+        "selected": True,
+    })
+    if slot["slot_ref"] != normalized_ref:
+        raise HouseholdError("MENY selected delivery could not be verified")
+    return slot
 
 
 def _vipps_dispatch_requests(value: Any) -> list[Mapping[str, Any]]:
@@ -492,7 +583,13 @@ def normalize_cart_snapshot(value: Any) -> dict[str, Any]:
         except HouseholdError as exc:
             raise HouseholdError("MENY cart delivery is invalid") from exc
         normalized_delivery = {"slot_id": None, "display": display}
-    return {"items": normalized, "count": count, "total": float(total), "delivery": normalized_delivery}
+    return {
+        "items": normalized,
+        "count": count,
+        "product_subtotal": 0.0 if empty else float(subtotal),
+        "total": float(total),
+        "delivery": normalized_delivery,
+    }
 
 
 def normalize_checkout_payment_snapshot(value: Any) -> dict[str, Any]:
@@ -1709,8 +1806,17 @@ __DELIVERY_BINDING__
             "provider": "meny",
             "items": snapshot["items"],
             "count": snapshot["count"],
-            "subtotal": snapshot["total"],
+            "subtotal": snapshot["product_subtotal"],
             "total": snapshot["total"],
+            "amounts": {
+                "product_subtotal": snapshot["product_subtotal"],
+                "delivery_price": None,
+                "discounts": None,
+                "deposits": None,
+                "bags": None,
+                "other_fees": None,
+                "provider_total": snapshot["total"],
+            },
             "delivery": snapshot["delivery"],
             "checkout": {"mode": "protected_vipps", "url": CHECKOUT_URL},
         }
@@ -1842,15 +1948,15 @@ __DELIVERY_BINDING__
   if (!identity || authenticated.length !== 1 || dialogs.length !== 1) return JSON.stringify({ready:false, identity, authenticated:authenticated.length === 1, slots:[]});
   const root = dialogs[0];
   const months = {januar:0,februar:1,mars:2,april:3,mai:4,juni:5,juli:6,august:7,september:8,oktober:9,november:10,desember:11};
-  const today = new Date();
+  const osloParts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {timeZone:'Europe/Oslo', year:'numeric', month:'2-digit', day:'2-digit'}).formatToParts(new Date()).filter(x => x.type !== 'literal').map(x => [x.type, Number(x.value)]));
   const slots = [];
   for (const button of [...root.querySelectorAll('button')].filter(visible)) {
     const label = norm(button.getAttribute('aria-label') || button.innerText);
-    const match = label.match(/^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kroner,\s*)?(0?[1-9]|[12]\d|3[01])\.\s*(januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+([01]?\d|2[0-3]):([0-5]\d)\s+til\s+([01]?\d|2[0-3]):([0-5]\d)$/i);
+    const match = label.match(/^(?:[^,\r\n]{1,200},\s*)?(0?[1-9]|[12]\d|3[01])\.\s*(januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+([01]?\d|2[0-3]):([0-5]\d)\s+til\s+([01]?\d|2[0-3]):([0-5]\d)$/i);
     if (!match || button.disabled || button.getAttribute('aria-disabled') === 'true') continue;
-    let year = today.getFullYear();
+    let year = osloParts.year;
     const month = months[match[2].toLocaleLowerCase('nb-NO')];
-    if (month < today.getMonth() - 6) year += 1;
+    if (month + 1 < osloParts.month || (month + 1 === osloParts.month && Number(match[1]) < osloParts.day)) year += 1;
     const iso = `${year}-${String(month + 1).padStart(2,'0')}-${String(Number(match[1])).padStart(2,'0')}`;
     slots.push({slot_id:label, date:iso, start:`${String(Number(match[3])).padStart(2,'0')}:${match[4]}`, end:`${String(Number(match[5])).padStart(2,'0')}:${match[6]}`, display:label, selected:button.getAttribute('aria-pressed') === 'true'});
   }
@@ -1874,11 +1980,31 @@ __DELIVERY_BINDING__
         slots = result["slots"]
         if delivery_date:
             slots = [slot for slot in slots if slot.get("date") == delivery_date]
-        return {"provider": "meny", "slots": slots}
+        normalized = [normalize_meny_delivery_slot(slot) for slot in slots]
+        if len({slot["slot_ref"] for slot in normalized}) != len(normalized):
+            raise HouseholdError("MENY delivery slot identity is ambiguous")
+        display = {
+            normalized_slot["slot_ref"]: str(raw_slot["display"])
+            for raw_slot, normalized_slot in zip(slots, normalized, strict=True)
+        }
+        return {
+            "provider": "meny",
+            "slots": normalized,
+            "price_display": {
+                slot["slot_ref"]: delivery_price_display(slot)
+                for slot in normalized
+            },
+            "display": display,
+        }
 
-    def _require_selected_delivery(self, required: Mapping[str, Any]) -> None:
+    def _require_selected_delivery(
+        self,
+        required: Mapping[str, Any],
+        guard: Mapping[str, Any] | None = None,
+    ) -> None:
         required_display = required.get("display")
-        selected = meny_selected_delivery(self._delivery_slots().get("slots"))
+        slots = self._delivery_slots().get("slots")
+        selected = meny_selected_delivery(slots)
         selected_display = selected.get("display") if selected is not None else None
         if (
             not isinstance(required_display, str)
@@ -1887,6 +2013,19 @@ __DELIVERY_BINDING__
             != meny_delivery_window_identity(selected_display)
         ):
             raise HouseholdError("MENY checkout delivery changed after review")
+        if isinstance(guard, Mapping):
+            expected = guard.get("selected")
+            selected_slots = [
+                validate_delivery_slot(slot)
+                for slot in slots
+                if isinstance(slot, Mapping) and slot.get("selected") is True
+            ] if isinstance(slots, list) else []
+            if (
+                not isinstance(expected, Mapping)
+                or len(selected_slots) != 1
+                or selected_slots[0] != validate_delivery_slot(expected)
+            ):
+                raise HouseholdError("MENY delivery price changed after review")
 
     def _wait_for_delivery_reservation(self) -> None:
         requests: Any = {"requests": []}
@@ -1901,14 +2040,14 @@ __DELIVERY_BINDING__
         )
 
     def _select_delivery_slot(self, value: Any, *, _allow_refresh: bool = True) -> dict[str, Any]:
-        slot_id, expected_suffix = normalize_delivery_slot_ref(value)
+        slot_ref, expected_suffix = normalize_delivery_slot_ref(value)
         self._open_delivery_picker()
         marked: dict[str, Any] = {}
         for _ in range(20):
             marked = self._eval(r"""
 (() => {
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
-  const wanted = WANTED, expectedSuffix = EXPECTED_SUFFIX;
+  const expectedSuffix = EXPECTED_SUFFIX.toLocaleLowerCase('nb-NO');
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
@@ -1916,10 +2055,13 @@ __DELIVERY_BINDING__
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => [...x.querySelectorAll('h1')].filter(visible).filter(h => norm(h.innerText) === 'Når skal vi levere til deg?').length === 1);
   if (!identity || authenticated.length !== 1 || dialogs.length !== 1) return JSON.stringify({ready:false, identity, authenticated:authenticated.length === 1});
   const dismiss = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Lukk');
-  const buttons = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.getAttribute('aria-label') || x.innerText) === wanted);
+  const slotPattern = /^(?:[^,\r\n]{1,200},\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
+  const buttons = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
+    const label = norm(x.getAttribute('aria-label') || x.innerText);
+    return slotPattern.test(label) && label.toLocaleLowerCase('nb-NO').endsWith(expectedSuffix);
+  });
   if (dismiss.length !== 1 || buttons.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true});
   if (buttons[0].getAttribute('aria-pressed') === 'true') {
-    const slotPattern = /^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kroner,\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
     const selected = [...dialogs[0].querySelectorAll('button[aria-pressed="true"]')].filter(visible).filter(x => slotPattern.test(norm(x.getAttribute('aria-label') || x.innerText)));
     const keep = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
       const parts = norm(x.getAttribute('aria-label') || x.innerText).match(/^Behold levering (?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(.+)$/i);
@@ -1929,15 +2071,15 @@ __DELIVERY_BINDING__
     if (selected.length !== 1 || keep.length > 1 || (keep.length === 1 && alternatives.length === 0)) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length});
     if (keep.length === 1) {
       alternatives[0].setAttribute('data-hermes-meal-planner-action', 'delivery-refresh-slot');
-      return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:true, refresh_slot:norm(alternatives[0].getAttribute('aria-label') || alternatives[0].innerText)});
+      return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:true, refresh_slot:norm(alternatives[0].getAttribute('aria-label') || alternatives[0].innerText), label:norm(buttons[0].getAttribute('aria-label') || buttons[0].innerText)});
     }
     dismiss[0].setAttribute('data-hermes-meal-planner-action', 'delivery-dismiss');
-    return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:false});
+    return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:false, label:norm(buttons[0].getAttribute('aria-label') || buttons[0].innerText)});
   }
   buttons[0].setAttribute('data-hermes-meal-planner-action', 'delivery-slot');
-  return JSON.stringify({ready:true, identity, authenticated:true, already_selected:false});
+  return JSON.stringify({ready:true, identity, authenticated:true, already_selected:false, label:norm(buttons[0].getAttribute('aria-label') || buttons[0].innerText)});
 })()
-""".replace("WANTED", json.dumps(slot_id, ensure_ascii=False)).replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
+""".replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
             if marked.get("identity") is not True:
                 raise HouseholdError("MENY delivery route changed")
             if marked.get("authenticated") is not True:
@@ -1947,18 +2089,23 @@ __DELIVERY_BINDING__
             self._sleep(0.25)
         else:
             raise HouseholdError("MENY delivery slot changed or is unavailable")
-        selected_slot_id = slot_id
+        selected_slot_ref = slot_ref
         selected_suffix = expected_suffix
         refreshing = False
         if marked.get("already_selected") is True and marked.get("refresh_available") is not True:
             self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
             self._wait_delivery_picker_closed()
-            return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
+            selected = normalized_selected_meny_slot(slot_ref, marked.get("label"))
+            return {
+                "provider": "meny",
+                "selected": selected,
+                "price_display": delivery_price_display(selected),
+            }
         if marked.get("already_selected") is True:
             if not _allow_refresh:
                 raise HouseholdError("MENY delivery reservation could not be refreshed")
-            selected_slot_id, selected_suffix = normalize_delivery_slot_ref(marked.get("refresh_slot"))
-            if selected_slot_id == slot_id:
+            selected_slot_ref, selected_suffix = meny_label_slot_ref(marked.get("refresh_slot"))
+            if selected_slot_ref == slot_ref:
                 raise HouseholdError("MENY delivery refresh slot is invalid")
             refreshing = True
             self._invoke("click", '[data-hermes-meal-planner-action="delivery-refresh-slot"]')
@@ -1968,17 +2115,16 @@ __DELIVERY_BINDING__
             confirmation = self._eval(r"""
 (() => {
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
-  const wanted = WANTED;
-  const expectedSuffix = EXPECTED_SUFFIX;
+  const expectedSuffix = EXPECTED_SUFFIX.toLocaleLowerCase('nb-NO');
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => [...x.querySelectorAll('h1')].filter(visible).filter(h => norm(h.innerText) === 'Når skal vi levere til deg?').length === 1);
   if (!identity || authenticated.length !== 1 || dialogs.length !== 1) return JSON.stringify({ready:false, identity, authenticated:authenticated.length === 1});
-  const slotPattern = /^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kroner,\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
+  const slotPattern = /^(?:[^,\r\n]{1,200},\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
   const allSelected = [...dialogs[0].querySelectorAll('button[aria-pressed="true"]')].filter(visible).filter(x => slotPattern.test(norm(x.getAttribute('aria-label') || x.innerText)));
-  const selected = allSelected.filter(x => norm(x.getAttribute('aria-label') || x.innerText) === wanted);
+  const selected = allSelected.filter(x => norm(x.getAttribute('aria-label') || x.innerText).toLocaleLowerCase('nb-NO').endsWith(expectedSuffix));
   const confirm = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => {
     const label = norm(x.getAttribute('aria-label') || x.innerText);
     const parts = label.match(/^Bekreft levering (?:mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag)\s+(.+)$/i);
@@ -1993,7 +2139,7 @@ __DELIVERY_BINDING__
   (confirm[0] || keep[0]).setAttribute('data-hermes-meal-planner-action', 'delivery-confirm');
   return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1, keeping_existing:keep.length === 1});
 })()
-""".replace("WANTED", json.dumps(selected_slot_id, ensure_ascii=False)).replace("EXPECTED_SUFFIX", json.dumps(selected_suffix, ensure_ascii=False)))
+""".replace("EXPECTED_SUFFIX", json.dumps(selected_suffix, ensure_ascii=False)))
             if confirmation.get("identity") is not True:
                 raise HouseholdError("MENY delivery route changed")
             if confirmation.get("authenticated") is not True:
@@ -2009,7 +2155,7 @@ __DELIVERY_BINDING__
         self._wait_delivery_picker_closed()
         if refreshing:
             try:
-                return self._select_delivery_slot(slot_id, _allow_refresh=False)
+                return self._select_delivery_slot(slot_ref, _allow_refresh=False)
             except HouseholdError as exc:
                 raise HouseholdError(
                     "MENY delivery refresh stopped on a temporary slot; select the requested slot again"
@@ -2020,22 +2166,22 @@ __DELIVERY_BINDING__
             selected = self._eval(r"""
 (() => {
   document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
-  const wanted = WANTED;
+  const expectedSuffix = EXPECTED_SUFFIX.toLocaleLowerCase('nb-NO');
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => [...x.querySelectorAll('h1')].filter(visible).filter(h => norm(h.innerText) === 'Når skal vi levere til deg?').length === 1);
   if (!identity || authenticated.length !== 1 || dialogs.length !== 1) return JSON.stringify({ready:false, identity, authenticated:authenticated.length === 1});
-  const slotPattern = /^(?:fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kr\s+fra\s+\d+(?:[ .]\d{3})*(?:,\d{2})?\s+kroner,\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
+  const slotPattern = /^(?:[^,\r\n]{1,200},\s*)?(?:0?[1-9]|[12]\d|3[01])\.\s*(?:januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+klokka\s+(?:[01]?\d|2[0-3]):[0-5]\d\s+til\s+(?:[01]?\d|2[0-3]):[0-5]\d$/i;
   const allSelected = [...dialogs[0].querySelectorAll('button[aria-pressed="true"]')].filter(visible).filter(x => slotPattern.test(norm(x.getAttribute('aria-label') || x.innerText)));
-  const selected = allSelected.filter(x => norm(x.getAttribute('aria-label') || x.innerText) === wanted);
+  const selected = allSelected.filter(x => norm(x.getAttribute('aria-label') || x.innerText).toLocaleLowerCase('nb-NO').endsWith(expectedSuffix));
   const dismiss = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Lukk');
   if (allSelected.length !== 1 || selected.length !== 1 || dismiss.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length, total_selected_count:allSelected.length});
   dismiss[0].setAttribute('data-hermes-meal-planner-action', 'delivery-dismiss');
-  return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1});
+  return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1, label:norm(selected[0].getAttribute('aria-label') || selected[0].innerText)});
 })()
-""".replace("WANTED", json.dumps(slot_id, ensure_ascii=False)))
+""".replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
             if selected.get("identity") is not True:
                 raise HouseholdError("MENY delivery route changed")
             if selected.get("authenticated") is not True:
@@ -2047,7 +2193,12 @@ __DELIVERY_BINDING__
             raise HouseholdError("MENY selected delivery could not be verified")
         self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
         self._wait_delivery_picker_closed()
-        return {"provider": "meny", "selected": {"slot_id": slot_id, "display": slot_id}}
+        verified = normalized_selected_meny_slot(slot_ref, selected.get("label"))
+        return {
+            "provider": "meny",
+            "selected": verified,
+            "price_display": delivery_price_display(verified),
+        }
 
     def _get_orders(self, limit: int) -> dict[str, Any]:
         self._invoke("network", "requests", "--clear")
@@ -2510,9 +2661,9 @@ __DELIVERY_BINDING__
             selected_delivery = meny_selected_delivery(self._delivery_slots().get("slots"))
             if selected_delivery is not None:
                 try:
-                    self._select_delivery_slot(selected_delivery["slot_id"])
+                    self._select_delivery_slot(selected_delivery["slot_ref"])
                 except _DeliveryReservationError:
-                    self._select_delivery_slot(selected_delivery["slot_id"])
+                    self._select_delivery_slot(selected_delivery["slot_ref"])
             expected["delivery"] = selected_delivery
         if expected.get("delivery") is None:
             raise HouseholdError("select a MENY delivery slot before checkout")
@@ -2737,6 +2888,15 @@ __DELIVERY_BINDING__
             "items": expected["items"],
             "count": expected["count"],
             "total": payment_summary["total"],
+            "amounts": {
+                "product_subtotal": (expected.get("amounts") or {}).get("product_subtotal"),
+                "delivery_price": None,
+                "discounts": None,
+                "deposits": None,
+                "bags": None,
+                "other_fees": None,
+                "provider_total": payment_summary["total"],
+            },
             "delivery": {"slot_id": None, "display": payment_summary["delivery"], "address": None, "unattended": None},
             "payment": "vipps",
             "order_lines": order_lines,
@@ -2762,7 +2922,11 @@ __DELIVERY_BINDING__
                     raise HouseholdError("MENY checkout delivery identity is unavailable")
                 # Bind the current account selection to the authorized window
                 # without changing provider state during protected submit.
-                self._require_selected_delivery(review_delivery)
+                guard = review.get("delivery_guard")
+                if isinstance(guard, Mapping):
+                    self._require_selected_delivery(review_delivery, guard)
+                else:
+                    self._require_selected_delivery(review_delivery)
                 final_cart["delivery"] = dict(review_delivery)
                 try:
                     fresh = self._review_checkout(final_cart, order_change=order_change)

@@ -1,0 +1,191 @@
+{
+  "captured_at": "2026-09-02",
+  "provider": "oda",
+  "source": "sanitized authenticated Oda MCP observation after owner-authorized slot selection",
+  "response": {
+    "deliveryDate": "2026-09-09",
+    "slots": [
+      {
+        "id": 1651235,
+        "openDatetime": "2026-09-09T02:00:00Z",
+        "closeDatetime": "2026-09-09T07:00:00Z",
+        "price": "kr\u00a00",
+        "isSelected": true,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650890,
+        "openDatetime": "2026-09-09T03:00:00Z",
+        "closeDatetime": "2026-09-09T05:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1651306,
+        "openDatetime": "2026-09-09T04:00:00Z",
+        "closeDatetime": "2026-09-09T06:00:00Z",
+        "price": "kr\u00a039",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650777,
+        "openDatetime": "2026-09-09T04:00:00Z",
+        "closeDatetime": "2026-09-09T09:00:00Z",
+        "price": "kr\u00a09",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1651325,
+        "openDatetime": "2026-09-09T05:00:00Z",
+        "closeDatetime": "2026-09-09T07:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650961,
+        "openDatetime": "2026-09-09T05:00:00Z",
+        "closeDatetime": "2026-09-09T11:00:00Z",
+        "price": "kr\u00a00",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1651226,
+        "openDatetime": "2026-09-09T07:00:00Z",
+        "closeDatetime": "2026-09-09T12:00:00Z",
+        "price": "kr\u00a09",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650864,
+        "openDatetime": "2026-09-09T08:00:00Z",
+        "closeDatetime": "2026-09-09T10:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650847,
+        "openDatetime": "2026-09-09T09:00:00Z",
+        "closeDatetime": "2026-09-09T11:00:00Z",
+        "price": "kr\u00a059",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650927,
+        "openDatetime": "2026-09-09T09:00:00Z",
+        "closeDatetime": "2026-09-09T12:00:00Z",
+        "price": "kr\u00a039",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1651229,
+        "openDatetime": "2026-09-09T11:00:00Z",
+        "closeDatetime": "2026-09-09T16:00:00Z",
+        "price": "kr\u00a00",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650451,
+        "openDatetime": "2026-09-09T12:00:00Z",
+        "closeDatetime": "2026-09-09T14:00:00Z",
+        "price": "kr\u00a064",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650964,
+        "openDatetime": "2026-09-09T13:00:00Z",
+        "closeDatetime": "2026-09-09T15:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650472,
+        "openDatetime": "2026-09-09T14:00:00Z",
+        "closeDatetime": "2026-09-09T16:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1651277,
+        "openDatetime": "2026-09-09T14:00:00Z",
+        "closeDatetime": "2026-09-09T19:00:00Z",
+        "price": "kr\u00a09",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650803,
+        "openDatetime": "2026-09-09T15:00:00Z",
+        "closeDatetime": "2026-09-09T17:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1651215,
+        "openDatetime": "2026-09-09T15:00:00Z",
+        "closeDatetime": "2026-09-09T19:00:00Z",
+        "price": "kr\u00a039",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1651223,
+        "openDatetime": "2026-09-09T15:00:00Z",
+        "closeDatetime": "2026-09-09T20:00:00Z",
+        "price": "kr\u00a09",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650531,
+        "openDatetime": "2026-09-09T16:00:00Z",
+        "closeDatetime": "2026-09-09T18:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      },
+      {
+        "id": 1650509,
+        "openDatetime": "2026-09-09T17:00:00Z",
+        "closeDatetime": "2026-09-09T19:00:00Z",
+        "price": "kr\u00a049",
+        "isSelected": false,
+        "isFull": false,
+        "isUnavailable": false
+      }
+    ]
+  },
+  "notes": "Account, address, cart contents, unavailable descriptions, sessions and orders were removed. The observed price form was exactly `kr` plus NBSP plus integer kroner, including confirmed zero."
+}

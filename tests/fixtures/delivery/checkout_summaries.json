@@ -1,0 +1,69 @@
+{
+  "captured_at": "2026-09-02",
+  "providers": {
+    "meny": {
+      "source": "sanitized authenticated read-only E2E observation",
+      "cart": {
+        "authoritative_fields": ["product_subtotal", "provider_total"],
+        "product_subtotal": 427.58,
+        "provider_total": 427.58,
+        "selected_delivery": "torsdag 3. september kl. 07:00-08:00",
+        "delivery_price": null,
+        "discounts": null,
+        "deposits": null,
+        "bags": null,
+        "other_fees": null
+      },
+      "checkout": {
+        "authoritative_fields": ["provider_total", "selected_delivery"],
+        "provider_total": 473.90,
+        "selected_delivery": "torsdag 3. september kl. 07:00-08:00",
+        "delivery_price": null,
+        "discounts": null,
+        "deposits": null,
+        "bags": null,
+        "other_fees": null
+      }
+    },
+    "oda": {
+      "source": "sanitized authenticated Oda MCP observation after owner-authorized slot selection plus a read-only checkout review",
+      "cart": {
+        "authoritative_fields": ["provider_total", "selected_delivery"],
+        "product_subtotal": null,
+        "provider_total": 1078.95,
+        "selected_delivery": {
+          "slot_id": 1651235,
+          "display": "Hjemlevering mellom kl 04 og 09, 9. sep"
+        },
+        "delivery_price": null,
+        "discounts": null,
+        "deposits": null,
+        "bags": null,
+        "other_fees": null
+      },
+      "checkout": {
+        "authoritative_fields": ["labeled_rows", "product_subtotal", "provider_total", "selected_delivery", "delivery_price", "discounts", "bags", "other_fees"],
+        "labeled_rows": [
+          {"label": "26 varer", "amount_text": "1\u00a0071,00\u00a0kr"},
+          {"label": "Du sparer", "amount_text": "\u221262,90\u00a0kr"},
+          {"label": "Delsum", "amount_text": "1\u00a0008,10\u00a0kr"},
+          {"label": "Tillegg for mindre bestilling", "amount_text": "29,00\u00a0kr"},
+          {"label": "Leveringsemballasje", "amount_text": "41,85\u00a0kr"},
+          {"label": "Levering", "amount_text": "0,00\u00a0kr"},
+          {"label": "Total inkl. MVA", "amount_text": "1\u00a0078,95\u00a0kr"}
+        ],
+        "product_subtotal": 1071.00,
+        "provider_total": 1078.95,
+        "selected_delivery": "ons 9. september, 04:00 - 09:00",
+        "delivery_price": 0.0,
+        "discounts": -62.90,
+        "deposits": null,
+        "bags": 41.85,
+        "other_fees": {
+          "Tillegg for mindre bestilling": 29.0
+        }
+      }
+    }
+  },
+  "notes": "Only independently supplied provider fields are authoritative. Oda checkout labels were captured from the expanded summary without activating its final submit control. No missing component is inferred by subtracting cart, order or checkout totals. Account, address, cart contents, order, payment and session data are excluded."
+}

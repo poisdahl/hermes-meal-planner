@@ -426,8 +426,8 @@ if [[ "$existing_install" == true ]]; then
 from mcp_server import rpc
 
 status = rpc("status")
-if "product_favorites_count" not in status or "favorites" in status:
-    raise SystemExit("meal-planner status still exposes the old favorites schema")
+if status.get("state_version") != 7 or "product_favorites_count" not in status or "favorites" in status:
+    raise SystemExit("meal-planner status does not expose canonical v7 state")
 PY
     then
       status_verified=true
@@ -436,7 +436,7 @@ PY
     sleep 0.5
   done
   if [[ "$status_verified" != true ]]; then
-    echo "the restarted meal-planner service did not expose canonical v6 status" >&2
+    echo "the restarted meal-planner service did not expose canonical v7 status" >&2
     exit 1
   fi
 fi

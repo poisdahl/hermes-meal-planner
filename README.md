@@ -114,16 +114,19 @@ set `HERMES_PYTHON`, `MEAL_PLANNER_AGENT_BROWSER` or
 `MEAL_PLANNER_BROWSER_EXECUTABLE` while running the installer; their resolved
 values are saved in the private service definition.
 
-Clean installations create household state v6 with only the
+Clean installations create household state v7 with only the
 `product_favorites` list and expose the
 `meal_planner_product_favorites` tool. When rerun for an existing installation,
 the installer stops only the meal-planner service, creates the non-overwriting
-private `state-v5.backup.json`, migrates the product list atomically, refreshes
+private migration backups, including `state-v6.backup.json` immediately before
+the v6→v7 delivery-preference migration, migrates state atomically, refreshes
 the installed skill and MCP registration, restarts the service, and verifies
 both status and the new tool schema. This also starts an existing installation
 that was stopped before the update. If migration fails, the old state and its
-backup remain usable and the service stays stopped. Roll back by restoring the
-v5 backup before running v5 code; v5 code must not read a v6 state file.
+backup remain usable and the service stays stopped. Existing v6 households gain
+`delivery.strategy="keep_selected"`; clean state and newly replaced delivery
+preferences default to `"cheapest"`. Restore the matching backup before running
+older code; older code must not read a v7 state file.
 
 New installations use `"confirmation_policy": "fresh"`: Hermes prepares the
 exact checkout or cancellation summary and asks once before dispatch. An owner
@@ -152,6 +155,59 @@ All five recipe sources are enabled by default. Disable a source with the setup
 tool, the profile tool, or a private `profile_overrides.recipes.sources` value.
 Provider selection and confirmation policy remain config-bound and require a
 separate state/service change rather than an in-place setup edit.
+
+## Delivery prices and selection
+
+Delivery list returns the same seven-field slot object for each provider:
+`slot_ref`, unchanged provider ID or `null`, complete offset-aware start/end
+timestamps, integer `price_ore` or `null`, `price_kind` (`exact`, `from` or
+`unavailable`) and the provider-selected flag. Price presentation is derived
+only from that state as `49 kr`, `fra 49 kr` or `pris ikke tilgjengelig`.
+`fra 0` is never reported as free. A parser is enabled only for sanitized
+provider-fixture shapes; unknown shapes stop instead of guessing price or units.
+The current Oda fixture establishes integer IDs, RFC 3339 `openDatetime` /
+`closeDatetime`, and exact `kr` + NBSP + integer-kroner prices, including
+confirmed `kr 0`; other Oda price syntax remains unavailable. Full or
+provider-unavailable Oda rows are not offered as candidates. The current MENY
+fixture establishes only its duplicated `fra N kr fra N kroner` label form.
+MENY list results retain that bounded original ARIA label in the outer
+`display[slot_ref]` metadata map while excluding it from the seven-field slot
+identity, so price wording can change without changing `slot_ref`.
+
+Select using the exact returned `slot_ref`. A provider ID remains unchanged;
+MENY currently has no verified stable slot ID, so its reference is derived only
+from date/start/end and a live click requires exactly one semantic match. This
+keeps the identity stable when price wording changes. Local selection provenance
+is only an observation and is checked against a fresh provider read.
+
+`schedule.delivery.strategy` is `keep_selected` or `cheapest`. Hard weekday/date
+and latest-end limits are applied before price. Cheapest requires every eligible
+candidate to have an exact price, then ranks by price, end nearest
+`preferred_end`, earlier start and bytewise `slot_ref`. Mixed exact/from/missing
+prices stop in `cart_ready`/`needs_input`, and explicit or externally selected
+windows are never replaced. Protected checkout rereads the provider selection
+and price. A strategy-owned window may be reselected/reprepared once after
+drift; a second drift stops before payment. MENY still ends unattended runs in
+`cart_ready` and keeps its manual/Vipps boundary.
+
+The scheduler invokes checkout `auto` for both `cart_ready` and
+`auto_checkout`. A `cart_ready` run may reserve the verified cheapest slot but
+never enters checkout or submits payment. Its returned occurrence is part of
+the delivery provenance and must be passed unchanged to a later manual checkout
+`prepare`; an unrelated or omitted occurrence is rejected while that scheduled
+selection is active.
+
+Checkout amount maps contain only independently supplied values. Oda's current
+MCP cart establishes the provider total; the read-only expanded checkout
+summary independently supplies its aggregate item-count/product-total,
+discount, discounted `Delsum`, delivery, delivery-packaging, named other-fee
+and total rows, while the selected-slot price is also verified against the
+fresh slot listing. The aggregate label is bound to the exact cart or order
+product count. The sanitized fixture retains the exact observed labels and
+formatted amount strings used by that parser.
+MENY's cart and checkout
+surfaces establish their own totals. Neither provider reconstructs a missing
+subtotal, delivery, discount, deposit, bag or other fee by subtraction.
 
 ## Manual cart goods during a weekly menu
 
@@ -398,13 +454,15 @@ requests, in a safe order, are:
   request is genuinely ambiguous, ask one short clarification.
 - “Schedule a weekly Thursday draft,” or explicitly configure a guarded
   scheduled-checkout maximum and delivery preference. The due run follows the
-  configured confirmation policy after its amount and delivery guards pass.
+  configured confirmation policy after its amount and delivery guards pass;
+  `cart_ready` runs stop before checkout and payment.
 - “Search for broccoli,” “Find a salmon recipe,” “Show my cart,” and “Add one
   of that exact broccoli to this week's order.”
 - For a saved weekly menu, sync the complete exact product requirements rather
   than raw deltas. If checkout reports a changed cart, answer its one combined
   keep/restore/exclude question before preparing again.
-- “List delivery windows,” select one exact window, then list, inspect or track
+- “List delivery windows,” show each structured price, select one exact
+  `slot_ref`, then list, inspect or track
   orders.
 - “Add one of that product to order …” or move that order's delivery. The agent
   begins the exact order change before using the ordinary cart or delivery

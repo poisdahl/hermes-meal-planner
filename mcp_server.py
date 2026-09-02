@@ -137,9 +137,9 @@ def meal_planner_cart(
     )
 
 
-@server.tool(description="List available delivery slots or select the exact slot the user requested. Selection is reversible until checkout.")
-def meal_planner_delivery(action: Literal["list", "select"] = "list", dates: list[str] | None = None, address_id: int | None = None, slot_id: str | int | None = None, unattended: bool | None = None) -> dict[str, Any]:
-    return rpc("delivery", action=action, dates=dates, address_id=address_id, slot_id=slot_id, unattended=unattended)
+@server.tool(description="List normalized delivery windows with exact/from/unavailable prices, or select one exact slot_ref. Selection is authoritative for the current cart/order and reversible until checkout.")
+def meal_planner_delivery(action: Literal["list", "select"] = "list", dates: list[str] | None = None, address_id: int | None = None, slot_ref: str | None = None, unattended: bool | None = None) -> dict[str, Any]:
+    return rpc("delivery", action=action, dates=dates, address_id=address_id, slot_ref=slot_ref, unattended=unattended)
 
 
 @server.tool(description="List/read orders; start or abort an exact existing-order change; or prepare, confirm, submit under configured standing authorization, and reconcile cancellation. After change_begin, use normal cart/delivery tools and protected checkout. cancel_submit requires one stable idempotency_key per explicit cancellation intent; reuse it only to recover that same call.")
@@ -152,12 +152,12 @@ def meal_planner_menu(action: Literal["get", "save", "clear"] = "get", menu: dic
     return rpc("menu", action=action, menu=menu, menu_id=menu_id, expected_revision=expected_revision, allow_repeat_keys=allow_repeat_keys or [], override_reason=override_reason, interactive=interactive)
 
 
-@server.tool(description="Show/update/disable the weekly run and guarded scheduled-checkout settings. A scheduled checkout stops for confirmation under fresh policy and may dispatch within its total/delivery guards under standing policy.")
+@server.tool(description="Show/update/disable the weekly run and guarded scheduled-checkout settings, including delivery.strategy keep_selected or cheapest. Cheapest stops cart_ready unless every hard-filtered candidate has an exact price. A scheduled checkout stops for confirmation under fresh policy and may dispatch within its total/delivery guards under standing policy.")
 def meal_planner_schedule(action: Literal["show", "update", "disable", "set_cron_job"] = "show", changes: dict[str, Any] | None = None, cron_job_id: str | None = None) -> dict[str, Any]:
     return rpc("schedule", action=action, changes=changes or {}, cron_job_id=cron_job_id)
 
 
-@server.tool(description="Prepare, confirm, submit under configured standing authorization, or reconcile a new checkout or active existing-order change; auto handles a due scheduled occurrence. submit requires one stable idempotency_key per explicit order intent; reuse it only for that same uncertain call and use a new key for a later intent. A preview or prepare never submits. MENY still requires provider-enforced Vipps approval.")
+@server.tool(description="Prepare, confirm, submit under configured standing authorization, or reconcile a new checkout or active existing-order change. auto handles each due cart_ready or auto_checkout occurrence; cart_ready never submits payment and its returned occurrence must be carried into a later manual prepare. submit requires one stable idempotency_key per explicit order intent; reuse it only for that same uncertain call and use a new key for a later intent. A preview or prepare never submits. MENY still requires provider-enforced Vipps approval.")
 def meal_planner_checkout(action: Literal["prepare", "confirm", "submit", "reconcile", "auto"] = "prepare", occurrence: str | None = None, confirmation_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
     return rpc("checkout", action=action, occurrence=occurrence, confirmation_id=confirmation_id, idempotency_key=idempotency_key)
 

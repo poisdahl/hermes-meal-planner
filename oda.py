@@ -5,15 +5,18 @@ from __future__ import annotations
 import asyncio
 import argparse
 from contextlib import contextmanager
+from datetime import date, datetime
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
-from core import HouseholdError, cart_summary
+from core import HouseholdError, cart_summary, validate_delivery_slot
 
 
 ODA_ENDPOINT = "https://oda.com/mcp"
@@ -23,6 +26,179 @@ REQUIRED_TOOLS = frozenset({
     "manipulate_cart", "get_delivery_addresses", "get_delivery_slots",
     "select_delivery_slot", "get_orders", "get_order", "order_tracking",
 })
+
+
+ODA_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})"
+)
+ODA_EXACT_PRICE = re.compile(r"kr\u00a0(0|[1-9]\d{0,6})")
+ODA_SLOT_REF = re.compile(r"oda:(\d{4}-\d{2}-\d{2}):(0|[1-9]\d*)")
+ODA_CART_DELIVERY = re.compile(
+    r"Hjemlevering mellom kl (?P<start>[01]\d|2[0-3]) og (?P<end>[01]\d|2[0-3]), "
+    r"(?P<day>0?[1-9]|[12]\d|3[01])\. (?P<month>jan|feb|mar|apr|mai|jun|jul|aug|sep|okt|nov|des)"
+)
+ODA_MONTHS = {
+    name: index for index, name in enumerate(
+        ("jan", "feb", "mar", "apr", "mai", "jun", "jul", "aug", "sep", "okt", "nov", "des"),
+        start=1,
+    )
+}
+
+
+def _oda_timestamp(value: Any) -> tuple[str, datetime]:
+    if not isinstance(value, str) or len(value) > 64 or ODA_TIMESTAMP.fullmatch(value) is None:
+        raise HouseholdError("Oda delivery slot timestamp changed")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HouseholdError("Oda delivery slot timestamp changed") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise HouseholdError("Oda delivery slot timestamp changed")
+    return value, parsed
+
+
+def _oda_price(value: Any) -> tuple[int | None, str]:
+    if not isinstance(value, str) or len(value) > 64:
+        return None, "unavailable"
+    match = ODA_EXACT_PRICE.fullmatch(value)
+    if match is None:
+        return None, "unavailable"
+    return int(match[1]) * 100, "exact"
+
+
+def oda_delivery_slot_date(value: Any) -> str:
+    match = ODA_SLOT_REF.fullmatch(str(value or ""))
+    if match is None:
+        raise HouseholdError("Oda delivery slot_ref is invalid")
+    try:
+        return date.fromisoformat(match[1]).isoformat()
+    except ValueError as exc:
+        raise HouseholdError("Oda delivery slot_ref is invalid") from exc
+
+
+def oda_cart_delivery_window(value: Any, *, today: date | None = None) -> dict[str, Any]:
+    """Parse the exact selected-delivery display observed in an Oda cart."""
+
+    if not isinstance(value, Mapping):
+        raise HouseholdError("Oda selected cart delivery changed")
+    slot_id = value.get("slot_id")
+    display = value.get("display")
+    if isinstance(slot_id, bool) or not isinstance(slot_id, int) or slot_id < 0:
+        raise HouseholdError("Oda selected cart delivery changed")
+    if not isinstance(display, str) or len(display.encode("utf-8")) > 200:
+        raise HouseholdError("Oda selected cart delivery changed")
+    match = ODA_CART_DELIVERY.fullmatch(display)
+    if match is None:
+        raise HouseholdError("Oda selected cart delivery changed")
+    current = today or datetime.now(ZoneInfo("Europe/Oslo")).date()
+    month = ODA_MONTHS[match["month"]]
+    day = int(match["day"])
+    year = current.year + (1 if (month, day) < (current.month, current.day) else 0)
+    try:
+        delivery_date = date(year, month, day)
+    except ValueError as exc:
+        raise HouseholdError("Oda selected cart delivery changed") from exc
+    return {
+        "slot_id": slot_id,
+        "date": delivery_date.isoformat(),
+        "start": f"{int(match['start']):02d}:00",
+        "end": f"{int(match['end']):02d}:00",
+    }
+
+
+def oda_cart_delivery_matches_slot(
+    cart_delivery: Any,
+    slot_value: Any,
+    *,
+    today: date | None = None,
+) -> bool:
+    """Bind Oda's selected cart display to the normalized selected slot."""
+
+    slot = validate_delivery_slot(slot_value)
+    start = datetime.fromisoformat(slot["start_at"].replace("Z", "+00:00")).astimezone(
+        ZoneInfo("Europe/Oslo")
+    )
+    end = datetime.fromisoformat(slot["end_at"].replace("Z", "+00:00")).astimezone(
+        ZoneInfo("Europe/Oslo")
+    )
+    cart_window = oda_cart_delivery_window(cart_delivery, today=today or start.date())
+    return (
+        cart_window["slot_id"] == slot["provider_slot_id"]
+        and cart_window["date"] == start.date().isoformat()
+        and cart_window["start"] == start.strftime("%H:%M")
+        and cart_window["end"] == end.strftime("%H:%M")
+    )
+
+
+def normalize_oda_delivery_slot(value: Any) -> dict[str, Any]:
+    """Normalize one slot using only the sanitized, fixture-backed Oda fields."""
+
+    required = {
+        "id", "openDatetime", "closeDatetime", "price",
+        "isSelected", "isFull", "isUnavailable",
+    }
+    if not isinstance(value, Mapping) or not required.issubset(value):
+        raise HouseholdError("Oda delivery slot changed")
+    provider_id = value.get("id")
+    if isinstance(provider_id, bool) or not isinstance(provider_id, int) or provider_id < 0:
+        raise HouseholdError("Oda delivery slot id changed")
+    if not all(isinstance(value.get(field), bool) for field in ("isSelected", "isFull", "isUnavailable")):
+        raise HouseholdError("Oda delivery slot availability changed")
+    start_at, start = _oda_timestamp(value.get("openDatetime"))
+    end_at, end = _oda_timestamp(value.get("closeDatetime"))
+    if end <= start:
+        raise HouseholdError("Oda delivery slot must end after it starts")
+    price_ore, price_kind = _oda_price(value.get("price"))
+    delivery_date = start.astimezone(ZoneInfo("Europe/Oslo")).date().isoformat()
+    return validate_delivery_slot({
+        "slot_ref": f"oda:{delivery_date}:{provider_id}",
+        "provider_slot_id": provider_id,
+        "start_at": start_at,
+        "end_at": end_at,
+        "price_ore": price_ore,
+        "price_kind": price_kind,
+        "selected": value["isSelected"],
+    })
+
+
+def normalize_oda_delivery_slots(value: Any) -> dict[str, Any]:
+    """Return only selectable slots from one exact Oda delivery-date response."""
+
+    if not isinstance(value, Mapping) or set(value) != {"deliveryDate", "slots"}:
+        raise HouseholdError("Oda delivery slots changed")
+    try:
+        delivery_date = date.fromisoformat(str(value.get("deliveryDate") or ""))
+    except ValueError as exc:
+        raise HouseholdError("Oda delivery date changed") from exc
+    raw_slots = value.get("slots")
+    if not isinstance(raw_slots, list):
+        raise HouseholdError("Oda delivery slots changed")
+    slots = []
+    for raw in raw_slots:
+        if not isinstance(raw, Mapping):
+            raise HouseholdError("Oda delivery slot changed")
+        if not all(isinstance(raw.get(field), bool) for field in ("isSelected", "isFull", "isUnavailable")):
+            raise HouseholdError("Oda delivery slot availability changed")
+        if raw["isFull"] or raw["isUnavailable"]:
+            continue
+        slot = normalize_oda_delivery_slot(raw)
+        start = datetime.fromisoformat(slot["start_at"].replace("Z", "+00:00"))
+        if start.astimezone(ZoneInfo("Europe/Oslo")).date() != delivery_date:
+            raise HouseholdError("Oda delivery slot date changed")
+        slots.append(slot)
+    references: dict[str, dict[str, Any]] = {}
+    for slot in slots:
+        previous = references.get(slot["slot_ref"])
+        if previous is not None and previous != slot:
+            raise HouseholdError("Oda returned conflicting delivery slot ids")
+        references[slot["slot_ref"]] = slot
+    if sum(slot["selected"] for slot in references.values()) > 1:
+        raise HouseholdError("Oda selected delivery slot is ambiguous")
+    return {
+        "provider": "oda",
+        "delivery_date": delivery_date.isoformat(),
+        "slots": list(references.values()),
+    }
 
 
 def _json_value(value: Any) -> Any:
@@ -163,6 +339,8 @@ class OdaClient:
         value = _json_value(structured)
         if not isinstance(value, dict):
             raise HouseholdError("Oda returned no structured result")
+        if tool == "get_delivery_slots":
+            return normalize_oda_delivery_slots(value)
         return value
 
     @contextmanager

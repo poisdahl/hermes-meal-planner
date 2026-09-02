@@ -497,7 +497,7 @@ class StateMigrationTests(unittest.TestCase):
             (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
             store = StateStore(root, {**CONFIG, "household": "Hus A", "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["version"], 7)
             self.assertIn("product_favorites", migrated)
             self.assertNotIn("favorites", migrated)
             self.assertEqual(migrated["profile"]["recipes"]["repeat_cooldown_weeks"], 6)
@@ -554,7 +554,7 @@ class StateMigrationTests(unittest.TestCase):
 
             store = StateStore(root, {**CONFIG, "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["version"], 7)
             self.assertEqual(migrated["email_jobs"][0]["provider"], "oda")
             self.assertEqual(migrated["email_jobs"][0]["status"], "pending")
             self.assertEqual(migrated["order_snapshot_providers"]["order-old"], "oda")
@@ -591,7 +591,7 @@ class StateMigrationTests(unittest.TestCase):
 
             migrated = StateStore(root, {**CONFIG, "provider": "oda"}).read()
 
-            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["version"], 7)
             self.assertIsNone(migrated["cart_plan"])
             backup = json.loads((root / "state-v3.backup.json").read_text(encoding="utf-8"))
             self.assertEqual(backup["version"], 3)
@@ -612,7 +612,7 @@ class StateMigrationTests(unittest.TestCase):
                 "profile_overrides": {"recipes": {"sources": {"themealdb": False}}},
             }).read()
 
-            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["version"], 7)
             self.assertEqual(migrated["setup"]["status"], "needs_review")
             self.assertFalse(migrated["profile"]["recipes"]["sources"]["themealdb"])
             self.assertTrue(migrated["profile"]["recipes"]["sources"]["wikibooks"])

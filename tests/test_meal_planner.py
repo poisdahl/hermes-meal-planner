@@ -16,32 +16,38 @@ import time
 import types
 import unittest
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT
 sys.path.insert(0, str(CORE))
 
-from core import DEFAULT_PROFILE, HouseholdError, StateStore, cart_summary, due_recurring, put_item  # noqa: E402
+from core import DEFAULT_PROFILE, HouseholdError, StateStore, cart_summary, cheapest_delivery_slot, delivery_candidate_digest, delivery_price_display, due_recurring, oslo_local_timestamp, put_item, validate_delivery_slot  # noqa: E402
 from migrate import migrate  # noqa: E402
+from oda import normalize_oda_delivery_slot, normalize_oda_delivery_slots, oda_cart_delivery_matches_slot, oda_cart_delivery_window, oda_delivery_slot_date  # noqa: E402
 from oda_browser import (  # noqa: E402
     CART_URL,
     CANCELLATION_BROWSER_ARGS,
     CHECKOUT_ENTRY_URL,
+    CHECKOUT_URL,
     DEFAULT_BROWSER_ARGS,
     CancellationPreconditionError,
     CheckoutPreconditionError,
     OdaBrowser,
     OdaCheckoutMismatchError,
+    ODA_CHECKOUT_AMOUNT_LABELS,
+    _oda_checkout_amount_script,
     cancellation_delivery_matches,
     cancellation_total_matches,
     clear_cancellation_cache,
     checkout_delivery_matches,
     checkout_lines_match,
+    oda_checkout_amount_minor,
     product_identity,
 )
-from service import Application, Server, config, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid  # noqa: E402
-from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, MenyOrderChangeDispatchError, _BrowserTransportError, _CheckoutNotReadyError, _DeliveryReservationError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_order_card_status, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
+from service import Application, Server, config, delivery_matches, menu_email_html, meny_order_matches_checkout, oda_order_matches_addition, order_matches_checkout, peer_uid, validate_schedule  # noqa: E402
+from meny import DEFAULT_BROWSER_ARGS as MENY_BROWSER_ARGS, MenyClient, MenyOrderChangeDispatchError, _BrowserTransportError, _CheckoutNotReadyError, _DeliveryReservationError, meny_checkout_reviews_match, meny_delivery_reservation_acknowledged, meny_delivery_window_identity, meny_label_slot_ref, meny_order_card_status, meny_order_search_completed, meny_selected_delivery, normalize_browser_cdp, normalize_cart_snapshot, normalize_checkout_payment_snapshot, normalize_delivery_slot_ref, normalize_meny_delivery_slot, normalize_product_ref, vipps_dispatch_acknowledged, vipps_dispatch_attempted  # noqa: E402
 
 
 CONFIG = {"instance": "test", "household": "Test", "email_automation_profile": "test-email", "profile_overrides": {}}
@@ -55,13 +61,33 @@ class FakeOda:
             "items": [{"product_id": 10, "name": "Fullkornspasta", "quantity": 1, "price": 35.0}],
             "count": 1,
             "subtotal": 35.0,
-            "delivery": {"display": "Saturday 2026-09-05 09:00 - 12:00"},
+            "delivery": {"slot_id": 70, "display": "Hjemlevering mellom kl 09 og 12, 5. sep"},
             "deliveryAddress": "Eksempelveien 1",
         }
         self.orders = []
         self.tracking = "paid_and_modifiable"
         self.order_delivery = "2026-09-05"
-        self.delivery_slots = {"slots": [{"id": 77, "name": "Lør 12. sep 09:00 - 12:00"}]}
+        self.delivery_slots = {"slots": [{
+            "slot_ref": "oda:2026-09-05:70",
+            "provider_slot_id": 70,
+            "start_at": "2026-09-05T09:00:00+02:00",
+            "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 4900,
+            "price_kind": "exact",
+            "selected": True,
+        }, {
+            "slot_ref": "oda:2026-09-12:77",
+            "provider_slot_id": 77,
+            "start_at": "2026-09-12T09:00:00+02:00",
+            "end_at": "2026-09-12T12:00:00+02:00",
+            "price_ore": 2900,
+            "price_kind": "exact",
+            "selected": False,
+        }]}
+        self.delivery_displays = {
+            "oda:2026-09-05:70": "Lør 5. sep 09:00 - 12:00",
+            "oda:2026-09-12:77": "Lør 12. sep 09:00 - 12:00",
+        }
 
     def probe(self, **_kwargs):
         return {"protocol_version": "2025-11-25", "server": {"name": "Oda MCP", "version": "1.1.0"}, "tool_count": 25}
@@ -82,8 +108,32 @@ class FakeOda:
         if tool == "order_tracking":
             return {"order_id": arguments["order_number"], "status": self.tracking}
         if tool == "get_delivery_slots":
-            return deepcopy(self.delivery_slots)
-        if tool in {"product_search", "recipe_search", "likely_to_buy", "select_delivery_slot"}:
+            slots = deepcopy(self.delivery_slots["slots"])
+            delivery_date = arguments.get("delivery_date")
+            if delivery_date:
+                slots = [slot for slot in slots if slot["start_at"].startswith(delivery_date + "T")]
+            return {"provider": "oda", "slots": slots}
+        if tool == "select_delivery_slot":
+            wanted = arguments.get("delivery_slot_id")
+            selected = [slot for slot in self.delivery_slots["slots"] if slot["provider_slot_id"] == wanted]
+            if len(selected) != 1:
+                raise HouseholdError("delivery slot is unavailable")
+            for slot in self.delivery_slots["slots"]:
+                slot["selected"] = slot["provider_slot_id"] == wanted
+            reference = selected[0]["slot_ref"]
+            start = datetime.fromisoformat(selected[0]["start_at"].replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/Oslo"))
+            end = datetime.fromisoformat(selected[0]["end_at"].replace("Z", "+00:00")).astimezone(ZoneInfo("Europe/Oslo"))
+            month = ("jan", "feb", "mar", "apr", "mai", "jun", "jul", "aug", "sep", "okt", "nov", "des")[start.month - 1]
+            self.cart["delivery"] = {
+                "slot_id": wanted,
+                "display": f"Hjemlevering mellom kl {start:%H} og {end:%H}, {start.day}. {month}",
+            }
+            return {
+                "provider": "oda",
+                "selected": deepcopy(selected[0]),
+                "display": self.delivery_displays[reference],
+            }
+        if tool in {"product_search", "recipe_search", "likely_to_buy"}:
             return {"tool": tool, "arguments": deepcopy(arguments)}
         raise AssertionError(tool)
 
@@ -260,7 +310,13 @@ class FakeMeny(FakeOda):
             return deepcopy(next(item for item in self.orders if str(item.get("orderNumber")) == str(arguments["order_number"])))
         if tool == "order_tracking":
             return {"order_id": str(arguments["order_number"]), "status": self.tracking}
-        return super().call(tool, arguments, **kwargs)
+        result = super().call(tool, arguments, **kwargs)
+        if tool == "get_delivery_slots":
+            result["display"] = {
+                slot["slot_ref"]: self.delivery_displays.get(slot["slot_ref"], slot["slot_ref"])
+                for slot in result["slots"]
+            }
+        return result
 
 
 class MutableCartMixin:
@@ -456,24 +512,377 @@ class CoreTestsBase:
         self.assertEqual(saved[0]["product_id"], short_suffix)
 
     def test_meny_delivery_slot_identity_is_exact_and_canonical(self):
-        slot = "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00"
+        slot = "meny:2026-09-03T10:00/12:00"
         self.assertEqual(normalize_delivery_slot_ref(slot), (
             slot,
             "3. september klokka 10:00 til 12:00",
         ))
         for invalid in (
-            "fra 0 kr, 3. september klokka 10:00 til 12:00:99",
-            "fra 0 kr, 3. september klokka 24:00 til 25:00",
-            "fra 0 kr, 3. september klokka 10:00 til 12:00, 4. september klokka 10:00 til 12:00",
-            "3. september klokka 09:00 til 10:00, 3. september klokka 10:00 til 12:00",
-            "4. september klokka 08:00 til 09:00, 3. september klokka 10:00 til 12:00",
-            "4. september, 3. september klokka 10:00 til 12:00",
-            "08:00 til 09:00, 3. september klokka 10:00 til 12:00",
-            "fra 0 kr, 0. september klokka 10:00 til 12:00",
+            "meny:2026-09-03T10:00/12:00:99",
+            "meny:2026-09-03T24:00/25:00",
+            "meny:2026-09-03T12:00/10:00",
+            "meny:2026-02-30T10:00/12:00",
+            "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00",
         ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(HouseholdError):
                     normalize_delivery_slot_ref(invalid)
+
+    def test_fixture_backed_oda_slots_preserve_ids_offsets_and_confirmed_free_price(self):
+        fixture = json.loads((ROOT / "tests/fixtures/delivery/oda_slots.json").read_text(encoding="utf-8"))
+        result = normalize_oda_delivery_slots(fixture["response"])
+        self.assertEqual(result["provider"], "oda")
+        self.assertEqual(result["delivery_date"], "2026-09-09")
+        self.assertEqual(len(result["slots"]), 20)
+        free = result["slots"][0]
+        self.assertEqual(free, {
+            "slot_ref": "oda:2026-09-09:1651235",
+            "provider_slot_id": 1651235,
+            "start_at": "2026-09-09T02:00:00Z",
+            "end_at": "2026-09-09T07:00:00Z",
+            "price_ore": 0,
+            "price_kind": "exact",
+            "selected": True,
+        })
+        self.assertEqual(delivery_price_display(free), "0 kr")
+        self.assertEqual(oda_delivery_slot_date(free["slot_ref"]), "2026-09-09")
+        self.assertTrue(all(set(slot) == {
+            "slot_ref", "provider_slot_id", "start_at", "end_at",
+            "price_ore", "price_kind", "selected",
+        } for slot in result["slots"]))
+
+    def test_oda_unobserved_price_forms_are_unavailable_not_guessed(self):
+        fixture = json.loads((ROOT / "tests/fixtures/delivery/oda_slots.json").read_text(encoding="utf-8"))
+        raw = fixture["response"]["slots"][1]
+        for price in (None, "", "kr 49", "49 kr", "kr\u00a049,00", "fra kr\u00a049", "kr\u00a0-1", "kr\u00a0NaN", 49):
+            with self.subTest(price=price):
+                slot = normalize_oda_delivery_slot({**raw, "price": price})
+                self.assertEqual(slot["price_kind"], "unavailable")
+                self.assertIsNone(slot["price_ore"])
+
+    def test_oda_slots_filter_provider_unavailability_and_reject_identity_drift(self):
+        fixture = json.loads((ROOT / "tests/fixtures/delivery/oda_slots.json").read_text(encoding="utf-8"))
+        response = deepcopy(fixture["response"])
+        response["slots"][0]["isFull"] = True
+        response["slots"][1]["isUnavailable"] = True
+        result = normalize_oda_delivery_slots(response)
+        self.assertEqual(len(result["slots"]), 18)
+        for changed, message in (
+            ({"id": True}, "id changed"),
+            ({"openDatetime": "2026-09-09T02:00:00"}, "timestamp changed"),
+            ({"closeDatetime": "2026-09-09T01:00:00Z"}, "end after"),
+            ({"isSelected": "false"}, "availability changed"),
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(HouseholdError, message):
+                normalize_oda_delivery_slot({**fixture["response"]["slots"][0], **changed})
+        with self.assertRaisesRegex(HouseholdError, "date changed"):
+            normalize_oda_delivery_slots({**fixture["response"], "deliveryDate": "2026-09-10"})
+
+    def test_fixture_backed_meny_from_price_is_not_exact_and_excludes_label_from_identity(self):
+        fixture = json.loads((ROOT / "tests/fixtures/delivery/meny_slots.json").read_text(encoding="utf-8"))
+        raw = fixture["slots"][0]
+        label = raw["aria_label"]
+        slot = normalize_meny_delivery_slot({
+            "slot_id": label,
+            "date": raw["delivery_date"],
+            "start": "07:00",
+            "end": "08:00",
+            "display": label,
+            "selected": raw["selected"],
+        })
+        self.assertEqual(slot, {
+            "slot_ref": "meny:2026-09-03T07:00/08:00",
+            "provider_slot_id": None,
+            "start_at": "2026-09-03T07:00:00+02:00",
+            "end_at": "2026-09-03T08:00:00+02:00",
+            "price_ore": 0,
+            "price_kind": "from",
+            "selected": True,
+        })
+        self.assertEqual(delivery_price_display(slot), "fra 0 kr")
+        drifted = label.replace("fra 0 kr fra 0 kroner", "fra 49 kr fra 49 kroner")
+        self.assertEqual(meny_label_slot_ref(drifted, today=date(2026, 9, 2))[0], slot["slot_ref"])
+
+    def test_meny_label_default_year_uses_oslo_calendar_date(self):
+        oslo_new_year = datetime(2026, 1, 1, 0, 30, tzinfo=ZoneInfo("Europe/Oslo"))
+        with mock.patch("meny.datetime") as clock:
+            clock.now.return_value = oslo_new_year
+            slot_ref, _suffix = meny_label_slot_ref(
+                "fra 49 kr fra 49 kroner, 31. desember klokka 09:00 til 12:00"
+            )
+
+        self.assertEqual(slot_ref, "meny:2026-12-31T09:00/12:00")
+        self.assertEqual(clock.now.call_args.args[0].key, "Europe/Oslo")
+
+    def test_meny_retains_unknown_price_prefixes_as_unavailable_candidates(self):
+        fixture = json.loads((ROOT / "tests/fixtures/delivery/meny_slots.json").read_text(encoding="utf-8"))
+        raw = fixture["slots"][0]
+        suffix = "3. september klokka 07:00 til 08:00"
+        for label in (
+            suffix,
+            f"10-20 kr, {suffix}",
+            f"anslått 0 kr, {suffix}",
+            f"kun 1 kr i dag, {suffix}",
+            f"fra -1 kr, {suffix}",
+            f"pris kommer, {suffix}",
+        ):
+            with self.subTest(label=label):
+                slot = normalize_meny_delivery_slot({
+                    "slot_id": label,
+                    "date": raw["delivery_date"],
+                    "start": "07:00",
+                    "end": "08:00",
+                    "display": label,
+                    "selected": False,
+                })
+                self.assertEqual(slot["price_kind"], "unavailable")
+                self.assertIsNone(slot["price_ore"])
+
+    def test_captured_checkout_amounts_preserve_only_provider_supplied_fields(self):
+        fixture = json.loads((ROOT / "tests/fixtures/delivery/checkout_summaries.json").read_text(encoding="utf-8"))
+        serialized = json.dumps(fixture, ensure_ascii=False).casefold()
+        self.assertNotIn("payment_method", serialized)
+        self.assertNotIn("vipps", serialized)
+        meny = fixture["providers"]["meny"]
+        self.assertEqual(meny["cart"]["provider_total"], 427.58)
+        self.assertEqual(meny["checkout"]["provider_total"], 473.90)
+        self.assertIsNone(meny["checkout"]["delivery_price"])
+        self.assertNotEqual(
+            meny["checkout"]["provider_total"] - meny["cart"]["provider_total"],
+            meny["checkout"]["delivery_price"],
+        )
+        oda = fixture["providers"]["oda"]
+        self.assertEqual(oda["cart"]["selected_delivery"]["slot_id"], 1651235)
+        self.assertEqual(oda["checkout"]["product_subtotal"], 1071.00)
+        self.assertEqual(oda["checkout"]["provider_total"], 1078.95)
+        self.assertEqual(oda["checkout"]["delivery_price"], 0.0)
+        self.assertEqual(oda["checkout"]["discounts"], -62.90)
+        self.assertEqual(oda["checkout"]["bags"], 41.85)
+        self.assertEqual(
+            oda["checkout"]["other_fees"], {"Tillegg for mindre bestilling": 29.0},
+        )
+        rows = oda["checkout"]["labeled_rows"]
+        self.assertEqual(
+            [row["label"] for row in rows],
+            [
+                "26 varer", "Du sparer", "Delsum",
+                "Tillegg for mindre bestilling", "Leveringsemballasje",
+                "Levering", "Total inkl. MVA",
+            ],
+        )
+        parsed = {
+            row["label"]: oda_checkout_amount_minor(row["label"], row["amount_text"])
+            for row in rows
+        }
+        self.assertEqual(parsed, {
+            "26 varer": 107100,
+            "Du sparer": -6290,
+            "Delsum": 100810,
+            "Tillegg for mindre bestilling": 2900,
+            "Leveringsemballasje": 4185,
+            "Levering": 0,
+            "Total inkl. MVA": 107895,
+        })
+        for changed in ("62,90 kr", "−62.9 kr", "−62,90"):
+            with self.subTest(changed=changed), self.assertRaisesRegex(HouseholdError, "amount row changed"):
+                oda_checkout_amount_minor("Du sparer", changed)
+        for changed_label in ("varer", "26 vare", "26.0 varer", "10000000 varer"):
+            with self.subTest(changed_label=changed_label), self.assertRaisesRegex(HouseholdError, "amount row changed"):
+                oda_checkout_amount_minor(changed_label, "1\u00a0071,00 kr")
+
+    def test_oda_cart_delivery_display_binds_the_selected_slot(self):
+        fixture = json.loads((ROOT / "tests/fixtures/delivery/checkout_summaries.json").read_text(encoding="utf-8"))
+        cart_delivery = fixture["providers"]["oda"]["cart"]["selected_delivery"]
+        slot_fixture = json.loads((ROOT / "tests/fixtures/delivery/oda_slots.json").read_text(encoding="utf-8"))
+        slot = normalize_oda_delivery_slot(slot_fixture["response"]["slots"][0])
+
+        parsed = oda_cart_delivery_window(cart_delivery, today=date(2026, 9, 2))
+
+        self.assertEqual(parsed, {
+            "slot_id": 1651235,
+            "date": "2026-09-09",
+            "start": "04:00",
+            "end": "09:00",
+        })
+        self.assertTrue(
+            oda_cart_delivery_matches_slot(
+                cart_delivery, slot, today=date(2026, 9, 2),
+            )
+        )
+        self.assertFalse(
+            oda_cart_delivery_matches_slot(
+                cart_delivery,
+                {**slot, "end_at": "2026-09-09T08:00:00Z"},
+                today=date(2026, 9, 2),
+            )
+        )
+        self.assertEqual(
+            oda_cart_delivery_window(
+                {"slot_id": 1, "display": "Hjemlevering mellom kl 09 og 12, 2. jan"},
+                today=date(2026, 12, 31),
+            )["date"],
+            "2027-01-02",
+        )
+        for changed in (
+            {"slot_id": 1651235, "display": "Wednesday 9 September 04:00-09:00"},
+            {"slot_id": "1651235", "display": cart_delivery["display"]},
+            {"slot_id": 1651235, "display": "Hjemlevering mellom kl 04 og 09, 31. feb"},
+        ):
+            with self.subTest(changed=changed), self.assertRaisesRegex(HouseholdError, "selected cart delivery changed"):
+                oda_cart_delivery_window(changed, today=date(2026, 9, 2))
+
+    def test_checkout_amounts_require_named_other_fees(self):
+        cart = {
+            "items": [],
+            "count": 0,
+            "subtotal": 100.0,
+            "amounts": {
+                "product_subtotal": 100.0,
+                "delivery_price": 0.0,
+                "discounts": None,
+                "deposits": None,
+                "bags": None,
+                "other_fees": {"  Tillegg   for mindre bestilling  ": 29.0},
+                "provider_total": 100.0,
+            },
+        }
+        summary = cart_summary(cart)
+        self.assertEqual(
+            summary["amounts"]["other_fees"],
+            {"Tillegg for mindre bestilling": 29.0},
+        )
+        cart["amounts"]["other_fees"] = 29.0
+        with self.assertRaisesRegex(HouseholdError, "checkout amounts"):
+            cart_summary(cart)
+        cart["amounts"]["other_fees"] = None
+        for key, invalid in (("bags", -1.0), ("discounts", 1.0)):
+            cart["amounts"][key] = invalid
+            with self.subTest(key=key), self.assertRaisesRegex(HouseholdError, "checkout amounts"):
+                cart_summary(cart)
+            cart["amounts"][key] = None
+
+    def test_delivery_contract_renders_free_from_and_missing_without_currency_or_inference(self):
+        base = {
+            "slot_ref": "provider:free",
+            "provider_slot_id": 7,
+            "start_at": "2030-01-05T12:00:00+01:00",
+            "end_at": "2030-01-05T14:00:00+01:00",
+            "price_ore": 0,
+            "price_kind": "exact",
+            "selected": False,
+        }
+        self.assertEqual(delivery_price_display(base), "0 kr")
+        self.assertEqual(delivery_price_display({**base, "price_kind": "from"}), "fra 0 kr")
+        self.assertEqual(delivery_price_display({**base, "price_kind": "unavailable", "price_ore": None}), "pris ikke tilgjengelig")
+        self.assertNotIn("currency", validate_delivery_slot(base))
+        for invalid in (
+            {**base, "price_ore": -1},
+            {**base, "price_ore": 1.5},
+            {**base, "price_ore": None},
+            {**base, "price_kind": "unavailable"},
+            {**base, "price_kind": "estimate", "price_ore": None},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(HouseholdError):
+                validate_delivery_slot(invalid)
+        for timestamp in (
+            "2030-01-05 12:00:00+01:00",
+            "2030-01-05T12:00+01:00",
+            "20300105T120000+0100",
+            "2030-01-05T12:00:00+01:00:30",
+            "2030-01-05T12:00:00+15:00",
+        ):
+            with self.subTest(timestamp=timestamp), self.assertRaisesRegex(HouseholdError, "timestamp"):
+                validate_delivery_slot({**base, "start_at": timestamp})
+
+    def test_checkout_binding_uses_exact_slot_price_without_total_subtraction(self):
+        slot = {
+            "slot_ref": "oda:7",
+            "provider_slot_id": 7,
+            "start_at": "2030-01-05T12:00:00+01:00",
+            "end_at": "2030-01-05T14:00:00+01:00",
+            "price_ore": 4900,
+            "price_kind": "exact",
+            "selected": True,
+        }
+        amounts = {
+            "product_subtotal": None,
+            "delivery_price": None,
+            "discounts": None,
+            "deposits": None,
+            "bags": None,
+            "other_fees": None,
+            "provider_total": 100.0,
+        }
+        bound = Application._bind_delivery_summary(
+            {"total": 100.0, "amounts": amounts},
+            {"selected": slot, "price_display": "49 kr", "candidate_digest": None, "origin": "explicit"},
+        )
+        self.assertEqual(bound["amounts"]["delivery_price"], 49.0)
+        self.assertIsNone(bound["amounts"]["product_subtotal"])
+        with self.assertRaisesRegex(HouseholdError, "disagrees"):
+            Application._bind_delivery_summary(
+                {"total": 100.0, "amounts": {**amounts, "delivery_price": 39.0}},
+                {"selected": slot, "price_display": "49 kr", "candidate_digest": None, "origin": "explicit"},
+            )
+
+    def test_cheapest_delivery_applies_deterministic_ties_and_rejects_mixed_prices(self):
+        def slot(reference, start, end, price):
+            return {
+                "slot_ref": reference,
+                "provider_slot_id": reference,
+                "start_at": f"2030-01-05T{start}:00+01:00",
+                "end_at": f"2030-01-05T{end}:00+01:00",
+                "price_ore": price,
+                "price_kind": "exact",
+                "selected": False,
+            }
+
+        candidates = [
+            slot("z", "09:00", "13:00", 4900),
+            slot("b", "10:00", "14:00", 4900),
+            slot("a", "10:00", "14:00", 4900),
+            slot("cheap", "12:00", "15:00", 3900),
+        ]
+        self.assertEqual(cheapest_delivery_slot(candidates, preferred_end="14:00")["slot_ref"], "cheap")
+        tied = [{**item, "price_ore": 4900} for item in candidates[:-1]]
+        self.assertEqual(cheapest_delivery_slot(tied, preferred_end="14:00")["slot_ref"], "a")
+        mixed = [tied[0], {**tied[1], "price_kind": "from"}]
+        with self.assertRaisesRegex(HouseholdError, "not all exact"):
+            cheapest_delivery_slot(mixed, preferred_end="14:00")
+        self.assertEqual(delivery_candidate_digest(tied), delivery_candidate_digest([{**item, "selected": True} for item in tied]))
+        self.assertEqual(delivery_candidate_digest(tied), delivery_candidate_digest(list(reversed(tied))))
+
+    def test_delivery_hard_boundaries_and_oslo_dst_are_not_guessed(self):
+        preference = {"weekday": "Saturday", "preferred_end": "14:00", "latest_end": "18:00", "strategy": "cheapest"}
+        slot = {
+            "slot_ref": "boundary",
+            "provider_slot_id": None,
+            "start_at": "2030-01-05T16:00:00+01:00",
+            "end_at": "2030-01-05T18:00:00+01:00",
+            "price_ore": 4900,
+            "price_kind": "exact",
+            "selected": False,
+        }
+        self.assertTrue(delivery_matches(preference, slot))
+        self.assertFalse(delivery_matches(preference, {**slot, "end_at": "2030-01-05T18:01:00+01:00"}))
+        utc_slot = {
+            **slot,
+            "start_at": "2030-01-05T15:00:00Z",
+            "end_at": "2030-01-05T17:01:00Z",
+        }
+        self.assertFalse(delivery_matches(preference, utc_slot))
+        local_nearest = {**slot, "slot_ref": "local-nearest", "start_at": "2030-01-05T11:00:00Z", "end_at": "2030-01-05T13:00:00Z"}
+        supplied_offset_nearest = {**slot, "slot_ref": "offset-nearest", "start_at": "2030-01-05T13:00:00+01:00", "end_at": "2030-01-05T15:00:00+01:00"}
+        self.assertEqual(
+            cheapest_delivery_slot(
+                [supplied_offset_nearest, local_nearest], preferred_end="14:00",
+            )["slot_ref"],
+            "local-nearest",
+        )
+        self.assertEqual(oslo_local_timestamp(date(2030, 1, 5), "12:00"), "2030-01-05T12:00:00+01:00")
+        for day, clock in ((date(2026, 3, 29), "02:30"), (date(2026, 10, 25), "02:30")):
+            with self.subTest(day=day), self.assertRaisesRegex(HouseholdError, "impossible or ambiguous"):
+                oslo_local_timestamp(day, clock)
 
     def test_live_shaped_cart_is_normalized_for_checkout(self):
         cart = {
@@ -488,8 +897,27 @@ class CoreTestsBase:
         self.assertEqual(summary["items"][0]["product_id"], "10")
         self.assertEqual(summary["total"], 35.0)
         self.assertEqual(summary["delivery"]["slot_id"], 7)
+        self.assertEqual(summary["amounts"], {
+            "product_subtotal": None,
+            "delivery_price": None,
+            "discounts": None,
+            "deposits": None,
+            "bags": None,
+            "other_fees": None,
+            "provider_total": 35.0,
+        })
         expected = OdaBrowser._cart_expectation(cart)
         self.assertEqual(expected["lines"], [{"name": "Fullkornspasta", "identity": "fullkornspasta 500 g testmerke", "quantity": 1}])
+        self.assertEqual(expected["product_count"], 1)
+
+        with self.assertRaisesRegex(HouseholdError, "product count changed"):
+            OdaBrowser._cart_expectation({**cart, "productQuantityCount": 2})
+
+    def test_oda_order_product_count_is_exact_and_bounded(self):
+        self.assertEqual(OdaBrowser._order_product_count({"productQuantityCount": 26}), 26)
+        for count in (None, True, 0, 1.5, "26", 1_000_001):
+            with self.subTest(count=count), self.assertRaisesRegex(HouseholdError, "product count is unavailable"):
+                OdaBrowser._order_product_count({"productQuantityCount": count})
 
     def test_checkout_product_identity_rejects_a_different_package_size(self):
         expected = [{"identity": product_identity("Karbonadedeig", "350 g", "Testmerke"), "quantity": 1}]
@@ -935,10 +1363,24 @@ class CoreTestsBase:
             "payment_display": "•••• 1234",
             "submit_controls": 1,
         }
+        extracted_amounts = {
+            "amounts": {
+                "product_subtotal": 23385,
+                "delivery_price": 0,
+                "discounts": -6290,
+                "deposits": None,
+                "bags": 4185,
+                "other_fees": {"Tillegg for mindre bestilling": 2900},
+                "provider_total": 24180,
+            },
+            "amounts_valid": True,
+        }
         results = iter([
             {"expanded": True},
             {"ready": True},
+            {"expanded": True},
             deepcopy(extracted),
+            deepcopy(extracted_amounts),
         ])
         browser._eval = lambda script: scripts.append(script) or next(results)
 
@@ -948,12 +1390,64 @@ class CoreTestsBase:
         self.assertTrue(review["delivery_matches"])
         self.assertNotIn("items", review)
         self.assertNotIn("delivery_roots", review)
-        self.assertIn("Vi leverer varene dine", scripts[-1])
+        self.assertEqual(review["amounts"]["discounts"], -62.9)
+        self.assertEqual(
+            review["amounts"]["other_fees"], {"Tillegg for mindre bestilling": 29.0},
+        )
+        self.assertIn("Vi leverer varene dine", scripts[-2])
+        for label in ODA_CHECKOUT_AMOUNT_LABELS.values():
+            self.assertIn(label, scripts[-1])
+        self.assertIn("String(1)+' varer'", scripts[-1])
+        self.assertIn("labels.length===0&&candidates.length===0", scripts[-1])
+        self.assertIn("summaryRoot.contains(row.root)", scripts[-1])
+        self.assertIn("unknownRows", scripts[-1])
 
-        malformed = iter([{"expanded": True}, {"ready": True}, {**extracted, "submit_controls": True}])
+        malformed = iter([{"expanded": True}, {"ready": True}, {"expanded": True}, {**extracted, "submit_controls": True}])
         browser._eval = lambda _script: next(malformed)
         with self.assertRaisesRegex(HouseholdError, "page changed"):
             browser._review_checkout(cart)
+
+    def test_oda_final_click_rechecks_every_protected_amount_component(self):
+        browser = OdaBrowser.__new__(OdaBrowser)
+        browser._checkout_deadline = None
+        scripts = []
+        browser._eval = lambda script: scripts.append(script) or {"clicked": True}
+        before_click = mock.Mock()
+        amounts = {
+            "product_subtotal": 1071.00,
+            "delivery_price": 0.0,
+            "discounts": -62.90,
+            "deposits": None,
+            "bags": 41.85,
+            "other_fees": {"Tillegg for mindre bestilling": 29.0},
+            "provider_total": 1078.95,
+        }
+
+        browser._click_checkout_submit(
+            107895,
+            CHECKOUT_URL,
+            before_click,
+            expected_product_count=26,
+            expected_amounts=amounts,
+        )
+
+        before_click.assert_called_once_with()
+        script = scripts[0]
+        self.assertIn('"product_subtotal":107100', script)
+        self.assertIn("String(26)+' varer'", script)
+        self.assertIn('"discounts":-6290', script)
+        self.assertIn('"Tillegg for mindre bestilling":2900', script)
+        self.assertIn("JSON.stringify(amounts)===JSON.stringify(expectedAmounts)", script)
+        self.assertLess(script.index("amountsValid"), script.index("labels[0].click()"))
+
+        browser._eval = mock.Mock(return_value={"clicked": False})
+        with self.assertRaisesRegex(CheckoutPreconditionError, "button changed"):
+            browser._click_checkout_submit(
+                107895,
+                CHECKOUT_URL,
+                expected_product_count=26,
+                expected_amounts=amounts,
+            )
 
     def test_intervals(self):
         weekly = {"schedule": {"unit": "weeks", "every": 2, "anchor": "2026-W36"}}
@@ -972,7 +1466,7 @@ class CoreTestsBase:
             "history": [{"old": True}],
         }}
         state = migrate(CONFIG, planning, {"schedules": []})
-        self.assertEqual(state["version"], 6)
+        self.assertEqual(state["version"], 7)
         self.assertEqual(len(state["product_favorites"]), 1)
         self.assertNotIn("favorites", state)
         self.assertEqual(len(state["recurring_items"]), 1)
@@ -983,7 +1477,9 @@ class CoreTestsBase:
     def test_clean_state_and_skill_expose_only_product_favorites(self):
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
-        self.assertEqual(state["version"], 6)
+        self.assertEqual(state["version"], 7)
+        self.assertEqual(state["schedule"]["delivery"]["strategy"], "cheapest")
+        self.assertIsNone(state["delivery_selection"])
         self.assertEqual(state["product_favorites"], [])
         self.assertNotIn("favorites", state)
         skill = (CORE / "skill" / "SKILL.md").read_text(encoding="utf-8")
@@ -1010,7 +1506,8 @@ class CoreTestsBase:
 
             self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(backup_before), state)
-            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["schedule"]["delivery"]["strategy"], "keep_selected")
             self.assertEqual(migrated["product_favorites"], items)
             self.assertNotIn("favorites", migrated)
 
@@ -1056,6 +1553,51 @@ class CoreTestsBase:
                 StateStore(Path(temp), CONFIG)
             self.assertEqual(state_path.read_bytes(), before)
 
+    def test_v6_migration_creates_one_exact_private_backup_and_defaults_to_keep_selected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state["version"] = 6
+            state["schedule"]["delivery"].pop("strategy")
+            state.pop("delivery_selection")
+            state_path = self.write_state(temp, state)
+
+            migrated = StateStore(Path(temp), CONFIG).read()
+            backup_path = Path(temp) / "state-v6.backup.json"
+            backup = backup_path.read_bytes()
+            after = state_path.read_bytes()
+            modified = state_path.stat().st_mtime_ns
+
+            self.assertEqual(json.loads(backup), state)
+            self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["schedule"]["delivery"]["strategy"], "keep_selected")
+            self.assertIsNone(migrated["delivery_selection"])
+
+            StateStore(Path(temp), CONFIG)
+            self.assertEqual(backup_path.read_bytes(), backup)
+            self.assertEqual(state_path.read_bytes(), after)
+            self.assertEqual(state_path.stat().st_mtime_ns, modified)
+
+        for field, value in (
+            ("strategy", "cheapest"),
+            ("strategy", "invalid"),
+            ("delivery_selection", {"unexpected": True}),
+        ):
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as temp:
+                state = StateStore(Path(temp), CONFIG).read()
+                state["version"] = 6
+                state["schedule"]["delivery"].pop("strategy")
+                state.pop("delivery_selection")
+                if field == "strategy":
+                    state["schedule"]["delivery"][field] = value
+                else:
+                    state[field] = value
+                state_path = self.write_state(temp, state)
+                before = state_path.read_bytes()
+                with self.assertRaisesRegex(HouseholdError, "conflict"):
+                    StateStore(Path(temp), CONFIG)
+                self.assertEqual(state_path.read_bytes(), before)
+
     def test_malformed_v6_old_key_fails_closed_and_older_states_continue_through_v6(self):
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
@@ -1073,14 +1615,14 @@ class CoreTestsBase:
             del state["product_favorites"]
             self.write_state(temp, state)
             migrated = StateStore(Path(temp), CONFIG).read()
-            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["version"], 7)
             self.assertEqual(migrated["product_favorites"], state["favorites"])
             self.assertTrue((Path(temp) / "state-v4.backup.json").exists())
             self.assertTrue((Path(temp) / "state-v5.backup.json").exists())
 
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
-            state["version"] = 7
+            state["version"] = 8
             self.write_state(temp, state)
             with self.assertRaisesRegex(HouseholdError, "newer than"):
                 StateStore(Path(temp), CONFIG)
@@ -1107,7 +1649,7 @@ class CoreTestsBase:
             state = json.loads((root / "output" / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(report["product_favorites_count"], 1)
             self.assertNotIn("favorites", report)
-            self.assertEqual(state["version"], 6)
+            self.assertEqual(state["version"], 7)
             self.assertEqual(state["product_favorites"][0]["product_id"], "1")
             self.assertNotIn("favorites", state)
 
@@ -1209,7 +1751,7 @@ if arguments and arguments[0] == \"-\":
     if 'status = rpc(\"status\")' in source:
         state_path = Path(os.environ[\"MEAL_PLANNER_HOME\"]) / \"state\" / \"state.json\"
         state = json.loads(state_path.read_text(encoding=\"utf-8\"))
-        if state.get(\"version\") != 6 or \"product_favorites\" not in state or \"favorites\" in state:
+        if state.get(\"version\") != 7 or \"product_favorites\" not in state or \"favorites\" in state:
             raise SystemExit(1)
         with open({str(python_log)!r}, \"a\", encoding=\"utf-8\") as handle:
             handle.write(\"status-probe\\n\")
@@ -1319,7 +1861,7 @@ else:
             self.assertEqual(completed.returncode, 0, completed.stderr)
             migrated = json.loads(state_path.read_text(encoding="utf-8"))
             backup = private_root / "state" / "state-v5.backup.json"
-            self.assertEqual(migrated["version"], 6)
+            self.assertEqual(migrated["version"], 7)
             self.assertEqual(migrated["product_favorites"], product_items)
             self.assertNotIn("favorites", migrated)
             self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), old_state)
@@ -1352,7 +1894,7 @@ else:
                     self.assertTrue(any(command.startswith("bootstrap gui/") for command in commands))
                 self.assertEqual(python_log.read_text(encoding="utf-8"), "status-probe\n")
 
-    def test_clean_install_creates_v6_skill_registration_and_new_tool_schema(self):
+    def test_clean_install_creates_v7_skill_registration_and_new_tool_schema(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             completed, old_state, product_items, state_path, service_log, python_log, hermes_log, hermes_home, private_root = self.fake_install(
@@ -1362,7 +1904,7 @@ else:
             self.assertIsNone(old_state)
             self.assertEqual(product_items, [])
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(state["version"], 6)
+            self.assertEqual(state["version"], 7)
             self.assertEqual(state["product_favorites"], [])
             self.assertNotIn("favorites", state)
             self.assertFalse((private_root / "state" / "state-v5.backup.json").exists())
@@ -1657,7 +2199,7 @@ else:
         browser._checkout_deadline = None
         browser._invoke = lambda *_arguments, **_kwargs: {}
         browser.review_checkout = lambda _cart: {"review": "same"}
-        browser._cart_expectation = lambda _cart: {"total_minor": 100}
+        browser._cart_expectation = lambda _cart: {"total_minor": 100, "product_count": 1}
         evaluations = []
         browser._eval = lambda script: evaluations.append(script) or {"clicked": True}
 
@@ -1670,7 +2212,7 @@ else:
     def test_checkout_read_only_preclick_failure_is_not_uncertain(self):
         browser = OdaBrowser.__new__(OdaBrowser)
         browser.review_checkout = lambda _cart: {"review": "same"}
-        browser._cart_expectation = lambda _cart: {"total_minor": 100}
+        browser._cart_expectation = lambda _cart: {"total_minor": 100, "product_count": 1}
         evaluations = []
         browser._eval = lambda script: evaluations.append(script) or {"clicked": True}
 
@@ -2436,11 +2978,11 @@ class MenyClientTests(unittest.TestCase):
                 "identity": True,
                 "authenticated": True,
                 "slots": [{
-                "slot_id": "fra 0 kr, 2. september klokka 07:00 til 08:00",
+                "slot_id": "fra 0 kr fra 0 kroner, 2. september klokka 07:00 til 08:00",
                 "date": "2026-09-02",
                 "start": "07:00",
                 "end": "08:00",
-                "display": "fra 0 kr, 2. september klokka 07:00 til 08:00",
+                "display": "fra 0 kr fra 0 kroner, 2. september klokka 07:00 til 08:00",
                 "selected": False,
                 }],
             },
@@ -2451,12 +2993,50 @@ class MenyClientTests(unittest.TestCase):
         result = client._delivery_slots("2026-09-02")
 
         self.assertEqual(len(result["slots"]), 1)
+        self.assertEqual(result["display"], {
+            "meny:2026-09-02T07:00/08:00":
+                "fra 0 kr fra 0 kroner, 2. september klokka 07:00 til 08:00",
+        })
         self.assertIn("querySelectorAll('dialog,[role=\"dialog\"]')", client._eval.call_args.args[0])
         self.assertIn("=== 'Lukk'", client._eval.call_args.args[0])
         self.assertNotIn("['Avbryt','Lukk']", client._eval.call_args.args[0])
         client._sleep.assert_called_once_with(0.25)
         client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
         client._wait_delivery_picker_closed.assert_called_once_with()
+
+    def test_meny_price_label_drift_changes_display_without_changing_identity(self):
+        client = self.client()
+        client._open_delivery_picker = mock.Mock()
+        client._sleep = mock.Mock()
+        client._invoke = mock.Mock(return_value={})
+        client._wait_delivery_picker_closed = mock.Mock()
+        labels = (
+            "fra 0 kr fra 0 kroner, 2. september klokka 07:00 til 08:00",
+            "fra 49 kr fra 49 kroner, 2. september klokka 07:00 til 08:00",
+        )
+        results = []
+        for label in labels:
+            client._eval = mock.Mock(return_value={
+                "ready": True,
+                "identity": True,
+                "authenticated": True,
+                "slots": [{
+                    "slot_id": label,
+                    "date": "2026-09-02",
+                    "start": "07:00",
+                    "end": "08:00",
+                    "display": label,
+                    "selected": False,
+                }],
+            })
+            results.append(client._delivery_slots("2026-09-02"))
+
+        reference = "meny:2026-09-02T07:00/08:00"
+        self.assertEqual(results[0]["slots"][0]["slot_ref"], reference)
+        self.assertEqual(results[1]["slots"][0]["slot_ref"], reference)
+        self.assertNotEqual(results[0]["display"][reference], results[1]["display"][reference])
+        self.assertEqual(results[0]["price_display"][reference], "fra 0 kr")
+        self.assertEqual(results[1]["price_display"][reference], "fra 49 kr")
 
     def test_delivery_selection_binds_both_native_dialog_steps(self):
         client = self.client()
@@ -2465,19 +3045,20 @@ class MenyClientTests(unittest.TestCase):
         scripts = []
         results = iter([
             {"ready": False, "identity": True, "authenticated": True},
-            {"ready": True, "identity": True, "authenticated": True, "already_selected": False},
-            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
+            {"ready": True, "identity": True, "authenticated": True, "already_selected": False, "label": "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00"},
+            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1, "label": "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00"},
             {"ready": True, "identity": True, "authenticated": True, "dialog_count": 0},
-            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
+            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1, "label": "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00"},
             {"ready": True, "identity": True, "authenticated": True, "dialog_count": 0},
         ])
         client._eval = lambda script: scripts.append(script) or next(results)
         client._invoke = mock.Mock(return_value={})
         client._wait_for_delivery_reservation = mock.Mock()
 
-        result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        result = client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
 
-        self.assertEqual(result["selected"]["display"], "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        self.assertEqual(result["selected"]["slot_ref"], "meny:2026-09-03T10:00/12:00")
+        self.assertEqual(result["price_display"], "fra 0 kr")
         self.assertIn("querySelectorAll('dialog,[role=\"dialog\"]')", scripts[1])
         self.assertIn("querySelectorAll('dialog,[role=\"dialog\"]')", scripts[2])
         self.assertIn("button[aria-pressed=\"true\"]", scripts[2])
@@ -2488,7 +3069,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("label.match(/^Behold levering", scripts[2])
         self.assertIn("confirm.length + keep.length !== 1", scripts[2])
         self.assertNotIn("startsWith('Bekreft levering ')", scripts[2])
-        self.assertNotIn("endsWith(expectedSuffix)", scripts[2])
+        self.assertIn("endsWith(expectedSuffix)", scripts[2])
         client._sleep.assert_called_once_with(0.25)
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
@@ -2511,17 +3092,17 @@ class MenyClientTests(unittest.TestCase):
                 "refresh_slot": "fra 0 kr fra 0 kroner, 3. september klokka 08:00 til 10:00",
             },
             {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
-            {"ready": True, "identity": True, "authenticated": True, "already_selected": False},
+            {"ready": True, "identity": True, "authenticated": True, "already_selected": False, "label": "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00"},
             {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
-            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1},
+            {"ready": True, "identity": True, "authenticated": True, "selected_count": 1, "total_selected_count": 1, "label": "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00"},
         ])
         client._invoke = mock.Mock(return_value={})
         client._wait_delivery_picker_closed = mock.Mock()
         client._wait_for_delivery_reservation = mock.Mock()
 
-        result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        result = client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
 
-        self.assertEqual(result["selected"]["display"], "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        self.assertEqual(result["selected"]["slot_ref"], "meny:2026-09-03T10:00/12:00")
         self.assertEqual(client._open_delivery_picker.call_count, 3)
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("click", '[data-hermes-meal-planner-action="delivery-refresh-slot"]'),
@@ -2543,14 +3124,15 @@ class MenyClientTests(unittest.TestCase):
             "identity": True,
             "authenticated": True,
             "already_selected": True,
+            "label": "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00",
         })
         client._invoke = mock.Mock(return_value={})
         client._wait_for_delivery_reservation = mock.Mock()
         client._wait_delivery_picker_closed = mock.Mock()
 
-        result = client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        result = client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
 
-        self.assertEqual(result["selected"]["display"], "fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+        self.assertEqual(result["selected"]["slot_ref"], "meny:2026-09-03T10:00/12:00")
         client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
         client._wait_delivery_picker_closed.assert_called_once_with()
 
@@ -2567,7 +3149,7 @@ class MenyClientTests(unittest.TestCase):
         client._wait_for_delivery_reservation = mock.Mock()
 
         with self.assertRaisesRegex(HouseholdError, "selection is uncertain"):
-            client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+            client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
 
         self.assertEqual(client._open_delivery_picker.call_count, 1)
         self.assertEqual(client._invoke.call_args_list, [
@@ -2587,7 +3169,7 @@ class MenyClientTests(unittest.TestCase):
         client._invoke = mock.Mock(return_value={})
 
         with self.assertRaisesRegex(HouseholdError, "confirmation changed"):
-            client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+            client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
 
         client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-slot"]')
 
@@ -2602,7 +3184,7 @@ class MenyClientTests(unittest.TestCase):
                 client._eval = mock.Mock(return_value=state)
                 client._invoke = mock.Mock(return_value={})
                 with self.assertRaisesRegex(HouseholdError, message):
-                    client._select_delivery_slot("fra 0 kr fra 0 kroner, 3. september klokka 10:00 til 12:00")
+                    client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
                 client._invoke.assert_not_called()
 
     def test_order_context_verification_waits_for_the_cart_shell_to_settle(self):
@@ -2631,17 +3213,18 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("location.pathname === '/varer'", client._eval.call_args_list[-1].args[0])
 
     def test_selected_delivery_normalizes_the_picker_slot_for_checkout(self):
-        slots = [{
+        raw = {
             "slot_id": "fra 0 kr fra 0 kroner, 3. september klokka 07:00 til 08:00",
             "date": "2026-09-03",
             "start": "07:00",
             "end": "08:00",
+            "display": "fra 0 kr fra 0 kroner, 3. september klokka 07:00 til 08:00",
             "selected": True,
-        }]
+        }
+        slots = [normalize_meny_delivery_slot(raw)]
 
         self.assertEqual(meny_selected_delivery(slots), {
-            "slot_id": slots[0]["slot_id"],
-            "display": "torsdag 3. september kl. 07:00-08:00",
+            **slots[0], "display": "torsdag 3. september kl. 07:00-08:00",
         })
         self.assertIsNone(meny_selected_delivery([{**slots[0], "selected": False}]))
         with self.assertRaisesRegex(HouseholdError, "ambiguous"):
@@ -2649,13 +3232,13 @@ class MenyClientTests(unittest.TestCase):
                 slots[0],
                 {
                     **slots[0],
-                    "slot_id": "3. september klokka 09:00 til 10:00",
-                    "start": "09:00",
-                    "end": "10:00",
+                    "slot_ref": "meny:2026-09-03T09:00/10:00",
+                    "start_at": "2026-09-03T09:00:00+02:00",
+                    "end_at": "2026-09-03T10:00:00+02:00",
                 },
             ])
         with self.assertRaisesRegex(HouseholdError, "invalid"):
-            meny_selected_delivery([{**slots[0], "date": "2026-09-04"}])
+            meny_selected_delivery([{**slots[0], "start_at": "not-a-time"}])
 
     def test_cart_read_opens_the_visible_cart_and_returns_provider_shape(self):
         client = self.client()
@@ -2673,6 +3256,15 @@ class MenyClientTests(unittest.TestCase):
         client._sleep.assert_called_once_with(0.5)
         self.assertEqual(cart["items"][0]["product_id"], MENY_PRODUCT)
         self.assertEqual(cart["delivery"], {"slot_id": None, "display": "torsdag 3. sep. kl. 10:00-12:00"})
+        self.assertEqual(cart["amounts"], {
+            "product_subtotal": 19.9,
+            "delivery_price": None,
+            "discounts": None,
+            "deposits": None,
+            "bags": None,
+            "other_fees": None,
+            "provider_total": 19.9,
+        })
         self.assertEqual(cart["checkout"]["mode"], "protected_vipps")
         self.assertTrue(all("'Til kassen','Fortsett'" in script for script in scripts))
         self.assertIn("deliveryPrefix = 'Du har valgt at varene leveres på døren'", scripts[-1])
@@ -3080,6 +3672,7 @@ class MenyClientTests(unittest.TestCase):
         }), {
             "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 20.0}],
             "count": 1,
+            "product_subtotal": 20.0,
             "total": 19.9,
             "delivery": None,
         })
@@ -3100,7 +3693,7 @@ class MenyClientTests(unittest.TestCase):
             "items": [],
             "count": 0,
             "total": 0,
-        }), {"items": [], "count": 0, "total": 0.0, "delivery": None})
+        }), {"items": [], "count": 0, "product_subtotal": 0.0, "total": 0.0, "delivery": None})
 
     def test_checkout_payment_snapshot_rejects_malformed_boundary_values(self):
         valid = {
@@ -3774,13 +4367,14 @@ class MenyClientTests(unittest.TestCase):
         client._open = mock.Mock()
         client._sleep = mock.Mock()
         client._click_checkout_control = mock.Mock()
-        client._delivery_slots = mock.Mock(return_value={"slots": [{
+        client._delivery_slots = mock.Mock(return_value={"slots": [normalize_meny_delivery_slot({
             "slot_id": "3. september klokka 07:00 til 08:00",
             "date": "2026-09-03",
             "start": "07:00",
             "end": "08:00",
+            "display": "3. september klokka 07:00 til 08:00",
             "selected": True,
-        }]})
+        })]})
         client._select_delivery_slot = mock.Mock(side_effect=[
             _DeliveryReservationError("temporary MENY reservation failure"),
             {
@@ -3825,19 +4419,20 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(review["summary"]["delivery"]["display"], "torsdag 3. september Kl. 07:00-08:00")
         client._delivery_slots.assert_called_once_with()
         self.assertEqual(client._select_delivery_slot.call_args_list, [
-            mock.call("3. september klokka 07:00 til 08:00"),
-            mock.call("3. september klokka 07:00 til 08:00"),
+            mock.call("meny:2026-09-03T07:00/08:00"),
+            mock.call("meny:2026-09-03T07:00/08:00"),
         ])
 
     def test_checkout_review_stops_after_two_delivery_reservation_failures(self):
         client = self.client()
-        client._delivery_slots = mock.Mock(return_value={"slots": [{
+        client._delivery_slots = mock.Mock(return_value={"slots": [normalize_meny_delivery_slot({
             "slot_id": "3. september klokka 07:00 til 08:00",
             "date": "2026-09-03",
             "start": "07:00",
             "end": "08:00",
+            "display": "3. september klokka 07:00 til 08:00",
             "selected": True,
-        }]})
+        })]})
         client._select_delivery_slot = mock.Mock(side_effect=_DeliveryReservationError("MENY reservation failed"))
         cart = {
             "items": [{"product_id": MENY_PRODUCT, "name": "Brokkoli", "quantity": 1, "price": 13.9}],
@@ -3853,13 +4448,14 @@ class MenyClientTests(unittest.TestCase):
 
     def test_checkout_submit_rejects_a_changed_selected_delivery_without_reserving_it(self):
         client = self.client()
-        client._delivery_slots = mock.Mock(return_value={"slots": [{
+        client._delivery_slots = mock.Mock(return_value={"slots": [normalize_meny_delivery_slot({
             "slot_id": "4. september klokka 10:00 til 12:00",
             "date": "2026-09-04",
             "start": "10:00",
             "end": "12:00",
+            "display": "4. september klokka 10:00 til 12:00",
             "selected": True,
-        }]})
+        })]})
         client._select_delivery_slot = mock.Mock()
         with self.assertRaisesRegex(HouseholdError, "delivery changed after review"):
             client._require_selected_delivery(
@@ -4979,7 +5575,7 @@ class CartPlanTests(unittest.TestCase):
             self.assertEqual(provider.checkout_clicks, 1)
             self.assertEqual(
                 [tool for tool, _arguments in provider.calls[confirm_start:]],
-                ["get_cart"],
+                ["get_cart", "get_delivery_slots", "get_cart", "get_cart", "get_delivery_slots"],
             )
 
     def test_active_menu_raw_delta_change_is_rejected_in_favor_of_requirement_sync(self):
@@ -5011,6 +5607,7 @@ class FlowTests(unittest.TestCase):
 
     def test_status_exposes_the_fresh_confirmation_default(self):
         status = self.app.handle({"operation": "status"})
+        self.assertEqual(status["state_version"], 7)
         self.assertEqual(status["confirmation_policy"], "fresh")
         self.assertEqual(status["product_favorites_count"], 0)
         self.assertNotIn("favorites", status)
@@ -5103,8 +5700,10 @@ class FlowTests(unittest.TestCase):
             provider.call = mock.Mock(wraps=provider.call)
             app = Application(store, provider, self.browser)
             with mock.patch("service.time.monotonic", return_value=10.0):
-                app.handle({"operation": "delivery", "action": "list"})
+                result = app.handle({"operation": "delivery", "action": "list"})
             self.assertEqual(provider.call.call_args.kwargs["deadline"], 250.0)
+            reference = result["slots"][0]["slot_ref"]
+            self.assertEqual(result["display"][reference], provider.delivery_displays[reference])
 
     def test_cart_change_accepts_intuitive_action_and_snake_case_product_id(self):
         self.app.handle({"operation": "cart", "action": "update", "operations": [{"product_id": "10", "quantity": 1}]})
@@ -5128,7 +5727,7 @@ class FlowTests(unittest.TestCase):
                 prepared = app.handle({"operation": "checkout", "action": "prepare"})
             self.assertEqual(prepared["summary"]["payment"], "vipps")
             prepare_calls = provider.call.call_args_list[:]
-            self.assertEqual([call.args[0] for call in prepare_calls], ["get_cart", "get_orders", "get_cart"])
+            self.assertEqual([call.args[0] for call in prepare_calls], ["get_cart", "get_orders", "get_cart", "get_delivery_slots"])
             self.assertTrue(all(call.kwargs.get("deadline") == 610.0 for call in prepare_calls))
             self.assertTrue(all(call.kwargs.get("allow_recovery") is True for call in prepare_calls))
             self.assertEqual(provider.checkout_review_recovery, [True, True])
@@ -5136,8 +5735,11 @@ class FlowTests(unittest.TestCase):
                 result = app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
             self.assertTrue(result["awaiting_user_payment"])
             confirm_calls = provider.call.call_args_list[len(prepare_calls):]
-            self.assertEqual([call.args[0] for call in confirm_calls], ["get_cart"])
-            self.assertEqual(confirm_calls[0].kwargs.get("deadline"), 620.0)
+            self.assertEqual(
+                [call.args[0] for call in confirm_calls],
+                ["get_cart", "get_delivery_slots", "get_cart", "get_cart", "get_delivery_slots"],
+            )
+            self.assertTrue(all(call.kwargs.get("deadline") == 620.0 for call in confirm_calls))
             self.assertEqual(store.read()["pending_checkout"]["status"], "awaiting_user_payment")
             self.assertEqual(provider.checkout_clicks, 1)
             provider.confirmation_order_id = "99990002"
@@ -5202,7 +5804,7 @@ class FlowTests(unittest.TestCase):
             pending = store.read()["pending_checkout"]
             self.assertEqual(prepared["summary"]["total"], 40.0)
             self.assertEqual(pending["cart"]["total"], 39.0)
-            self.assertEqual([call[0] for call in provider.calls], ["get_cart", "get_orders", "get_cart"])
+            self.assertEqual([call[0] for call in provider.calls], ["get_cart", "get_orders", "get_cart", "get_delivery_slots"])
 
     def test_meny_prepare_waits_for_two_matching_checkout_reviews(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -5238,7 +5840,10 @@ class FlowTests(unittest.TestCase):
 
             self.assertTrue(result["awaiting_user_payment"])
             self.assertEqual(result["authorized_summary"], prepared["summary"])
-            self.assertEqual([call.args[0] for call in provider.call.call_args_list], ["get_cart"])
+            self.assertEqual(
+                [call.args[0] for call in provider.call.call_args_list],
+                ["get_cart", "get_delivery_slots", "get_cart", "get_cart", "get_delivery_slots"],
+            )
             self.assertEqual(provider.checkout_clicks, 1)
 
     def test_meny_confirmation_can_expire_during_final_browser_checks(self):
@@ -5944,7 +6549,7 @@ class FlowTests(unittest.TestCase):
             "items": [{"product_id": 20, "name": "Såpe", "quantity": 1, "price": 25.0}],
             "count": 1,
             "subtotal": 25.0,
-            "delivery": {"display": "Lør 5. sep 09:00 - 12:00"},
+            "delivery": {"slot_id": 70, "display": "Hjemlevering mellom kl 09 og 12, 5. sep"},
             "deliveryAddress": "Eksempelveien 1",
         }
         self.app.handle({"operation": "cart", "action": "change", "operations": [{"productId": 20, "quantity": 1}]})
@@ -5988,13 +6593,18 @@ class FlowTests(unittest.TestCase):
         }]
         self.oda.cart = {"items": [], "count": 0, "subtotal": 0.0, "delivery": None}
         self.app.handle({"operation": "orders", "action": "change_begin", "order_id": "test-oda-order"})
-        selected = self.app.handle({"operation": "delivery", "action": "select", "slot_id": 77})
+        selected = self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-12:77"})
         self.assertEqual(selected["staged_for_order"], "test-oda-order")
+        self.assertIn(("get_delivery_slots", {"delivery_date": "2026-09-12"}), self.oda.calls)
+        self.assertIn(("select_delivery_slot", {"delivery_slot_id": 77}), self.oda.calls)
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         self.assertEqual(prepared["order_change"], {"order_id": "test-oda-order", "kind": "delivery"})
         result = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
         self.assertTrue(result["confirmed"])
-        self.assertEqual(self.oda.orders[0]["deliverySlotDisplay"], "Lør 12. sep 09:00 - 12:00")
+        self.assertEqual(
+            self.oda.orders[0]["deliverySlotDisplay"],
+            "Hjemlevering mellom kl 09 og 12, 12. sep",
+        )
         self.assertEqual(len(self.oda.orders), 1)
 
     def test_oda_delivery_change_rejects_an_unexpected_post_submit_total(self):
@@ -6006,7 +6616,7 @@ class FlowTests(unittest.TestCase):
         }]
         self.oda.cart = {"items": [], "count": 0, "subtotal": 0.0, "delivery": None}
         self.app.handle({"operation": "orders", "action": "change_begin", "order_id": "test-oda-order"})
-        self.app.handle({"operation": "delivery", "action": "select", "slot_id": 77})
+        self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-12:77"})
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         original_submit = self.browser.submit_delivery_change
 
@@ -6028,7 +6638,7 @@ class FlowTests(unittest.TestCase):
         }]
         self.oda.cart = {"items": [], "count": 0, "subtotal": 0.0, "delivery": None}
         self.app.handle({"operation": "orders", "action": "change_begin", "order_id": "test-oda-order"})
-        self.app.handle({"operation": "delivery", "action": "select", "slot_id": 77})
+        self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-12:77"})
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         original_submit = self.browser.submit_delivery_change
 
@@ -6049,7 +6659,7 @@ class FlowTests(unittest.TestCase):
         }]
         self.oda.cart = {"items": [], "count": 0, "subtotal": 0.0, "delivery": None}
         self.app.handle({"operation": "orders", "action": "change_begin", "order_id": "test-oda-order"})
-        self.app.handle({"operation": "delivery", "action": "select", "slot_id": 77})
+        self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-12:77"})
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         original_submit = self.browser.submit_delivery_change
 
@@ -6070,7 +6680,7 @@ class FlowTests(unittest.TestCase):
         }]
         self.oda.cart = {"items": [], "count": 0, "subtotal": 0.0, "delivery": None}
         self.app.handle({"operation": "orders", "action": "change_begin", "order_id": "test-oda-order"})
-        self.app.handle({"operation": "delivery", "action": "select", "slot_id": 77})
+        self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-12:77"})
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         original_submit = self.browser.submit_delivery_change
 
@@ -6091,7 +6701,7 @@ class FlowTests(unittest.TestCase):
         }]
         self.oda.cart = {"items": [], "count": 0, "subtotal": 0.0, "delivery": None}
         self.app.handle({"operation": "orders", "action": "change_begin", "order_id": "test-oda-order"})
-        self.app.handle({"operation": "delivery", "action": "select", "slot_id": 77})
+        self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-12:77"})
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         with self.store.locked() as state:
             state["order_change"]["requested_delivery"] = {"slot_id": 88, "display": "Lør 19. sep 09:00 - 12:00"}
@@ -6118,6 +6728,75 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(repeated["idempotent"])
         self.assertEqual(self.browser.checkout_clicks, 1)
 
+    def test_oda_checkout_preserves_browser_supplied_named_amounts(self):
+        self.oda.cart["subtotal"] = 107.95
+        self.oda.delivery_slots["slots"][0]["price_ore"] = 0
+        amounts = {
+            "product_subtotal": 100.0,
+            "delivery_price": 0.0,
+            "discounts": -62.9,
+            "deposits": None,
+            "bags": 41.85,
+            "other_fees": {"Tillegg for mindre bestilling": 29.0},
+            "provider_total": 107.95,
+        }
+        self.browser.review_checkout = lambda _cart, *, deadline=None: {
+            "page_digest": "a" * 64,
+            "payment_display": "•••• 1234",
+            "amounts": deepcopy(amounts),
+        }
+
+        prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
+
+        self.assertEqual(prepared["summary"]["amounts"], amounts)
+
+    def test_oda_checkout_rejects_browser_delivery_price_that_disagrees_with_slot(self):
+        self.browser.review_checkout = lambda _cart, *, deadline=None: {
+            "page_digest": "a" * 64,
+            "payment_display": "•••• 1234",
+            "amounts": {
+                "product_subtotal": None,
+                "delivery_price": 39.0,
+                "discounts": None,
+                "deposits": None,
+                "bags": None,
+                "other_fees": None,
+                "provider_total": 35.0,
+            },
+        }
+
+        with self.assertRaisesRegex(HouseholdError, "delivery price disagrees"):
+            self.app.handle({"operation": "checkout", "action": "prepare"})
+        self.assertIsNone(self.store.read()["pending_checkout"])
+
+    def test_live_shaped_oda_cart_does_not_false_drift_after_delivery_price_binding(self):
+        self.oda.cart = {
+            "groups": [{"items": [{
+                "product": {
+                    "id": 10, "name": "Fullkornspasta", "description": "500 g",
+                    "brand": "Testmerke", "price": "35.00",
+                },
+                "quantity": 1.0,
+                "totalGrossAmount": "35.00",
+            }]}],
+            "productQuantityCount": 1,
+            "totalGrossAmount": "35.00",
+            "deliveryAddress": "Eksempelveien 1",
+            "deliverySlot": {"id": 70, "name": "Hjemlevering mellom kl 09 og 12, 5. sep"},
+            "isUnattendedDelivery": False,
+        }
+
+        prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
+        self.assertEqual(prepared["summary"]["amounts"]["delivery_price"], 49.0)
+        result = self.app.handle({
+            "operation": "checkout",
+            "action": "confirm",
+            "confirmation_id": prepared["confirmation_id"],
+        })
+
+        self.assertTrue(result["confirmed"])
+        self.assertEqual(self.browser.checkout_clicks, 1)
+
     def test_oda_checkout_requires_a_delivery_address_before_browser_review(self):
         self.oda.cart["deliveryAddress"] = " \t "
         with self.assertRaisesRegex(HouseholdError, "select a delivery address"):
@@ -6126,6 +6805,11 @@ class FlowTests(unittest.TestCase):
 
     def test_checkout_reconcile_accepts_live_compact_delivery_hours(self):
         self.oda.cart["delivery"]["display"] = "Hjemlevering mellom kl 07 og 13, 3. sep"
+        self.oda.delivery_slots["slots"][0].update({
+            "slot_ref": "oda:2026-09-03:70",
+            "start_at": "2026-09-03T07:00:00+02:00",
+            "end_at": "2026-09-03T13:00:00+02:00",
+        })
 
         def live_shaped_submit(cart, review, before_click=None, *, deadline=None):
             if before_click:
@@ -6176,8 +6860,6 @@ class FlowTests(unittest.TestCase):
         self.assertIsNone(self.store.read()["pending_checkout"])
 
     def test_checkout_reconcile_rejects_ambiguous_compact_delivery_hours(self):
-        self.oda.cart["delivery"]["display"] = "Hjemlevering mellom kl 07 og 13, 3. sep; alternativ 08:00"
-
         def live_shaped_submit(cart, review, before_click=None, *, deadline=None):
             if before_click:
                 before_click()
@@ -6185,8 +6867,8 @@ class FlowTests(unittest.TestCase):
             self.oda.orders.append({
                 "order_number": "new-order",
                 "grossAmount": 35.0,
-                "deliveryDate": "2026-09-03",
-                "deliverySlotDisplay": "Tor 3. sep 07:00 - 13:00",
+                "deliveryDate": "2026-09-05",
+                "deliverySlotDisplay": "Lør 5. sep 09:00 - 12:00; alternativ 10:00",
                 "deliveryAddress": "Eksempelveien 1",
                 "products": [{"product": {"id": 10, "name": "Fullkornspasta"}, "quantity": 1, "totalGrossAmount": "35.00"}],
             })
@@ -6463,11 +7145,11 @@ class FlowTests(unittest.TestCase):
         original_call = self.oda.call
         original_review = self.browser.review_checkout
 
-        def blocked_tracking(tool, arguments):
+        def blocked_tracking(tool, arguments, **kwargs):
             if tool == "order_tracking" and self.browser.cancel_clicks == 1:
                 tracking_started.set()
                 release_tracking.wait(1)
-            return original_call(tool, arguments)
+            return original_call(tool, arguments, **kwargs)
 
         def observed_review(cart, *, deadline=None):
             checkout_entered.set()
@@ -6774,6 +7456,12 @@ class FlowTests(unittest.TestCase):
             result = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
         self.assertFalse(result["confirmed"])
         self.assertTrue(result["awaiting_confirmation"])
+        self.assertEqual(result["summary"]["delivery"]["selection_origin"], "external")
+        self.assertIn(
+            ("get_delivery_slots", {"delivery_date": "2026-09-05"}),
+            self.oda.calls,
+        )
+        self.assertFalse(any(tool == "select_delivery_slot" for tool, _arguments in self.oda.calls))
         self.assertEqual(self.browser.review_deadlines[-1], 250.0)
         self.assertEqual(self.browser.submit_deadlines, [])
         first_confirmation = result["confirmation_id"]
@@ -6797,6 +7485,519 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(repeated["confirmed"])
         self.assertTrue(repeated["idempotent"])
         self.assertEqual(self.browser.checkout_clicks, 1)
+
+    def test_scheduled_cheapest_selects_only_from_exact_hard_filtered_candidates(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [
+            {
+                "slot_ref": "expensive", "provider_slot_id": 1,
+                "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+                "price_ore": 5900, "price_kind": "exact", "selected": False,
+            },
+            {
+                "slot_ref": "cheap", "provider_slot_id": 2,
+                "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+                "price_ore": 2900, "price_kind": "exact", "selected": False,
+            },
+            {
+                "slot_ref": "wrong-day", "provider_slot_id": 3,
+                "start_at": "2026-09-06T09:00:00+02:00", "end_at": "2026-09-06T11:00:00+02:00",
+                "price_ore": 0, "price_kind": "exact", "selected": False,
+            },
+        ]
+        self.oda.delivery_displays.update({
+            "expensive": "Lør 5. sep 09:00 - 12:00",
+            "cheap": "Lør 5. sep 12:00 - 14:00",
+            "wrong-day": "Søn 6. sep 09:00 - 11:00",
+        })
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "preferred_end": "14:00", "latest_end": "18:00", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            result = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        selected = self.store.read()["delivery_selection"]
+        self.assertEqual(selected["origin"], "cheapest")
+        self.assertEqual(selected["slot"]["slot_ref"], "cheap")
+        self.assertEqual(result["summary"]["delivery"]["price_display"], "29 kr")
+        self.assertEqual(
+            [arguments["delivery_slot_id"] for tool, arguments in self.oda.calls if tool == "select_delivery_slot"],
+            [2],
+        )
+
+    def test_scheduled_cheapest_stops_cart_ready_for_mixed_exact_and_from_prices(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [
+            {
+                "slot_ref": "exact", "provider_slot_id": 1,
+                "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+                "price_ore": 4900, "price_kind": "exact", "selected": False,
+            },
+            {
+                "slot_ref": "from", "provider_slot_id": 2,
+                "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+                "price_ore": 0, "price_kind": "from", "selected": False,
+            },
+        ]
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "latest_end": "18:00", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            result = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        self.assertEqual(result["mode"], "cart_ready")
+        self.assertIn("not all exact", result["reason"])
+        self.assertEqual([item["price_display"] for item in result["candidates"]], ["49 kr", "fra 0 kr"])
+        self.assertFalse(any(tool == "select_delivery_slot" for tool, _arguments in self.oda.calls))
+        self.assertEqual(self.store.read()["occurrences"]["2026-W36"]["status"], "needs_input")
+
+    def test_oda_cart_ready_schedule_uses_cheapest_without_preparing_checkout(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "expensive", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 5900, "price_kind": "exact", "selected": False,
+        }, {
+            "slot_ref": "cheap", "provider_slot_id": 2,
+            "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays.update({
+            "expensive": "Lør 5. sep 09:00 - 12:00", "cheap": "Lør 5. sep 12:00 - 14:00",
+        })
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "mode": "cart_ready", "auto_checkout": False,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            result = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        self.assertEqual(result["mode"], "cart_ready")
+        self.assertEqual(result["origin"], "cheapest")
+        self.assertEqual(result["selected"]["slot_ref"], "cheap")
+        self.assertEqual(result["summary"]["delivery"]["price_display"], "29 kr")
+        self.assertEqual(self.store.read()["occurrences"]["2026-W36"]["status"], "cart_ready")
+        self.assertEqual(self.browser.review_deadlines, [])
+
+    def test_cart_ready_occurrence_must_be_carried_into_manual_checkout(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "candidate", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays["candidate"] = "Lør 5. sep 09:00 - 12:00"
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "mode": "cart_ready", "auto_checkout": False,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            ready = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+            with self.assertRaisesRegex(HouseholdError, "carry the cart_ready occurrence"):
+                self.app.handle({"operation": "checkout", "action": "prepare"})
+            with self.assertRaisesRegex(HouseholdError, "not a cart_ready scheduled run"):
+                self.app.handle({"operation": "checkout", "action": "prepare", "occurrence": "2026-W35"})
+            prepared = self.app.handle({
+                "operation": "checkout", "action": "prepare", "occurrence": ready["occurrence"],
+            })
+
+        self.assertEqual(prepared["summary"]["delivery"]["selection_origin"], "cheapest")
+        self.assertEqual(self.store.read()["occurrences"]["2026-W36"]["status"], "awaiting_confirmation")
+
+    def test_meny_cart_ready_schedule_shows_mixed_candidates_without_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
+            provider = FakeMeny()
+            provider.cart["delivery"] = None
+            provider.delivery_slots["slots"] = [{
+                "slot_ref": "meny:2026-09-05T09:00/12:00", "provider_slot_id": None,
+                "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+                "price_ore": 4900, "price_kind": "exact", "selected": False,
+            }, {
+                "slot_ref": "meny:2026-09-05T12:00/14:00", "provider_slot_id": None,
+                "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+                "price_ore": 0, "price_kind": "from", "selected": False,
+            }]
+            browser = FakeBrowser()
+            app = Application(store, provider, browser)
+            app.handle({"operation": "schedule", "action": "update", "changes": {
+                "enabled": True, "mode": "cart_ready", "auto_checkout": False,
+                "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+            }})
+            app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+            with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+                result = app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+            self.assertEqual(result["mode"], "cart_ready")
+            self.assertIn("not all exact", result["reason"])
+            self.assertEqual([item["price_display"] for item in result["candidates"]], ["49 kr", "fra 0 kr"])
+            self.assertFalse(any(tool == "select_delivery_slot" for tool, _arguments in provider.calls))
+            self.assertEqual(store.read()["occurrences"]["2026-W36"]["status"], "needs_input")
+
+    def test_cheapest_reconciles_one_uncertain_reservation_without_retrying(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "candidate", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays["candidate"] = "Lør 5. sep 09:00 - 12:00"
+        original_call = self.oda.call
+        select_calls = 0
+
+        def timeout_after_reservation(tool, arguments, **kwargs):
+            nonlocal select_calls
+            result = original_call(tool, arguments, **kwargs)
+            if tool == "select_delivery_slot":
+                select_calls += 1
+                raise HouseholdError("provider response timed out")
+            return result
+
+        self.oda.call = timeout_after_reservation
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "mode": "cart_ready", "auto_checkout": False,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            result = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        self.assertEqual(select_calls, 1)
+        self.assertEqual(result["origin"], "cheapest")
+        self.assertEqual(self.store.read()["delivery_selection"]["origin"], "cheapest")
+
+    def test_cheapest_uncertain_reservation_stops_when_oda_cart_and_slots_disagree(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "candidate", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays["candidate"] = "Lør 5. sep 09:00 - 12:00"
+        original_call = self.oda.call
+        select_calls = 0
+
+        def timeout_with_slot_only(tool, arguments, **kwargs):
+            nonlocal select_calls
+            if tool == "select_delivery_slot":
+                select_calls += 1
+                self.oda.delivery_slots["slots"][0]["selected"] = True
+                raise HouseholdError("provider response timed out")
+            return original_call(tool, arguments, **kwargs)
+
+        self.oda.call = timeout_with_slot_only
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "mode": "cart_ready", "auto_checkout": False,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with (
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)),
+            self.assertRaisesRegex(HouseholdError, "cart and slots disagree"),
+        ):
+            self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        self.assertEqual(select_calls, 1)
+        self.assertIsNone(self.store.read()["delivery_selection"])
+
+    def test_explicit_selection_is_not_replaced_by_scheduled_cheapest(self):
+        self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-05:70"})
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "latest_end": "18:00", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+        calls_before = sum(tool == "select_delivery_slot" for tool, _arguments in self.oda.calls)
+
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            result = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        self.assertEqual(result["summary"]["delivery"]["selection_origin"], "explicit")
+        self.assertEqual(sum(tool == "select_delivery_slot" for tool, _arguments in self.oda.calls), calls_before)
+
+    def test_explicit_oda_selection_rejects_same_id_with_different_cart_window(self):
+        original_call = self.oda.call
+
+        def mismatched_cart_window(tool, arguments, **kwargs):
+            result = original_call(tool, arguments, **kwargs)
+            if tool == "select_delivery_slot":
+                self.oda.cart["delivery"]["display"] = "Hjemlevering mellom kl 12 og 14, 5. sep"
+            return result
+
+        self.oda.call = mismatched_cart_window
+
+        with self.assertRaisesRegex(HouseholdError, "selection is uncertain"):
+            self.app.handle({
+                "operation": "delivery",
+                "action": "select",
+                "slot_ref": "oda:2026-09-05:70",
+            })
+        self.assertIsNone(self.store.read()["delivery_selection"])
+
+    def test_cheapest_oda_selection_rejects_same_id_with_different_cart_window(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "candidate", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays["candidate"] = "Lør 5. sep 09:00 - 12:00"
+        original_call = self.oda.call
+
+        def mismatched_cart_window(tool, arguments, **kwargs):
+            result = original_call(tool, arguments, **kwargs)
+            if tool == "select_delivery_slot":
+                self.oda.cart["delivery"]["display"] = "Hjemlevering mellom kl 12 og 14, 5. sep"
+            return result
+
+        self.oda.call = mismatched_cart_window
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True,
+            "mode": "cart_ready",
+            "auto_checkout": False,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with (
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)),
+            self.assertRaisesRegex(HouseholdError, "cart and slots disagree"),
+        ):
+            self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+        self.assertIsNone(self.store.read()["delivery_selection"])
+
+    def test_cheapest_precheckout_reselects_once_then_stops_on_second_drift(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [
+            {
+                "slot_ref": "first", "provider_slot_id": 1,
+                "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+                "price_ore": 2900, "price_kind": "exact", "selected": False,
+            },
+            {
+                "slot_ref": "second", "provider_slot_id": 2,
+                "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+                "price_ore": 3900, "price_kind": "exact", "selected": False,
+            },
+        ]
+        self.oda.delivery_displays.update({
+            "first": "Lør 5. sep 09:00 - 12:00", "second": "Lør 5. sep 12:00 - 14:00",
+        })
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "preferred_end": "14:00", "latest_end": "18:00", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            prepared = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+        self.assertEqual(prepared["summary"]["delivery"]["slot"]["slot_ref"], "first")
+
+        self.oda.delivery_slots["slots"][1]["price_ore"] = 1900
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 6, tzinfo=timezone.utc)):
+            reprepared = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
+        self.assertTrue(reprepared["reprepared"])
+        self.assertEqual(reprepared["summary"]["delivery"]["slot"]["slot_ref"], "second")
+        self.assertEqual(self.browser.checkout_clicks, 0)
+
+        self.oda.delivery_slots["slots"][0]["price_ore"] = 900
+        with (
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 7, tzinfo=timezone.utc)),
+            self.assertRaisesRegex(HouseholdError, "second time"),
+        ):
+            self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": reprepared["confirmation_id"]})
+        self.assertEqual(self.browser.checkout_clicks, 0)
+
+    def test_cheapest_post_selection_rejects_new_nonexact_price_without_provenance(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "candidate", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays["candidate"] = "Lør 5. sep 09:00 - 12:00"
+        original_call = self.oda.call
+
+        def drift_after_selection(tool, arguments, **kwargs):
+            result = original_call(tool, arguments, **kwargs)
+            if tool == "select_delivery_slot":
+                self.oda.delivery_slots["slots"][0].update({"price_ore": 0, "price_kind": "from"})
+            return result
+
+        self.oda.call = drift_after_selection
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+
+        with (
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)),
+            self.assertRaisesRegex(HouseholdError, "automatic delivery selection changed"),
+        ):
+            self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        self.assertIsNone(self.store.read()["delivery_selection"])
+        self.assertEqual(self.browser.checkout_clicks, 0)
+
+    def test_cheapest_candidate_drift_at_final_action_stops_before_payment(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "first", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }, {
+            "slot_ref": "second", "provider_slot_id": 2,
+            "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+            "price_ore": 3900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays.update({
+            "first": "Lør 5. sep 09:00 - 12:00", "second": "Lør 5. sep 12:00 - 14:00",
+        })
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            prepared = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+
+        def drift_then_check(_cart, _review, before_click=None, *, deadline=None):
+            self.oda.delivery_slots["slots"][1]["price_ore"] = 1900
+            if before_click:
+                before_click()
+
+        self.browser.submit_checkout = drift_then_check
+        with (
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 6, tzinfo=timezone.utc)),
+            self.assertRaisesRegex(CheckoutPreconditionError, "delivery changed again"),
+        ):
+            self.app.handle({
+                "operation": "checkout", "action": "confirm",
+                "confirmation_id": prepared["confirmation_id"],
+            })
+        self.assertEqual(self.browser.checkout_clicks, 0)
+        self.assertIsNone(self.store.read()["pending_checkout"])
+
+    def test_scheduled_reprepare_reapplies_maximum_total(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "first", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }, {
+            "slot_ref": "second", "provider_slot_id": 2,
+            "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+            "price_ore": 3900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays.update({
+            "first": "Lør 5. sep 09:00 - 12:00", "second": "Lør 5. sep 12:00 - 14:00",
+        })
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 40.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            prepared = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+        self.oda.delivery_slots["slots"][1]["price_ore"] = 1900
+        self.oda.cart["subtotal"] = 50.0
+
+        with (
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 6, tzinfo=timezone.utc)),
+            self.assertRaisesRegex(HouseholdError, "total exceeds maximum"),
+        ):
+            self.app.handle({
+                "operation": "checkout", "action": "confirm",
+                "confirmation_id": prepared["confirmation_id"],
+            })
+        self.assertIsNone(self.store.read()["pending_checkout"])
+        self.assertEqual(self.browser.checkout_clicks, 0)
+
+    def test_scheduled_delivery_drift_during_review_cannot_create_stale_summary(self):
+        self.oda.cart["delivery"] = None
+        self.oda.delivery_slots["slots"] = [{
+            "slot_ref": "first", "provider_slot_id": 1,
+            "start_at": "2026-09-05T09:00:00+02:00", "end_at": "2026-09-05T12:00:00+02:00",
+            "price_ore": 2900, "price_kind": "exact", "selected": False,
+        }, {
+            "slot_ref": "second", "provider_slot_id": 2,
+            "start_at": "2026-09-05T12:00:00+02:00", "end_at": "2026-09-05T14:00:00+02:00",
+            "price_ore": 3900, "price_kind": "exact", "selected": False,
+        }]
+        self.oda.delivery_displays.update({
+            "first": "Lør 5. sep 09:00 - 12:00", "second": "Lør 5. sep 12:00 - 14:00",
+        })
+        original_review = self.browser.review_checkout
+
+        def drift_after_review(cart, *, deadline=None):
+            result = original_review(cart, deadline=deadline)
+            self.oda.delivery_slots["slots"][1]["price_ore"] = 1900
+            return result
+
+        self.browser.review_checkout = drift_after_review
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+        with (
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)),
+            self.assertRaisesRegex(HouseholdError, "cheapest delivery candidates changed"),
+        ):
+            self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+        self.assertIsNone(self.store.read()["pending_checkout"])
+        self.assertEqual(self.browser.checkout_clicks, 0)
+
+    def test_delivery_provenance_does_not_cross_cart_identity(self):
+        self.oda.cart["id"] = "cart-a"
+        self.app.handle({"operation": "delivery", "action": "select", "slot_ref": "oda:2026-09-05:70"})
+        self.assertEqual(self.store.read()["delivery_selection"]["scope"]["cart_id"], "cart-a")
+        self.oda.cart["id"] = "cart-b"
+        self.app.handle({"operation": "schedule", "action": "update", "changes": {
+            "enabled": True, "maximum_total": 100.0, "auto_checkout": True,
+            "delivery": {"weekday": "Saturday", "strategy": "cheapest"},
+        }})
+        self.app.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "test-cron"})
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            result = self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+        self.assertEqual(result["summary"]["delivery"]["selection_origin"], "external")
+
+    def test_standing_submit_rebinds_idempotency_to_reprepared_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = StateStore(Path(temp), {**CONFIG, "confirmation_policy": "standing"})
+            oda = FakeOda()
+            browser = FakeBrowser()
+            browser.oda = oda
+            app = Application(store, oda, browser)
+            original = app.handle({"operation": "checkout", "action": "prepare"})
+            oda.delivery_slots["slots"][0]["price_ore"] = 5900
+
+            reprepared = app.handle({
+                "operation": "checkout", "action": "submit", "idempotency_key": "standing-drift-1",
+            })
+            self.assertTrue(reprepared["reprepared"])
+            self.assertNotEqual(reprepared["confirmation_id"], original["confirmation_id"])
+            record = store.read()["protected_requests"]["checkout:standing-drift-1"]
+            self.assertEqual(record["confirmation_id"], reprepared["confirmation_id"])
+
+            confirmed = app.handle({
+                "operation": "checkout", "action": "submit", "idempotency_key": "standing-drift-1",
+            })
+            self.assertTrue(confirmed["confirmed"])
+            self.assertEqual(browser.checkout_clicks, 1)
 
     def test_auto_checkout_dispatches_inside_guards_under_standing_authorization(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -6830,12 +8031,12 @@ class FlowTests(unittest.TestCase):
         self.browser.review_checkout = fail_review
 
         with (
-            mock.patch("service.now", return_value=datetime(2026, 9, 10, 13, 5, tzinfo=timezone.utc)),
+            mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)),
             self.assertRaisesRegex(HouseholdError, "browser deadline"),
         ):
-            self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W37"})
+            self.app.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
 
-        self.assertEqual(self.store.read()["occurrences"]["2026-W37"]["status"], "needs_input")
+        self.assertEqual(self.store.read()["occurrences"]["2026-W36"]["status"], "needs_input")
 
 if __name__ == "__main__":
     unittest.main()

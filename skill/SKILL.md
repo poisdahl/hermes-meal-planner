@@ -127,9 +127,25 @@ payment was dispatched and one fresh prepare is safe, a standing-authorized
 current request may use `submit` once more; do not describe the stopped attempt
 as sent. Never make more than that one pre-dispatch retry.
 If MENY says the delivery reservation expired, list the same date, select the
-same returned window once to renew it, and then retry the standing-authorized
+same returned `slot_ref` once to renew it, and then retry the standing-authorized
 checkout once; this is a pre-dispatch recovery, not a payment retry.
-For recurring runs or recipe email,
+Show delivery prices only from `price_kind` and `price_ore`: exact as `49 kr`,
+from as `fra 49 kr`, and unavailable as `pris ikke tilgjengelig`. Never call
+`fra 0` free or infer delivery cost by subtracting totals. An explicit or
+provider-external selection is authoritative and must not be replaced by the
+configured cheapest strategy. Cheapest may select only after every eligible
+candidate passes the hard delivery limits and has an exact price. Mixed or
+unavailable prices stop in `cart_ready`/`needs_input`. Before checkout, preserve
+the fresh normalized slot and candidate digest in the summary; after one
+strategy-owned reselection/reprepare, any further drift stops before payment.
+When a protected checkout summary returns amount components, show only the
+non-null provider-supplied values and preserve every returned fee name. Never
+derive an absent component from another total.
+For every due `cart_ready` or `auto_checkout` schedule, call checkout `auto`
+with the exact occurrence from the cron request. `cart_ready` may reserve a
+verified cheapest window but never submits payment. If the owner later continues
+that cart manually, pass the unchanged occurrence returned by `auto` into
+checkout `prepare`; do not drop or invent it. For recurring runs or recipe email,
 apply the exact cron or email action returned by the integration and do not
 invent a second scheduler, recipient, state store or duplicate-order check. A
 new, rescheduled or upgraded email job is not ready until its returned cron

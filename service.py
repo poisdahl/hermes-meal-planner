@@ -31,14 +31,23 @@ from core import (
     HouseholdError,
     StateStore,
     cart_summary,
+    cheapest_delivery_slot,
+    delivery_candidate_digest,
+    delivery_price_display,
     due_recurring,
     mask_email,
     masked_status,
     put_item,
     remove_item,
+    validate_delivery_slot,
     valid_email_address,
 )
-from oda import OdaClient
+from oda import (
+    OdaClient,
+    oda_cart_delivery_matches_slot,
+    oda_cart_delivery_window,
+    oda_delivery_slot_date,
+)
 from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, MenyOrderChangeDispatchError, meny_checkout_reviews_match, normalize_product_ref
 from recipes import RecipeError, RecipeStore, normalize_recipe, normalize_source_url, recipe_key, scale_recipe, validate_week
 from recipe_sources import (
@@ -373,23 +382,28 @@ def menu_email_html(menu: Mapping[str, Any], *, test: bool = False) -> str:
     return "".join(parts)
 
 
-def delivery_matches(preference: Mapping[str, Any], delivery: Mapping[str, Any] | None) -> bool:
-    if not delivery or not delivery.get("display"):
+def delivery_matches(
+    preference: Mapping[str, Any],
+    delivery: Mapping[str, Any] | None,
+    *,
+    timezone_name: str = "Europe/Oslo",
+) -> bool:
+    if not delivery:
         return False
-    display = str(delivery["display"]).casefold()
+    candidate = delivery.get("slot") if isinstance(delivery.get("slot"), Mapping) else delivery
+    try:
+        slot = validate_delivery_slot(candidate)
+        zone = ZoneInfo(timezone_name)
+        start_at = datetime.fromisoformat(slot["start_at"].replace("Z", "+00:00")).astimezone(zone)
+        end_at = datetime.fromisoformat(slot["end_at"].replace("Z", "+00:00")).astimezone(zone)
+    except (HouseholdError, ValueError, ZoneInfoNotFoundError):
+        return False
     weekday = str(preference.get("weekday") or "").casefold()
-    translations = {
-        "monday": "mandag", "tuesday": "tirsdag", "wednesday": "onsdag",
-        "thursday": "torsdag", "friday": "fredag", "saturday": "lørdag",
-        "sunday": "søndag",
-    }
-    if weekday and weekday not in display and translations.get(weekday) not in display:
+    if weekday and start_at.weekday() != SCHEDULE_WEEKDAYS.get(weekday):
         return False
     latest = str(preference.get("latest_end") or "")
-    times = re.findall(r"\b([01]\d|2[0-3]):([0-5]\d)\b", display)
-    if latest:
-        if not times or f"{times[-1][0]}:{times[-1][1]}" > latest:
-            return False
+    if latest and end_at.strftime("%H:%M") > latest:
+        return False
     return True
 
 
@@ -417,8 +431,10 @@ def validate_schedule(schedule: Mapping[str, Any], provider: str) -> float | Non
         if isinstance(maximum, bool) or not isinstance(maximum, (int, float)) or not math.isfinite(maximum_value) or maximum_value <= 0:
             raise HouseholdError("schedule maximum total must be a positive finite number")
     delivery = schedule.get("delivery")
-    if not isinstance(delivery, Mapping) or not set(delivery).issubset({"weekday", "preferred_end", "latest_end"}):
+    if not isinstance(delivery, Mapping) or not set(delivery).issubset({"weekday", "preferred_end", "latest_end", "strategy"}):
         raise HouseholdError("schedule delivery preference is invalid")
+    if delivery.get("strategy") not in {"keep_selected", "cheapest"}:
+        raise HouseholdError("schedule delivery strategy is invalid")
     delivery_weekday = str(delivery.get("weekday") or "").casefold()
     if delivery_weekday and delivery_weekday not in SCHEDULE_WEEKDAYS:
         raise HouseholdError("schedule delivery weekday is invalid")
@@ -1654,6 +1670,13 @@ class Application:
                 allowed = {"enabled", "weekday", "time", "timezone", "mode", "delivery", "maximum_total", "auto_checkout"}
                 if not set(changes).issubset(allowed):
                     raise HouseholdError("schedule contains unknown fields")
+                if "delivery" in changes:
+                    replacement = changes["delivery"]
+                    if not isinstance(replacement, Mapping):
+                        raise HouseholdError("schedule delivery preference is invalid")
+                    replacement = deepcopy(dict(replacement))
+                    replacement.setdefault("strategy", "cheapest")
+                    changes = {**changes, "delivery": replacement}
                 schedule.update(deepcopy(changes))
                 validate_schedule(schedule, self.provider)
                 if schedule.get("auto_checkout"):
@@ -2217,25 +2240,692 @@ class Application:
                     return found
         return None
 
+    @staticmethod
+    def _delivery_scope(state: Mapping[str, Any], cart: Mapping[str, Any] | None = None) -> dict[str, str | None]:
+        raw_cart_id = None
+        if isinstance(cart, Mapping):
+            raw_cart_id = cart.get("id", cart.get("cartId", cart.get("cart_id")))
+        order_change = state.get("order_change")
+        pending = state.get("pending_checkout")
+        return {
+            "cart_id": str(raw_cart_id)[:128] if raw_cart_id not in {None, ""} else None,
+            "order_id": str(order_change.get("order_id"))[:128] if isinstance(order_change, Mapping) and order_change.get("order_id") else None,
+            "occurrence": str(pending.get("occurrence"))[:128] if isinstance(pending, Mapping) and pending.get("occurrence") else None,
+        }
+
+    def _record_delivery_selection(
+        self,
+        slot: Mapping[str, Any],
+        *,
+        origin: str,
+        candidate_digest: str | None,
+        baseline: Mapping[str, Any],
+        cart: Mapping[str, Any] | None = None,
+        occurrence: str | None = None,
+    ) -> None:
+        normalized = validate_delivery_slot(slot)
+        if origin not in {"explicit", "cheapest"}:
+            raise HouseholdError("delivery selection origin is invalid")
+        if candidate_digest is not None and (
+            not isinstance(candidate_digest, str)
+            or re.fullmatch(r"[a-f0-9]{64}", candidate_digest) is None
+        ):
+            raise HouseholdError("delivery candidate digest is invalid")
+        observation = {
+            "provider": self.provider,
+            "scope": {
+                **self._delivery_scope(baseline, cart),
+                **({"occurrence": occurrence} if occurrence else {}),
+            },
+            "origin": origin,
+            "slot": normalized,
+            "candidate_digest": candidate_digest,
+            "observed_at": now().isoformat(),
+        }
+        with self.store.locked() as state:
+            if canonical(state.get("order_change")) != canonical(baseline.get("order_change")):
+                raise HouseholdError("order change state changed while recording delivery")
+            state["delivery_selection"] = observation
+
+    def _delivery_observation_applies(
+        self,
+        observation: Any,
+        state: Mapping[str, Any],
+        *,
+        cart: Mapping[str, Any] | None,
+        occurrence: str | None,
+    ) -> bool:
+        if not isinstance(observation, Mapping) or observation.get("provider") != self.provider:
+            return False
+        scope = observation.get("scope")
+        if not isinstance(scope, Mapping):
+            return False
+        current = self._delivery_scope(state, cart)
+        if scope.get("cart_id") != current["cart_id"] or scope.get("order_id") != current["order_id"]:
+            return False
+        return scope.get("occurrence") in {None, occurrence}
+
+    @staticmethod
+    def _same_delivery_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+        keys = ("slot_ref", "provider_slot_id", "start_at", "end_at")
+        return all(left.get(key) == right.get(key) for key in keys)
+
+    @staticmethod
+    def _delivery_slot_date(slot: Mapping[str, Any]) -> str:
+        normalized = validate_delivery_slot(slot)
+        return datetime.fromisoformat(
+            normalized["start_at"].replace("Z", "+00:00")
+        ).astimezone(ZoneInfo("Europe/Oslo")).date().isoformat()
+
+    def _normalized_provider_slots(
+        self,
+        dates: list[str] | None = None,
+        *,
+        deadline: float | None = None,
+        address_id: Any = None,
+        allow_recovery: bool = False,
+        display_metadata: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        calls = dates or [None]
+        slots: list[dict[str, Any]] = []
+        for delivery_date in calls:
+            arguments = {"delivery_date": delivery_date} if delivery_date else {}
+            if address_id is not None:
+                arguments["delivery_address_id"] = address_id
+            if self.provider == "meny":
+                result = self.oda.call(
+                    "get_delivery_slots", arguments, deadline=deadline, allow_recovery=allow_recovery,
+                )
+            else:
+                result = self.oda.call("get_delivery_slots", arguments, deadline=deadline)
+            raw_slots = result.get("slots") if isinstance(result, Mapping) else None
+            if not isinstance(raw_slots, list):
+                raise HouseholdError(f"{self.provider.upper()} delivery slots are not normalized")
+            normalized_call = [validate_delivery_slot(slot) for slot in raw_slots]
+            if display_metadata is not None:
+                raw_display = result.get("display") if isinstance(result, Mapping) else None
+                if self.provider == "meny" and (
+                    not isinstance(raw_display, Mapping)
+                    or set(raw_display) != {slot["slot_ref"] for slot in normalized_call}
+                ):
+                    raise HouseholdError("MENY delivery display metadata is unavailable")
+                if isinstance(raw_display, Mapping):
+                    for slot in normalized_call:
+                        reference = slot["slot_ref"]
+                        label = raw_display.get(reference)
+                        if (
+                            not isinstance(label, str)
+                            or not label.strip()
+                            or len(label.encode("utf-8")) > 500
+                        ):
+                            raise HouseholdError("provider delivery display metadata is invalid")
+                        normalized_label = " ".join(label.split())
+                        previous = display_metadata.get(reference)
+                        if previous is not None and previous != normalized_label:
+                            raise HouseholdError("provider returned conflicting delivery display metadata")
+                        display_metadata[reference] = normalized_label
+            slots.extend(normalized_call)
+        unique: dict[str, dict[str, Any]] = {}
+        for slot in slots:
+            reference = slot["slot_ref"]
+            if reference in unique and canonical(unique[reference]) != canonical(slot):
+                raise HouseholdError("provider returned conflicting delivery slot references")
+            unique[reference] = slot
+        return list(unique.values())
+
+    @staticmethod
+    def _scheduled_delivery_dates(schedule: Mapping[str, Any], instant: datetime) -> list[str]:
+        preference = schedule["delivery"]
+        local_day = instant.astimezone(ZoneInfo(str(schedule["timezone"]))).date()
+        weekday = str(preference.get("weekday") or "").casefold()
+        if weekday:
+            offset = (SCHEDULE_WEEKDAYS[weekday] - local_day.weekday()) % 7
+            return [(local_day + timedelta(days=offset)).isoformat()]
+        return [(local_day + timedelta(days=offset)).isoformat() for offset in range(7)]
+
+    def _scheduled_delivery_choice(
+        self,
+        schedule: Mapping[str, Any],
+        *,
+        occurrence: str,
+        deadline: float | None,
+    ) -> dict[str, Any]:
+        preference = schedule["delivery"]
+        state = self.store.read()
+        scope_cart = (
+            self.oda.call("get_cart", {}, deadline=deadline)
+            if self.provider == "meny"
+            else self.oda.call("get_cart", {}, deadline=deadline)
+        )
+        observation = state.get("delivery_selection")
+        applicable = self._delivery_observation_applies(
+            observation, state, cart=scope_cart, occurrence=occurrence,
+        )
+        cart_delivery = cart_summary(scope_cart).get("delivery") if self.provider == "oda" else None
+        current_dates = None
+        if applicable and isinstance(observation.get("slot"), Mapping):
+            current_dates = [self._delivery_slot_date(observation["slot"])]
+        elif isinstance(cart_delivery, Mapping):
+            oda_today = now().astimezone(ZoneInfo("Europe/Oslo")).date()
+            current_dates = [oda_cart_delivery_window(cart_delivery, today=oda_today)["date"]]
+        current_slots = self._normalized_provider_slots(current_dates, deadline=deadline)
+        selected = [slot for slot in current_slots if slot["selected"]]
+        if len(selected) > 1:
+            raise HouseholdError("provider-selected delivery is ambiguous")
+        selected_slot = selected[0] if selected else None
+        if self.provider == "oda":
+            if isinstance(cart_delivery, Mapping):
+                if (
+                    selected_slot is None
+                    or not oda_cart_delivery_matches_slot(cart_delivery, selected_slot)
+                ):
+                    raise HouseholdError("Oda cart and selected delivery listing disagree")
+            elif selected_slot is not None:
+                raise HouseholdError("Oda cart and selected delivery listing disagree")
+        if selected_slot is not None and not applicable:
+            return {
+                "ready": True,
+                "origin": "external",
+                "selected": selected_slot,
+                "price_display": delivery_price_display(selected_slot),
+            }
+        if applicable:
+            observed_slot = observation.get("slot")
+            if (
+                selected_slot is None
+                or not isinstance(observed_slot, Mapping)
+                or not self._same_delivery_identity(
+                    selected_slot, validate_delivery_slot(observed_slot),
+                )
+            ):
+                raise HouseholdError("provider delivery and local selection provenance disagree")
+            if observation.get("origin") == "explicit" or preference["strategy"] == "keep_selected":
+                self._record_delivery_selection(
+                    selected_slot,
+                    origin=str(observation["origin"]),
+                    candidate_digest=observation.get("candidate_digest"),
+                    baseline=state,
+                    cart=scope_cart,
+                    occurrence=occurrence,
+                )
+                return {
+                    "ready": True,
+                    "origin": observation["origin"],
+                    "selected": selected_slot,
+                    "price_display": delivery_price_display(selected_slot),
+                }
+        elif preference["strategy"] == "keep_selected":
+            return {"ready": False, "reason": "select a delivery slot", "candidates": []}
+
+        dates = self._scheduled_delivery_dates(schedule, now())
+        candidates = [
+            slot for slot in self._normalized_provider_slots(dates, deadline=deadline)
+            if delivery_matches(
+                preference, slot, timezone_name=str(schedule["timezone"]),
+            )
+        ]
+        rendered = [
+            {"slot": slot, "price_display": delivery_price_display(slot)}
+            for slot in candidates
+        ]
+        if not candidates:
+            return {"ready": False, "reason": "no delivery slot satisfies the hard constraints", "candidates": []}
+        if any(slot["price_kind"] != "exact" for slot in candidates):
+            return {
+                "ready": False,
+                "reason": "eligible delivery prices are not all exact",
+                "candidates": rendered,
+            }
+        digest = delivery_candidate_digest(candidates)
+        winner = cheapest_delivery_slot(
+            candidates,
+            preferred_end=preference.get("preferred_end"),
+            timezone_name=str(schedule["timezone"]),
+        )
+        if selected_slot is not None and self._same_delivery_identity(selected_slot, winner) and selected_slot["price_ore"] == winner["price_ore"]:
+            self._record_delivery_selection(
+                selected_slot,
+                origin="cheapest",
+                candidate_digest=digest,
+                baseline=state,
+                cart=scope_cart,
+                occurrence=occurrence,
+            )
+            return {
+                "ready": True,
+                "origin": "cheapest",
+                "selected": selected_slot,
+                "candidate_digest": digest,
+                "price_display": delivery_price_display(selected_slot),
+            }
+        selection_error = None
+        try:
+            result = self._delivery({
+                "action": "select",
+                "slot_ref": winner["slot_ref"],
+                "_deadline": deadline,
+                "_origin": "cheapest",
+                "_candidate_digest": digest,
+                "_occurrence": occurrence,
+                "_defer_record": True,
+            })
+        except HouseholdError as exc:
+            selection_error = exc
+            result = None
+        verified = result.get("selected") if isinstance(result, Mapping) else None
+        fresh_slots = self._normalized_provider_slots(dates, deadline=deadline)
+        fresh_selected = [slot for slot in fresh_slots if slot["selected"]]
+        fresh_candidates = [
+            slot for slot in fresh_slots
+            if delivery_matches(
+                preference, slot, timezone_name=str(schedule["timezone"]),
+            )
+        ]
+        if (
+            len(fresh_selected) != 1
+            or (selection_error is None and not isinstance(verified, Mapping))
+            or (
+                isinstance(verified, Mapping)
+                and not self._same_delivery_identity(
+                    fresh_selected[0], validate_delivery_slot(verified),
+                )
+            )
+            or not fresh_candidates
+            or any(slot["price_kind"] != "exact" for slot in fresh_candidates)
+        ):
+            raise HouseholdError(
+                "automatic delivery selection failed and fresh provider state is not the exact winner"
+                if selection_error is not None
+                else "automatic delivery selection changed; inspect the provider selection"
+            ) from selection_error
+        fresh_digest = delivery_candidate_digest(fresh_candidates)
+        fresh_winner = cheapest_delivery_slot(
+            fresh_candidates,
+            preferred_end=preference.get("preferred_end"),
+            timezone_name=str(schedule["timezone"]),
+        )
+        if fresh_digest != digest or canonical(fresh_selected[0]) != canonical(fresh_winner):
+            raise HouseholdError(
+                "automatic delivery selection failed and fresh candidates do not prove the winner"
+                if selection_error is not None
+                else "automatic delivery candidates changed; inspect the provider selection"
+            ) from selection_error
+        verified = fresh_selected[0]
+        fresh_scope_cart = (
+            self.oda.call("get_cart", {}, deadline=deadline)
+            if self.provider == "meny"
+            else self.oda.call("get_cart", {}, deadline=deadline)
+        )
+        if self.provider == "oda":
+            cart_delivery = cart_summary(fresh_scope_cart).get("delivery")
+            if (
+                not isinstance(cart_delivery, Mapping)
+                or not oda_cart_delivery_matches_slot(cart_delivery, verified)
+            ):
+                raise HouseholdError(
+                    "automatic delivery selection is uncertain; provider cart and slots disagree"
+                ) from selection_error
+        self._record_delivery_selection(
+            verified,
+            origin="cheapest",
+            candidate_digest=fresh_digest,
+            baseline=self.store.read(),
+            cart=fresh_scope_cart,
+            occurrence=occurrence,
+        )
+        return {
+            "ready": True,
+            "origin": "cheapest",
+            "selected": validate_delivery_slot(verified),
+            "candidate_digest": digest,
+            "price_display": delivery_price_display(verified),
+        }
+
+    def _current_delivery_choice(
+        self,
+        *,
+        occurrence: str | None,
+        deadline: float | None,
+        allow_recovery: bool = False,
+        expected_slot: Mapping[str, Any] | None = None,
+        scope_cart: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = self.store.read()
+        if scope_cart is None:
+            scope_cart = (
+                self.oda.call(
+                    "get_cart", {}, deadline=deadline, allow_recovery=allow_recovery,
+                )
+                if self.provider == "meny"
+                else self.oda.call("get_cart", {}, deadline=deadline)
+            )
+        observation = state.get("delivery_selection")
+        applicable = self._delivery_observation_applies(
+            observation, state, cart=scope_cart, occurrence=occurrence,
+        )
+        target = expected_slot
+        if target is None and applicable and isinstance(observation.get("slot"), Mapping):
+            target = observation["slot"]
+        cart_delivery = cart_summary(scope_cart).get("delivery") if self.provider == "oda" else None
+        dates = [self._delivery_slot_date(target)] if isinstance(target, Mapping) else None
+        if dates is None and isinstance(cart_delivery, Mapping):
+            oda_today = now().astimezone(ZoneInfo("Europe/Oslo")).date()
+            dates = [oda_cart_delivery_window(cart_delivery, today=oda_today)["date"]]
+        selected = [
+            slot for slot in self._normalized_provider_slots(
+                dates, deadline=deadline, allow_recovery=allow_recovery,
+            )
+            if slot["selected"]
+        ]
+        if self.provider == "oda":
+            if isinstance(cart_delivery, Mapping):
+                if (
+                    len(selected) != 1
+                    or not oda_cart_delivery_matches_slot(cart_delivery, selected[0])
+                ):
+                    raise HouseholdError("Oda cart and selected delivery listing disagree")
+            elif selected:
+                raise HouseholdError("Oda cart and selected delivery listing disagree")
+        if len(selected) != 1:
+            raise HouseholdError("select one unambiguous provider delivery slot before checkout")
+        slot = selected[0]
+        if applicable:
+            observed_slot = observation.get("slot")
+            if (
+                not isinstance(observed_slot, Mapping)
+                or not self._same_delivery_identity(
+                    slot, validate_delivery_slot(observed_slot),
+                )
+            ):
+                raise HouseholdError("provider delivery and local selection provenance disagree")
+            origin = str(observation["origin"])
+            digest = observation.get("candidate_digest")
+            self._record_delivery_selection(
+                slot,
+                origin=origin,
+                candidate_digest=digest,
+                baseline=state,
+                cart=scope_cart,
+                occurrence=occurrence,
+            )
+        else:
+            origin = "external"
+            digest = None
+        return {
+            "ready": True,
+            "origin": origin,
+            "selected": slot,
+            "candidate_digest": digest,
+            "price_display": delivery_price_display(slot),
+        }
+
+    @staticmethod
+    def _bind_delivery_summary(summary: Mapping[str, Any], binding: Mapping[str, Any]) -> dict[str, Any]:
+        result = deepcopy(dict(summary))
+        slot = validate_delivery_slot(binding["selected"])
+        existing = result.get("delivery")
+        delivery = deepcopy(dict(existing)) if isinstance(existing, Mapping) else {}
+        delivery.update({
+            "slot": slot,
+            "price_display": str(binding["price_display"]),
+            "candidate_digest": binding.get("candidate_digest"),
+            "selection_origin": binding["origin"],
+        })
+        result["delivery"] = delivery
+        amounts = result.get("amounts")
+        if slot["price_kind"] == "exact" and isinstance(amounts, Mapping):
+            amounts = deepcopy(dict(amounts))
+            exact_price = slot["price_ore"] / 100
+            supplied = amounts.get("delivery_price")
+            if supplied is not None and supplied != exact_price:
+                raise HouseholdError("provider checkout delivery price disagrees with the selected slot")
+            amounts["delivery_price"] = exact_price
+            result["amounts"] = amounts
+        return result
+
+    def _unchanged_delivery_binding(
+        self,
+        binding: Mapping[str, Any],
+        *,
+        occurrence: str | None,
+        deadline: float | None,
+        allow_recovery: bool = False,
+        scope_cart: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        expected = binding.get("selected", binding.get("slot"))
+        if not isinstance(expected, Mapping):
+            raise HouseholdError("checkout delivery binding is invalid")
+        expected_slot = validate_delivery_slot(expected)
+        expected_origin = str(binding.get("origin", binding.get("selection_origin")) or "")
+        current = self._current_delivery_choice(
+            occurrence=occurrence,
+            deadline=deadline,
+            allow_recovery=allow_recovery,
+            expected_slot=expected_slot,
+            scope_cart=scope_cart,
+        )
+        current_slot = validate_delivery_slot(current["selected"])
+        if canonical(current_slot) != canonical(expected_slot):
+            raise HouseholdError("delivery changed while preparing the protected checkout summary")
+        if expected_origin in {"explicit", "cheapest"} and current.get("origin") != expected_origin:
+            raise HouseholdError("delivery selection provenance changed")
+        if expected_origin != "cheapest":
+            return current
+        if not occurrence:
+            raise HouseholdError("automatic cheapest delivery is not bound to a scheduled occurrence")
+        state = self.store.read()
+        schedule = state.get("schedule")
+        if not isinstance(schedule, Mapping):
+            raise HouseholdError("scheduled delivery configuration is unavailable")
+        preference = schedule["delivery"]
+        candidates = [
+            slot
+            for slot in self._normalized_provider_slots(
+                self._scheduled_delivery_dates(schedule, now()),
+                deadline=deadline,
+                allow_recovery=allow_recovery,
+            )
+            if delivery_matches(
+                preference, slot, timezone_name=str(schedule["timezone"]),
+            )
+        ]
+        if not candidates or any(slot["price_kind"] != "exact" for slot in candidates):
+            raise HouseholdError("delivery candidates changed and are no longer all exact")
+        digest = delivery_candidate_digest(candidates)
+        winner = cheapest_delivery_slot(
+            candidates,
+            preferred_end=preference.get("preferred_end"),
+            timezone_name=str(schedule["timezone"]),
+        )
+        if digest != binding.get("candidate_digest") or canonical(winner) != canonical(expected_slot):
+            raise HouseholdError("cheapest delivery candidates changed")
+        return {
+            "ready": True,
+            "origin": "cheapest",
+            "selected": current_slot,
+            "candidate_digest": digest,
+            "price_display": delivery_price_display(current_slot),
+        }
+
+    def _scheduled_checkout_problem(
+        self,
+        summary: Mapping[str, Any],
+        occurrence: str | None,
+    ) -> str | None:
+        if not occurrence:
+            return None
+        state = self.store.read()
+        schedule = state.get("schedule")
+        if not isinstance(schedule, Mapping):
+            return "scheduled checkout configuration changed"
+        maximum_total = validate_schedule(schedule, self.provider)
+        if not schedule.get("enabled") or not schedule.get("auto_checkout"):
+            return "scheduled checkout is no longer enabled"
+        total = summary.get("total")
+        if (
+            isinstance(total, bool)
+            or not isinstance(total, (int, float))
+            or not math.isfinite(float(total))
+            or maximum_total is None
+            or total > maximum_total
+        ):
+            return "total exceeds maximum"
+        if not delivery_matches(
+            schedule["delivery"],
+            summary.get("delivery"),
+            timezone_name=str(schedule["timezone"]),
+        ):
+            return "delivery does not match preference"
+        return None
+
+    def _revalidate_checkout_delivery(
+        self,
+        pending: Mapping[str, Any],
+        *,
+        deadline: float | None,
+    ) -> dict[str, Any] | None:
+        delivery = (pending.get("summary") or {}).get("delivery")
+        expected = delivery.get("slot") if isinstance(delivery, Mapping) else None
+        if not isinstance(expected, Mapping):
+            raise HouseholdError("protected checkout summary has no normalized delivery binding")
+        expected_slot = validate_delivery_slot(expected)
+        origin = delivery.get("selection_origin")
+        occurrence = str(pending.get("occurrence") or "")
+        reselections = pending.get("delivery_reselections", 0)
+        if isinstance(reselections, bool) or not isinstance(reselections, int) or reselections not in {0, 1}:
+            raise HouseholdError("checkout delivery reselection state is invalid")
+        if origin == "cheapest":
+            state = self.store.read()
+            current = [
+                slot for slot in self._normalized_provider_slots(
+                    [self._delivery_slot_date(expected_slot)], deadline=deadline,
+                )
+                if slot["selected"]
+            ]
+            if len(current) != 1 or not self._same_delivery_identity(current[0], expected_slot):
+                raise HouseholdError("provider delivery and local selection provenance disagree")
+            schedule = state["schedule"]
+            preference = schedule["delivery"]
+            candidates = [
+                slot for slot in self._normalized_provider_slots(
+                    self._scheduled_delivery_dates(schedule, now()), deadline=deadline,
+                )
+                if delivery_matches(
+                    preference, slot, timezone_name=str(schedule["timezone"]),
+                )
+            ]
+            if not candidates or any(slot["price_kind"] != "exact" for slot in candidates):
+                raise HouseholdError("delivery candidates changed and no exact cheapest window is available")
+            digest = delivery_candidate_digest(candidates)
+            winner = cheapest_delivery_slot(
+                candidates,
+                preferred_end=preference.get("preferred_end"),
+                timezone_name=str(schedule["timezone"]),
+            )
+            changed = (
+                canonical(winner) != canonical(expected_slot)
+                or digest != delivery.get("candidate_digest")
+            )
+            if changed and reselections >= 1:
+                raise HouseholdError("delivery changed a second time; checkout stopped before payment")
+            choice = (
+                self._scheduled_delivery_choice(
+                    schedule, occurrence=occurrence, deadline=deadline,
+                )
+                if changed
+                else {
+                    "ready": True,
+                    "origin": "cheapest",
+                    "selected": current[0],
+                    "candidate_digest": digest,
+                    "price_display": delivery_price_display(current[0]),
+                }
+            )
+        else:
+            choice = self._current_delivery_choice(
+                occurrence=occurrence or None, deadline=deadline, expected_slot=expected_slot,
+            )
+            current = validate_delivery_slot(choice["selected"])
+            if not self._same_delivery_identity(current, expected_slot):
+                raise HouseholdError("explicit or external delivery selection changed; inspect it before checkout")
+            changed = canonical(current) != canonical(expected_slot)
+        if not changed:
+            return None
+        with self.store.locked() as state:
+            if canonical(state.get("pending_checkout")) != canonical(pending):
+                raise HouseholdError("checkout state changed while revalidating delivery")
+            state["pending_checkout"] = None
+        prepared = self._checkout_prepare(
+            deadline,
+            occurrence=occurrence or None,
+            delivery_binding=choice,
+            delivery_reselections=reselections + 1,
+        )
+        problem = self._scheduled_checkout_problem(prepared["summary"], occurrence or None)
+        if problem is not None:
+            with self.store.locked() as state:
+                replacement = state.get("pending_checkout")
+                if (
+                    isinstance(replacement, Mapping)
+                    and replacement.get("confirmation_id") == prepared.get("confirmation_id")
+                    and replacement.get("status") == "awaiting_confirmation"
+                ):
+                    state["pending_checkout"] = None
+            raise HouseholdError(f"scheduled checkout stopped: {problem}")
+        return {
+            "confirmed": False,
+            "reprepared": True,
+            "reason": "delivery price or cheapest candidate set changed",
+            **prepared,
+        }
+
     def _delivery(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "list")
         if action == "list":
-            arguments: dict[str, Any] = {}
-            if request.get("address_id") is not None:
-                arguments["delivery_address_id"] = request["address_id"]
             dates = request.get("dates")
-            if dates is None:
-                return self.oda.call("get_delivery_slots", arguments, deadline=request.get("_deadline"), allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("get_delivery_slots", arguments)
-            if not isinstance(dates, list) or not dates or len(dates) > 7 or not all(isinstance(item, str) for item in dates):
+            if dates is not None and (
+                not isinstance(dates, list)
+                or not dates
+                or len(dates) > 7
+                or not all(isinstance(item, str) for item in dates)
+            ):
                 raise HouseholdError("delivery dates must be one to seven ISO dates")
-            return {"dates": [{"date": item, "slots": self.oda.call("get_delivery_slots", {**arguments, "delivery_date": item}, deadline=request.get("_deadline"), allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("get_delivery_slots", {**arguments, "delivery_date": item})} for item in dates]}
+            if dates is not None:
+                for item in dates:
+                    try:
+                        if date.fromisoformat(item).isoformat() != item:
+                            raise ValueError
+                    except ValueError as exc:
+                        raise HouseholdError("delivery dates must be one to seven ISO dates") from exc
+            display: dict[str, str] = {}
+            slots = self._normalized_provider_slots(
+                dates,
+                deadline=request.get("_deadline"),
+                address_id=request.get("address_id"),
+                allow_recovery=request.get("_allow_browser_recovery") is True,
+                display_metadata=display,
+            )
+            return {
+                "provider": self.provider,
+                "slots": slots,
+                "price_display": {
+                    slot["slot_ref"]: delivery_price_display(slot)
+                    for slot in slots
+                },
+                "display": display,
+            }
         if action == "select":
-            arguments = {"delivery_slot_id": request.get("slot_id")}
+            slot_ref = request.get("slot_ref")
+            if slot_ref is None:
+                raise HouseholdError("delivery select requires the exact slot_ref returned by delivery list")
+            arguments = {"delivery_slot_id": slot_ref}
             if request.get("address_id") is not None:
                 arguments["delivery_address_id"] = request["address_id"]
             if request.get("unattended") is not None:
                 arguments["is_unattended_delivery"] = bool(request["unattended"])
-            deadline = time.monotonic() + MENY_ORDER_TIMEOUT if self.provider == "meny" else None
+            deadline = request.get("_deadline")
+            if deadline is None and self.provider == "meny":
+                deadline = time.monotonic() + MENY_ORDER_TIMEOUT
             with self._browser_operation(deadline):
                 state = self.store.read()
                 if (state.get("pending_checkout") or {}).get("status") in UNRESOLVED_CHECKOUT_STATUSES:
@@ -2243,20 +2933,78 @@ class Application:
                 change = deepcopy(state.get("order_change"))
                 if change and change.get("status") != "editing":
                     raise HouseholdError("the order change is still starting")
-                if self.provider == "oda" and change:
-                    cart = cart_summary(self.oda.call("get_cart", {}))
-                    if cart["items"]:
-                        raise HouseholdError("an Oda delivery-window change must be prepared without staged item additions")
-                    available = self.oda.call("get_delivery_slots", {})
-                    selected = self._find_delivery_slot(available, request.get("slot_id"))
-                    if not selected:
+                if self.provider == "oda":
+                    if change:
+                        cart = cart_summary(self.oda.call("get_cart", {}, deadline=deadline))
+                        if cart["items"]:
+                            raise HouseholdError("an Oda delivery-window change must be prepared without staged item additions")
+                    requested_dates = None
+                    if isinstance(slot_ref, str) and slot_ref.startswith("oda:"):
+                        requested_dates = [oda_delivery_slot_date(slot_ref)]
+                    available = self._normalized_provider_slots(requested_dates, deadline=deadline)
+                    candidates = [slot for slot in available if slot["slot_ref"] == slot_ref]
+                    if len(candidates) != 1:
                         raise HouseholdError("the requested Oda delivery slot is no longer available")
-                    with self.store.locked() as locked:
-                        if canonical(locked.get("order_change")) != canonical(change):
-                            raise HouseholdError("order change state changed while selecting delivery")
-                        locked["order_change"]["kind"] = "delivery"
-                        locked["order_change"]["requested_delivery"] = selected
-                    return {"provider": "oda", "selected": selected, "staged_for_order": change["order_id"], "next": "Prepare checkout, review the exact new window and any payment difference, then ask for confirmation."}
+                    candidate = candidates[0]
+                    provider_slot_id = candidate["provider_slot_id"]
+                    if provider_slot_id is None:
+                        raise HouseholdError("the requested Oda delivery slot has no provider id")
+                    arguments["delivery_slot_id"] = provider_slot_id
+                    self.oda.call("select_delivery_slot", arguments, deadline=deadline)
+                    selected_date = self._delivery_slot_date(candidate)
+                    fresh = [
+                        slot for slot in self._normalized_provider_slots([selected_date], deadline=deadline)
+                        if slot["selected"]
+                    ]
+                    if (
+                        len(fresh) != 1
+                        or fresh[0]["slot_ref"] != slot_ref
+                        or not self._same_delivery_identity(fresh[0], candidate)
+                    ):
+                        raise HouseholdError("Oda delivery selection is uncertain; inspect the provider selection")
+                    normalized = fresh[0]
+                    raw_cart = self.oda.call("get_cart", {}, deadline=deadline)
+                    cart = cart_summary(raw_cart)
+                    delivery = cart.get("delivery")
+                    if (
+                        not isinstance(delivery, Mapping)
+                        or not oda_cart_delivery_matches_slot(delivery, normalized)
+                    ):
+                        raise HouseholdError("Oda delivery selection is uncertain; inspect the provider selection")
+                    if change:
+                        display = delivery.get("display")
+                        if not isinstance(display, str) or not display.strip() or len(display) > 500:
+                            raise HouseholdError("Oda delivery selection returned no verified display")
+                        requested = {
+                            "slot_id": normalized["provider_slot_id"],
+                            "display": display.strip(),
+                            "slot": normalized,
+                        }
+                        with self.store.locked() as locked:
+                            if canonical(locked.get("order_change")) != canonical(change):
+                                raise HouseholdError("order change state changed while selecting delivery")
+                            locked["order_change"]["kind"] = "delivery"
+                            locked["order_change"]["requested_delivery"] = requested
+                    if request.get("_defer_record") is not True:
+                        self._record_delivery_selection(
+                            normalized,
+                            origin=str(request.get("_origin") or "explicit"),
+                            candidate_digest=request.get("_candidate_digest"),
+                            baseline=self.store.read(),
+                            cart=raw_cart,
+                            occurrence=str(request.get("_occurrence") or "") or None,
+                        )
+                    response = {
+                        "provider": "oda",
+                        "selected": normalized,
+                        "price_display": delivery_price_display(normalized),
+                    }
+                    if change:
+                        response.update({
+                            "staged_for_order": change["order_id"],
+                            "next": "Prepare checkout, review the exact new window and any payment difference, then ask for confirmation.",
+                        })
+                    return response
                 if self.provider == "meny":
                     self.browser.verify_order_change(
                         change.get("order_id") if change else None,
@@ -2274,8 +3022,21 @@ class Application:
                             if canonical(locked.get("order_change")) != canonical(change):
                                 raise HouseholdError("order change state changed while selecting delivery")
                             locked["order_change"]["kind"] = "full_order"
+                    selected = result.get("selected") if isinstance(result, Mapping) else None
+                    normalized = validate_delivery_slot(selected)
+                    if normalized["slot_ref"] != slot_ref or normalized["selected"] is not True:
+                        raise HouseholdError("MENY selected delivery does not match the requested slot")
+                    if request.get("_defer_record") is not True:
+                        scope_cart = self.oda.call("get_cart", {}, deadline=deadline)
+                        self._record_delivery_selection(
+                            normalized,
+                            origin=str(request.get("_origin") or "explicit"),
+                            candidate_digest=request.get("_candidate_digest"),
+                            baseline=self.store.read(),
+                            cart=scope_cart,
+                            occurrence=str(request.get("_occurrence") or "") or None,
+                        )
                     return result
-                return self.oda.call("select_delivery_slot", arguments)
         raise HouseholdError("unknown delivery action")
 
     def _orders(self, request: Mapping[str, Any]) -> dict[str, Any]:
@@ -2721,7 +3482,28 @@ class Application:
         action = request.get("action", "prepare")
         deadline = time.monotonic() + (MENY_CHECKOUT_OPERATION_TIMEOUT if self.provider == "meny" else 240)
         if action == "prepare":
-            return self._checkout_prepare(deadline)
+            occurrence = str(request.get("occurrence") or "") or None
+            state = self.store.read()
+            observation = state.get("delivery_selection")
+            scope = observation.get("scope") if isinstance(observation, Mapping) else None
+            scoped_occurrence = scope.get("occurrence") if isinstance(scope, Mapping) else None
+            scoped_record = state.get("occurrences", {}).get(scoped_occurrence)
+            if (
+                occurrence is None
+                and scoped_occurrence
+                and isinstance(scoped_record, Mapping)
+                and scoped_record.get("status") == "cart_ready"
+            ):
+                raise HouseholdError("carry the cart_ready occurrence into checkout prepare")
+            if occurrence is not None:
+                record = state.get("occurrences", {}).get(occurrence)
+                if not isinstance(record, Mapping) or record.get("status") != "cart_ready":
+                    raise HouseholdError("checkout occurrence is not a cart_ready scheduled run")
+            return self._checkout_prepare(
+                deadline,
+                occurrence=occurrence,
+                cart_ready_continuation=occurrence is not None,
+            )
         if action == "confirm":
             return self._checkout_confirm(deadline, str(request.get("confirmation_id") or ""))
         if action == "submit":
@@ -2765,6 +3547,31 @@ class Application:
                 elif existing.get("confirmation_id") != prepared["confirmation_id"]:
                     raise HouseholdError("checkout idempotency_key is bound to another attempt")
             result = self._checkout_confirm(deadline, prepared["confirmation_id"])
+            if result.get("reprepared") is True:
+                replacement_id = str(result.get("confirmation_id") or "")
+                if not replacement_id:
+                    raise HouseholdError("reprepared checkout has no confirmation identity")
+                with self.store.locked() as state:
+                    existing = self._protected_request(state, "checkout", idempotency_key)
+                    if (
+                        not isinstance(existing, dict)
+                        or existing.get("confirmation_id") != prepared["confirmation_id"]
+                    ):
+                        raise HouseholdError("checkout idempotency binding changed during reprepare")
+                    current_pending = state.get("pending_checkout")
+                    if (
+                        not isinstance(current_pending, Mapping)
+                        or current_pending.get("confirmation_id") != replacement_id
+                    ):
+                        raise HouseholdError("reprepared checkout state changed")
+                    existing["confirmation_id"] = replacement_id
+                    existing["rebound_at"] = now().isoformat()
+                return {
+                    **result,
+                    "confirmation_id": replacement_id,
+                    "authorized_summary": result["summary"],
+                    "order_change": result.get("order_change"),
+                }
             return {**result, "confirmation_id": prepared["confirmation_id"], "authorized_summary": prepared["summary"], "order_change": prepared.get("order_change")}
         if action == "reconcile":
             return self._checkout_reconcile(deadline, str(request.get("confirmation_id") or ""))
@@ -2772,9 +3579,11 @@ class Application:
             occurrence = str(request.get("occurrence") or "")
             with self.store.locked() as state:
                 schedule = deepcopy(state["schedule"])
-                maximum_total = validate_schedule(schedule, self.provider)
-                if not schedule.get("enabled") or not schedule.get("auto_checkout"):
-                    raise HouseholdError("auto-checkout is off")
+                validate_schedule(schedule, self.provider)
+                if not schedule.get("enabled"):
+                    raise HouseholdError("scheduled run is off")
+                if not schedule.get("auto_checkout") and schedule.get("mode") != "cart_ready":
+                    raise HouseholdError("scheduled delivery choice requires cart_ready or auto_checkout mode")
                 if not isinstance(schedule.get("cron_job_id"), str) or not schedule["cron_job_id"].strip():
                     raise HouseholdError("auto-checkout is not linked to its configured cron job")
                 expected_occurrence = scheduled_occurrence(schedule, now())
@@ -2806,7 +3615,52 @@ class Application:
                 attempts = int(existing.get("attempts", 0)) + 1 if isinstance(existing, Mapping) else 1
                 state["occurrences"][occurrence] = {"status": "started", "at": now().isoformat(), "attempts": attempts}
             try:
-                prepared = self._checkout_prepare(deadline, occurrence=occurrence)
+                delivery_choice = self._scheduled_delivery_choice(
+                    schedule, occurrence=occurrence, deadline=deadline,
+                )
+                if delivery_choice.get("ready") is not True:
+                    with self.store.locked() as state:
+                        state["occurrences"][occurrence]["status"] = "needs_input"
+                    return {
+                        "completed": False,
+                        "confirmed": False,
+                        "mode": "cart_ready",
+                        **delivery_choice,
+                    }
+                if not schedule.get("auto_checkout"):
+                    if not delivery_matches(
+                        schedule["delivery"],
+                        delivery_choice.get("selected"),
+                        timezone_name=str(schedule["timezone"]),
+                    ):
+                        with self.store.locked() as state:
+                            state["occurrences"][occurrence]["status"] = "needs_input"
+                        return {
+                            "completed": False,
+                            "confirmed": False,
+                            "mode": "cart_ready",
+                            "reason": "delivery does not match preference",
+                            **delivery_choice,
+                        }
+                    cart = (
+                        self.oda.call("get_cart", {}, deadline=deadline)
+                        if self.provider == "meny"
+                        else self.oda.call("get_cart", {}, deadline=deadline)
+                    )
+                    summary = self._bind_delivery_summary(cart_summary(cart), delivery_choice)
+                    with self.store.locked() as state:
+                        state["occurrences"][occurrence]["status"] = "cart_ready"
+                    return {
+                        "completed": False,
+                        "confirmed": False,
+                        "mode": "cart_ready",
+                        "occurrence": occurrence,
+                        "summary": summary,
+                        **delivery_choice,
+                    }
+                prepared = self._checkout_prepare(
+                    deadline, occurrence=occurrence, delivery_binding=delivery_choice,
+                )
             except HouseholdError:
                 with self.store.locked() as state:
                     state["occurrences"][occurrence]["status"] = "needs_input"
@@ -2815,21 +3669,14 @@ class Application:
                 with self.store.locked() as state:
                     state["occurrences"][occurrence]["status"] = "needs_input"
                 return {"completed": False, "confirmed": False, "mode": "cart_ready", **prepared}
-            total = prepared["summary"]["total"]
-            if isinstance(total, bool) or not isinstance(total, (int, float)) or not math.isfinite(float(total)) or maximum_total is None or total > maximum_total:
+            problem = self._scheduled_checkout_problem(prepared["summary"], occurrence)
+            if problem is not None:
                 with self.store.locked() as state:
                     pending = state.get("pending_checkout")
                     if pending and pending.get("confirmation_id") == prepared["confirmation_id"] and pending.get("status") == "awaiting_confirmation":
                         state["pending_checkout"] = None
                     state["occurrences"][occurrence]["status"] = "needs_input"
-                return {"completed": False, "reason": "total exceeds maximum", "summary": prepared["summary"]}
-            if not delivery_matches(schedule["delivery"], prepared["summary"].get("delivery")):
-                with self.store.locked() as state:
-                    pending = state.get("pending_checkout")
-                    if pending and pending.get("confirmation_id") == prepared["confirmation_id"] and pending.get("status") == "awaiting_confirmation":
-                        state["pending_checkout"] = None
-                    state["occurrences"][occurrence]["status"] = "needs_input"
-                return {"completed": False, "reason": "delivery does not match preference", "summary": prepared["summary"]}
+                return {"completed": False, "reason": problem, "summary": prepared["summary"]}
             if self.confirmation_policy == "standing":
                 try:
                     result = self._checkout_confirm(deadline, prepared["confirmation_id"])
@@ -2852,8 +3699,20 @@ class Application:
             }
         raise HouseholdError("unknown checkout action")
 
-    def _checkout_prepare(self, deadline: float | None = None, *, occurrence: str | None = None) -> dict[str, Any]:
+    def _checkout_prepare(
+        self,
+        deadline: float | None = None,
+        *,
+        occurrence: str | None = None,
+        delivery_binding: Mapping[str, Any] | None = None,
+        delivery_reselections: int = 0,
+        cart_ready_continuation: bool = False,
+    ) -> dict[str, Any]:
         with self.store.locked() as state:
+            if cart_ready_continuation:
+                record = state.get("occurrences", {}).get(occurrence)
+                if not isinstance(record, Mapping) or record.get("status") != "cart_ready":
+                    raise HouseholdError("checkout occurrence is no longer cart_ready")
             current_pending = state.get("pending_checkout")
             inherited_occurrence = (
                 current_pending.get("occurrence")
@@ -2897,7 +3756,7 @@ class Application:
             fresh_target = self._orders({"action": "get", "order_id": order_change["order_id"]})
             if canonical(fresh_target) != canonical(order_change["before"]):
                 raise HouseholdError("the target Oda order changed; begin the order change again")
-        cart = self.oda.call("get_cart", {}, deadline=deadline, allow_recovery=allow_recovery) if self.provider == "meny" else self.oda.call("get_cart", {})
+        cart = self.oda.call("get_cart", {}, deadline=deadline, allow_recovery=allow_recovery) if self.provider == "meny" else self.oda.call("get_cart", {}, deadline=deadline)
         summary = cart_summary(cart)
         cart_plan_baseline = None
         if not order_change and isinstance(menu_baseline, Mapping):
@@ -2949,7 +3808,7 @@ class Application:
                     try:
                         review = self.browser.review_checkout(cart, deadline=deadline)
                     except OdaCheckoutMismatchError:
-                        refreshed_cart = self.oda.call("get_cart", {})
+                        refreshed_cart = self.oda.call("get_cart", {}, deadline=deadline)
                         refreshed_summary = cart_summary(refreshed_cart)
                         if canonical(refreshed_summary) == canonical(summary):
                             raise
@@ -3005,7 +3864,7 @@ class Application:
                 else:
                     raise HouseholdError("MENY checkout summary did not settle")
             elif not order_change:
-                refreshed_cart = self.oda.call("get_cart", {})
+                refreshed_cart = self.oda.call("get_cart", {}, deadline=deadline)
                 refreshed_summary = cart_summary(refreshed_cart)
                 if canonical(refreshed_summary) != canonical(summary):
                     if isinstance(menu_baseline, Mapping):
@@ -3015,11 +3874,35 @@ class Application:
                     raise HouseholdError("Oda cart or delivery changed while preparing checkout; prepare a new summary")
                 cart = refreshed_cart
                 summary = refreshed_summary
+            if self.provider == "oda" and isinstance(review.get("amounts"), Mapping):
+                amount_cart = dict(cart)
+                amount_cart["amounts"] = deepcopy(dict(review["amounts"]))
+                reviewed_amounts = cart_summary(amount_cart).get("amounts")
+                if not isinstance(reviewed_amounts, Mapping):
+                    raise HouseholdError("Oda checkout returned no verified amounts")
+                summary["amounts"] = deepcopy(dict(reviewed_amounts))
             payment_display = None
             if self.provider == "oda":
                 payment_display = str((review.get("summary") or {}).get("payment") or review.get("payment_display") or "")
                 if re.fullmatch(r"•••• \d{4}", payment_display) is None:
                     raise HouseholdError("Oda checkout returned no verified masked payment identity")
+            if delivery_binding is None:
+                delivery_binding = self._current_delivery_choice(
+                    occurrence=occurrence, deadline=deadline, allow_recovery=allow_recovery,
+                    scope_cart=cart,
+                )
+            else:
+                delivery_binding = self._unchanged_delivery_binding(
+                    delivery_binding,
+                    occurrence=occurrence,
+                    deadline=deadline,
+                    allow_recovery=allow_recovery,
+                    scope_cart=cart,
+                )
+            summary = self._bind_delivery_summary(summary, delivery_binding)
+            if self.provider == "meny":
+                review = deepcopy(dict(review))
+                review["delivery_guard"] = deepcopy(dict(delivery_binding))
             confirmation_id = secrets.token_urlsafe(18)
             with self.store.locked() as state:
                 if canonical(state.get("pending_checkout")) != canonical(baseline):
@@ -3047,7 +3930,12 @@ class Application:
                     } if isinstance(menu_baseline, Mapping) else None,
                     "occurrence": occurrence,
                     "order_change": order_change,
+                    "delivery_reselections": delivery_reselections,
                 }
+                if occurrence:
+                    occurrence_record = state.get("occurrences", {}).get(occurrence)
+                    if isinstance(occurrence_record, dict):
+                        occurrence_record["status"] = "awaiting_confirmation"
         return {
             "confirmation_id": confirmation_id,
             "confirmation_policy": self.confirmation_policy,
@@ -3079,9 +3967,18 @@ class Application:
                 if canonical(state.get("pending_checkout")) == canonical(pending):
                     state["pending_checkout"] = None
             raise HouseholdError("checkout confirmation expired")
-        cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {})
+        try:
+            reprepared = self._revalidate_checkout_delivery(pending, deadline=deadline)
+        except HouseholdError:
+            with self.store.locked() as state:
+                if canonical(state.get("pending_checkout")) == canonical(pending):
+                    state["pending_checkout"] = None
+            raise
+        if reprepared is not None:
+            return reprepared
+        cart = self.oda.call("get_cart", {}, deadline=deadline) if self.provider == "meny" else self.oda.call("get_cart", {}, deadline=deadline)
         pending_change = pending.get("order_change") or {}
-        expected_cart = cart_summary(pending["cart"]) if self.provider == "meny" or pending_change.get("requested_delivery") else pending["summary"]
+        expected_cart = cart_summary(pending["cart"])
         if canonical(cart_summary(cart)) != canonical(expected_cart):
             with self.store.locked() as state:
                 if canonical(state.get("pending_checkout")) == canonical(pending):
@@ -3110,14 +4007,27 @@ class Application:
                     # MENY's provider client is this same locked browser tab;
                     # submit_checkout performs its own exact fresh review.
                     if self.provider == "oda":
-                        fresh = self.oda.call("get_cart", {})
-                        expected = (
-                            cart_summary(pending["cart"])
-                            if pending_change.get("requested_delivery")
-                            else pending["summary"]
-                        )
+                        fresh = self.oda.call("get_cart", {}, deadline=deadline)
+                        expected = cart_summary(pending["cart"])
                         if canonical(cart_summary(fresh)) != canonical(expected):
                             raise CheckoutPreconditionError("cart or delivery changed before the final click")
+                        try:
+                            self._unchanged_delivery_binding(
+                                pending["summary"]["delivery"],
+                                occurrence=str(pending.get("occurrence") or "") or None,
+                                deadline=deadline,
+                            )
+                        except HouseholdError as exc:
+                            raise CheckoutPreconditionError(
+                                f"delivery changed again before the final click: {exc}"
+                            ) from exc
+                    problem = self._scheduled_checkout_problem(
+                        pending["summary"], str(pending.get("occurrence") or "") or None,
+                    )
+                    if problem is not None:
+                        raise CheckoutPreconditionError(
+                            f"scheduled checkout stopped before the final click: {problem}"
+                        )
                     if pending_change:
                         with self.store.locked() as state:
                             if canonical(state.get("order_change")) != canonical(pending_change):
@@ -3135,6 +4045,18 @@ class Application:
                             raise CheckoutPreconditionError("checkout confirmation changed before the final click")
                     if now() >= datetime.fromisoformat(pending["expires_at"]):
                         raise CheckoutPreconditionError("checkout confirmation expired before the final click")
+
+                if self.provider == "meny":
+                    try:
+                        self._unchanged_delivery_binding(
+                            pending["summary"]["delivery"],
+                            occurrence=str(pending.get("occurrence") or "") or None,
+                            deadline=deadline,
+                        )
+                    except HouseholdError as exc:
+                        raise CheckoutPreconditionError(
+                            f"delivery changed again before the final provider action: {exc}"
+                        ) from exc
 
                 if pending_change.get("requested_delivery") and self.provider == "oda":
                     change = pending["order_change"]
