@@ -350,7 +350,7 @@ class StateMigrationTests(unittest.TestCase):
             (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
             store = StateStore(root, {**CONFIG, "household": "Hus A", "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 3)
+            self.assertEqual(migrated["version"], 4)
             self.assertEqual(migrated["profile"]["recipes"]["repeat_cooldown_weeks"], 6)
             self.assertIn("menu_id", migrated["menu"])
             self.assertEqual(migrated["order_snapshots"]["order-old"]["digest"], migrated["menu"]["digest"])
@@ -405,7 +405,7 @@ class StateMigrationTests(unittest.TestCase):
 
             store = StateStore(root, {**CONFIG, "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 3)
+            self.assertEqual(migrated["version"], 4)
             self.assertEqual(migrated["email_jobs"][0]["provider"], "oda")
             self.assertEqual(migrated["email_jobs"][0]["status"], "pending")
             self.assertEqual(migrated["order_snapshot_providers"]["order-old"], "oda")
@@ -431,6 +431,22 @@ class StateMigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(HouseholdError, "recipe lifecycle state is invalid"):
                 StateStore(root, {**CONFIG, "provider": "oda"})
             self.assertTrue((root / "state-v2.backup.json").exists())
+
+    def test_v3_adds_an_empty_active_cart_plan_once_with_raw_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = meal_core.initial_state({**CONFIG, "provider": "oda"})
+            legacy["version"] = 3
+            legacy.pop("cart_plan")
+            (root / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+            migrated = StateStore(root, {**CONFIG, "provider": "oda"}).read()
+
+            self.assertEqual(migrated["version"], 4)
+            self.assertIsNone(migrated["cart_plan"])
+            backup = json.loads((root / "state-v3.backup.json").read_text(encoding="utf-8"))
+            self.assertEqual(backup["version"], 3)
+            self.assertNotIn("cart_plan", backup)
 
     def test_structured_state_version_is_rejected_without_raw_type_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -553,6 +569,17 @@ class RecipeFlowTests(unittest.TestCase):
     def save_bank_recipe(self, name: str = "Bankfisk", external_id: str = "bank-1") -> dict:
         return self.app.handle({"operation": "recipes", "action": "save", "recipe": full_recipe(name, external_id=external_id), "idempotency_key": f"save-{external_id}"})["recipe"]
 
+    def prepare_checkout_with_current_cart(self):
+        prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
+        if prepared.get("cart_reconciliation_required"):
+            digest = prepared["cart_plan"]["cart_digest"]
+            self.app.handle({
+                "operation": "cart", "action": "reconcile",
+                "decision": "keep_current", "cart_digest": digest,
+            })
+            prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
+        return prepared
+
     def test_bank_recipe_materializes_into_menu_scaling_usage_and_source_email(self):
         saved = self.save_bank_recipe()
         result = self.app.handle({
@@ -623,14 +650,14 @@ class RecipeFlowTests(unittest.TestCase):
 
     def test_predispatch_can_be_abandoned_but_uncertain_checkout_blocks(self):
         first = self.app.handle({"operation": "menu", "action": "save", "menu": menu("2026-W40")})["menu"]
-        self.app.handle({"operation": "checkout", "action": "prepare"})
+        self.prepare_checkout_with_current_cart()
         second = self.app.handle({"operation": "menu", "action": "save", "menu": menu("2026-W41", full_recipe("Annen fisk"))})["menu"]
         state = self.store.read()
         self.assertIsNone(state["pending_checkout"])
         self.assertEqual(state["recipe_usage"][first["menu_id"]]["status"], "cancelled")
         self.assertEqual(state["menu"]["menu_id"], second["menu_id"])
 
-        self.app.handle({"operation": "checkout", "action": "prepare"})
+        self.prepare_checkout_with_current_cart()
         with self.store.locked() as locked:
             locked["pending_checkout"]["status"] = "uncertain"
         with self.assertRaisesRegex(HouseholdError, "may have been dispatched"):
@@ -1147,7 +1174,7 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertEqual(state["menu"]["phase"], "draft")
         self.assertNotIn("order_id", state["menu"])
         self.oda.tracking = "paid_and_modifiable"
-        prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
+        prepared = self.prepare_checkout_with_current_cart()
         self.assertTrue(prepared["confirmation_id"])
 
     def test_email_schedule_requires_canonical_delivery_date(self):

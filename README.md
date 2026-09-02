@@ -13,7 +13,7 @@ through Hermes Agent or with `profile_overrides` in your private configuration.
 | Capability | Oda | MENY |
 |---|---:|---:|
 | Product and recipe search | MCP | Logged-in browser |
-| Read and change cart | MCP | Logged-in browser |
+| Read, change and active-menu sync cart | MCP | Logged-in browser |
 | Favorites, recurring items and menus | Local | Local |
 | Delivery, orders and cancellation | Yes | Yes |
 | Add goods / move an existing order | Yes | Yes |
@@ -124,6 +124,38 @@ Vipps, bank, device or platform approval, and an uncertain result is never
 retried automatically.
 Each standing submit/cancel intent uses one explicit idempotency key. Reuse it
 only to recover that same lost response; use a new key for a later user intent.
+
+## Manual cart goods during a weekly menu
+
+An active weekly menu uses one small provider- and menu-revision-bound cart
+plan. Cart `sync` receives the complete required quantity `R` for each exact
+provider product ID. On its first run it snapshots the live starting quantity
+`B`; different packages, brands and substitutions remain different products.
+By default an existing same-SKU quantity counts toward the requirement, so the
+target is `max(B,R)` and the service adds only the verified shortfall. If the
+owner explicitly says a starting product is extra, its target is `B+R`.
+
+The plan stores only `B`, `R`, the verified quantity Meal Planner added, the
+last verified live product quantities/digest and an optional owner-approved
+digest. It survives restart, and repeated sync is idempotent, including after
+an explicit exclusion or accepted shortfall on an unchanged digest. Immediately
+before every batch write, the provider cart is reread; any concurrent manual
+change stops the write for reconciliation. A successful write is read back and
+must exactly match the safe merge. Price, bags, deposits, fees and delivery are
+not classified as manual product provenance; the normal fresh checkout review
+continues to bind those values.
+
+Checkout rereads the live product quantities, including immediately before the
+final provider click. Extras, missing menu quantities
+and unresolved starting goods are presented in one combined question bound to
+that exact cart digest. “Keep the current cart” is only a suggested default;
+silence and timeout are not approval. The owner may name exact exclusions,
+restore missing menu products, or explicitly accept named missing quantities.
+An exclusion cannot reduce below `R` unless that shortfall is accepted in the
+same decision. The cart is reread before applying the decision and again before
+checkout. Any later product or quantity change invalidates the approved digest.
+Scheduled checkout stops in `cart_ready`/`needs_input` while anything is
+unresolved and never treats the suggested default as automatic consent.
 
 Only the checkout tool's bound `submit` or `reconcile` result can establish a
 successful order. A generic order list or order read after checkout returned an
@@ -316,6 +348,9 @@ requests, in a safe order, are:
   configured confirmation policy after its amount and delivery guards pass.
 - “Search for broccoli,” “Find a salmon recipe,” “Show my cart,” and “Add one
   of that exact broccoli to this week's order.”
+- For a saved weekly menu, sync the complete exact product requirements rather
+  than raw deltas. If checkout reports a changed cart, answer its one combined
+  keep/restore/exclude question before preparing again.
 - “List delivery windows,” select one exact window, then list, inspect or track
   orders.
 - “Add one of that product to order …” or move that order's delivery. The agent

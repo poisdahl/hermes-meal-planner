@@ -51,6 +51,29 @@ that exact order change first,
 then use the ordinary cart or delivery tool and protected checkout. Do not
 reproduce integration rules or maintain household data in the skill or chat.
 
+For an active weekly menu, call cart `sync` with the complete required quantity
+`R` for every exact searched provider product ID; do not translate the menu into
+raw cart deltas. The integration snapshots the starting quantity `B`, rereads
+immediately before its smallest safe write, and verifies the provider result.
+By default an existing same-SKU quantity counts toward the requirement, so the
+target is `max(B,R)`. Pass `start_as_extra_product_ids` only for exact products
+the owner explicitly said are extra, making their target `B+R`. Repeated sync
+is restart-safe and idempotent. Different packages, brands and substitutions
+remain different exact product IDs.
+
+The owner may edit Oda or MENY directly while planning. Checkout rereads the
+live product quantities and binds any decision to that exact cart digest. When
+it returns `cart_reconciliation_required`, show extras, missing quantities and
+unresolved starting goods in one short question. Suggest `keep_current`, but do
+not treat silence, timeout or ambiguity as consent. Then call cart `reconcile`
+with the unchanged returned digest and the explicit decision. Pass only exact
+named `exclude_product_ids`; use `restore_missing` to restore missing menu
+quantities, or `accept_missing_product_ids` when the owner explicitly accepts a
+named shortfall. Prepare checkout again afterward. A changed digest invalidates
+the decision and requires one new combined question. If no issue exists, do not
+ask. An unattended scheduled run with any unresolved cart state stops in
+`cart_ready`/`needs_input`; it never applies the suggested default automatically.
+
 Save a recipe only on a clear request. Preserve explicit source and rights
 facts; do not guess a license or claim authorship. Store original Oda/MENY
 recipes as link-only. A materially rewritten recipe may be saved as adapted or

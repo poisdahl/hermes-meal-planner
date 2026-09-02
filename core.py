@@ -114,7 +114,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 3,
+        "version": 4,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -123,6 +123,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "schedule": deepcopy(DEFAULT_SCHEDULE),
         "email_recipient": None,
         "menu": None,
+        "cart_plan": None,
         "pending_checkout": None,
         "pending_cancellation": None,
         "order_change": None,
@@ -262,7 +263,7 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 3:
+    if version > 4:
         raise HouseholdError("household state is newer than this meal planner")
     if version == 1:
         profile = state.get("profile")
@@ -331,6 +332,9 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
                 order_id, next(iter(matching_providers)) if len(matching_providers) == 1 else bound_provider,
             )
         state["version"] = 3
+    if state["version"] == 3:
+        state.setdefault("cart_plan", None)
+        state["version"] = 4
     state.setdefault("recipe_usage", {})
     state.setdefault("recipe_usage_requests", {})
     state.setdefault("order_snapshots", {})
@@ -338,6 +342,7 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
     state.setdefault("order_snapshot_providers", {})
     state.setdefault("protected_results", {})
     state.setdefault("protected_requests", {})
+    state.setdefault("cart_plan", None)
     recipient = state.get("email_recipient")
     if recipient is not None and not valid_email_address(recipient):
         state["email_recipient"] = None
@@ -377,6 +382,38 @@ def _migrate_state(state: dict[str, Any], config: Mapping[str, Any]) -> None:
         for provider in state["order_snapshot_providers"].values()
     ):
         raise HouseholdError("household order snapshot providers are invalid")
+    cart_plan = state.get("cart_plan")
+    if cart_plan is not None:
+        if not isinstance(cart_plan, dict) or cart_plan.get("provider") not in {"oda", "meny"}:
+            raise HouseholdError("household cart plan is invalid")
+        if cart_plan.get("status") not in {"active", "needs_input", "ordered"}:
+            raise HouseholdError("household cart plan status is invalid")
+        if not isinstance(cart_plan.get("menu_ref"), dict):
+            raise HouseholdError("household cart plan menu is invalid")
+        mappings = (
+            cart_plan.get("product_names"), cart_plan.get("baseline_quantities"),
+            cart_plan.get("required_quantities"), cart_plan.get("added_quantities"),
+            cart_plan.get("last_synced_quantities"),
+        )
+        if not all(isinstance(value, dict) for value in mappings):
+            raise HouseholdError("household cart plan quantities are invalid")
+        names, *quantity_maps = mappings
+        for product_id in set().union(*(value.keys() for value in mappings)):
+            if item_key({"product_id": product_id}) != product_id:
+                raise HouseholdError("household cart plan product identity is invalid")
+            if not isinstance(names.get(product_id), str) or not names[product_id].strip():
+                raise HouseholdError("household cart plan product name is invalid")
+            for values in quantity_maps:
+                quantity = values.get(product_id, 0)
+                if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 0 or quantity > 1_000_000:
+                    raise HouseholdError("household cart plan quantity is invalid")
+        extra_ids = cart_plan.get("start_as_extra_product_ids")
+        if not isinstance(extra_ids, list) or not set(extra_ids).issubset(cart_plan["baseline_quantities"]):
+            raise HouseholdError("household cart plan starting-quantity mode is invalid")
+        for key in ("last_synced_digest", "approved_cart_digest", "pending_cart_digest"):
+            digest = cart_plan.get(key)
+            if digest is not None and (not isinstance(digest, str) or re.fullmatch(r"[a-f0-9]{64}", digest) is None):
+                raise HouseholdError("household cart plan digest is invalid")
 
 
 class StateStore:
@@ -395,7 +432,7 @@ class StateStore:
             if (
                 not isinstance(source_version, bool)
                 and isinstance(source_version, int)
-                and source_version in {1, 2}
+                and source_version in {1, 2, 3}
             ):
                 backup = self.directory / f"state-v{source_version}.backup.json"
                 if not backup.exists():
@@ -551,6 +588,7 @@ def masked_status(state: Mapping[str, Any], integration: Mapping[str, Any]) -> d
         "recurring_items": len(state["recurring_items"]),
         "menu_phase": (state.get("menu") or {}).get("phase"),
         "menu_id": (state.get("menu") or {}).get("menu_id"),
+        "cart_plan_status": (state.get("cart_plan") or {}).get("status"),
         "pending_checkout_status": (state.get("pending_checkout") or {}).get("status"),
         "pending_cancellation_status": (state.get("pending_cancellation") or {}).get("status"),
         "order_change_status": (state.get("order_change") or {}).get("status"),

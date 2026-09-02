@@ -260,6 +260,52 @@ class FakeMeny(FakeOda):
         return super().call(tool, arguments, **kwargs)
 
 
+class MutableCartMixin:
+    def _mutate_cart(self, arguments):
+        for operation in arguments["operations"]:
+            product_id = str(operation["productId"])
+            delta = operation["quantity"]
+            match = next((item for item in self.cart["items"] if str(item["product_id"]) == product_id), None)
+            current = int(match["quantity"]) if match else 0
+            updated = current + delta
+            if updated < 0:
+                raise HouseholdError("test cart quantity became negative")
+            if updated == 0 and match:
+                self.cart["items"].remove(match)
+            elif match:
+                match["quantity"] = updated
+            elif updated:
+                self.cart["items"].append({
+                    "product_id": operation["productId"],
+                    "name": "Brokkoli" if product_id == MENY_PRODUCT else f"Produkt {product_id}",
+                    "quantity": updated,
+                    "price": 35.0,
+                })
+        count = sum(int(item["quantity"]) for item in self.cart["items"])
+        total = sum(float(item.get("price", 35.0)) * int(item["quantity"]) for item in self.cart["items"])
+        self.cart["count"] = count
+        self.cart["subtotal"] = total
+        if self.cart.get("provider") == "meny":
+            self.cart["total"] = total
+        return deepcopy(self.cart)
+
+
+class MutableFakeOda(MutableCartMixin, FakeOda):
+    def call(self, tool, arguments, **kwargs):
+        if tool == "manipulate_cart":
+            self.calls.append((tool, deepcopy(arguments)))
+            return self._mutate_cart(arguments)
+        return super().call(tool, arguments, **kwargs)
+
+
+class MutableFakeMeny(MutableCartMixin, FakeMeny):
+    def call(self, tool, arguments, **kwargs):
+        if tool == "manipulate_cart":
+            self.calls.append((tool, deepcopy(arguments)))
+            return self._mutate_cart(arguments)
+        return super().call(tool, arguments, **kwargs)
+
+
 class CoreTests(unittest.TestCase):
     def test_mcp_saved_item_tools_build_the_internal_item_shape(self):
         class FakeMCPServer:
@@ -3986,6 +4032,295 @@ class MenyClientTests(unittest.TestCase):
         with self.assertRaises(CancellationPreconditionError):
             client.submit_cancellation("99990001", order, review)
         client._invoke.assert_not_called()
+
+
+class CartPlanTests(unittest.TestCase):
+    @staticmethod
+    def menu(revision=1, digest="a" * 64):
+        return {
+            "menu_id": "menu_cart_plan_test", "revision": revision, "digest": digest,
+            "phase": "draft", "week": "2026-W36", "dishes": [], "salads": [],
+        }
+
+    @staticmethod
+    def app(directory, provider_name):
+        settings = {**CONFIG, "provider": provider_name}
+        store = StateStore(Path(directory), settings)
+        provider = MutableFakeMeny() if provider_name == "meny" else MutableFakeOda()
+        browser = FakeBrowser()
+        browser.oda = provider
+        application = Application(store, provider, browser)
+        with store.locked() as state:
+            state["menu"] = CartPlanTests.menu()
+        product_id = MENY_PRODUCT if provider_name == "meny" else "10"
+        return store, provider, browser, application, product_id
+
+    @staticmethod
+    def sync(application, product_id, quantity=2, **extra):
+        return application.handle({
+            "operation": "cart", "action": "sync",
+            "requirements": [{"product_id": product_id, "product_name": "Brokkoli" if product_id == MENY_PRODUCT else "Fullkornspasta", "quantity": quantity}],
+            **extra,
+        })
+
+    def test_sync_uses_exact_ids_counts_start_toward_requirement_and_is_restart_idempotent(self):
+        for provider_name in ("oda", "meny"):
+            with self.subTest(provider=provider_name), tempfile.TemporaryDirectory() as directory:
+                store, provider, _browser, application, product_id = self.app(directory, provider_name)
+                first = self.sync(application, product_id)
+                self.assertTrue(first["synced"])
+                self.assertFalse(first["idempotent"])
+                plan = store.read()["cart_plan"]
+                self.assertEqual(plan["baseline_quantities"][product_id], 1)
+                self.assertEqual(plan["required_quantities"][product_id], 2)
+                self.assertEqual(plan["added_quantities"][product_id], 1)
+                self.assertEqual(plan["last_synced_quantities"][product_id], 2)
+                self.assertEqual(plan["last_synced_digest"], application._cart_digest({product_id: 2}))
+                calls = sum(tool == "manipulate_cart" for tool, _arguments in provider.calls)
+
+                reopened_store = StateStore(Path(directory), {**CONFIG, "provider": provider_name})
+                reopened = Application(reopened_store, provider, FakeBrowser())
+                second = self.sync(reopened, product_id)
+
+                self.assertTrue(second["idempotent"])
+                self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), calls)
+                self.assertEqual(reopened_store.read()["cart_plan"]["added_quantities"][product_id], 1)
+
+    def test_explicit_start_is_extra_uses_baseline_plus_requirement_for_same_sku(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, _browser, application, product_id = self.app(directory, "oda")
+            result = self.sync(application, product_id, start_as_extra_product_ids=[product_id])
+            self.assertEqual(cart_summary(result["cart"])["items"][0]["quantity"], 3)
+            plan = store.read()["cart_plan"]
+            self.assertEqual(plan["baseline_quantities"][product_id], 1)
+            self.assertEqual(plan["required_quantities"][product_id], 2)
+            self.assertEqual(plan["added_quantities"][product_id], 2)
+            self.assertEqual(provider.cart["items"][0]["quantity"], 3)
+
+    def test_start_as_extra_rejects_a_product_that_was_not_in_the_starting_cart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _store, _provider, _browser, application, product_id = self.app(directory, "oda")
+            with self.assertRaisesRegex(HouseholdError, "already in the cart"):
+                self.sync(application, product_id, start_as_extra_product_ids=["20"])
+
+    def test_sync_rereads_immediately_before_write_and_never_overwrites_a_manual_add(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, _browser, application, product_id = self.app(directory, "oda")
+            original = provider.call
+            reads = 0
+
+            def concurrent(tool, arguments, **kwargs):
+                nonlocal reads
+                result = original(tool, arguments, **kwargs)
+                if tool == "get_cart":
+                    reads += 1
+                    if reads == 1:
+                        provider._mutate_cart({"operations": [{"productId": 20, "quantity": 1}]})
+                return result
+
+            provider.call = concurrent
+            result = self.sync(application, product_id)
+
+            self.assertFalse(result["synced"])
+            self.assertTrue(result["cart_reconciliation_required"])
+            self.assertEqual(result["reason"], "cart_changed_immediately_before_sync")
+            self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), 0)
+            self.assertEqual(store.read()["cart_plan"]["status"], "needs_input")
+            self.assertTrue(any(str(item["product_id"]) == "20" for item in provider.cart["items"]))
+
+    def test_checkout_combines_start_extras_and_missing_then_binds_explicit_keep_current_digest(self):
+        for provider_name in ("oda", "meny"):
+            with self.subTest(provider=provider_name), tempfile.TemporaryDirectory() as directory:
+                store, provider, _browser, application, product_id = self.app(directory, provider_name)
+                self.sync(application, product_id)
+                provider_id = int(product_id) if provider_name == "oda" else product_id
+                provider._mutate_cart({"operations": [{"productId": provider_id, "quantity": -1}]})
+
+                stopped = application.handle({"operation": "checkout", "action": "prepare"})
+
+                self.assertTrue(stopped["cart_reconciliation_required"])
+                self.assertEqual(stopped["default_suggestion"], "keep_current")
+                item = next(item for item in stopped["cart_plan"]["items"] if item["product_id"] == product_id)
+                self.assertEqual(item["missing_quantity"], 1)
+                self.assertTrue(item["unresolved_start_quantity"])
+                digest = stopped["cart_plan"]["cart_digest"]
+                accepted = application.handle({
+                    "operation": "cart", "action": "reconcile", "decision": "keep_current", "cart_digest": digest,
+                })
+                self.assertTrue(accepted["reconciled"])
+                self.assertEqual(store.read()["cart_plan"]["approved_cart_digest"], digest)
+                prepared = application.handle({"operation": "checkout", "action": "prepare"})
+                self.assertNotIn("cart_reconciliation_required", prepared)
+
+    def test_selective_exclusion_keeps_required_same_sku_and_can_remove_external_product(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, _browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            provider._mutate_cart({"operations": [{"productId": 10, "quantity": 1}, {"productId": 20, "quantity": 1}]})
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            digest = stopped["cart_plan"]["cart_digest"]
+
+            result = application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "keep_current",
+                "cart_digest": digest, "exclude_product_ids": ["10", "20"],
+            })
+
+            quantities = {item["product_id"]: item["quantity"] for item in cart_summary(result["cart"])["items"]}
+            self.assertEqual(quantities, {"10": 2})
+            self.assertEqual(store.read()["cart_plan"]["approved_cart_digest"], application._cart_digest({"10": 2}))
+
+    def test_missing_restore_and_explicitly_accepted_shortfall_are_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _store, provider, _browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            provider._mutate_cart({"operations": [{"productId": 10, "quantity": -1}]})
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            restored = application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "restore_missing",
+                "cart_digest": stopped["cart_plan"]["cart_digest"],
+            })
+            self.assertEqual(cart_summary(restored["cart"])["items"][0]["quantity"], 2)
+
+        with tempfile.TemporaryDirectory() as directory:
+            _store, provider, _browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            provider._mutate_cart({"operations": [{"productId": 10, "quantity": -1}]})
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            digest = stopped["cart_plan"]["cart_digest"]
+            with self.assertRaisesRegex(HouseholdError, "cannot reduce below"):
+                application.handle({
+                    "operation": "cart", "action": "reconcile", "decision": "keep_current",
+                    "cart_digest": digest, "exclude_product_ids": [product_id],
+                })
+            accepted = application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "keep_current",
+                "cart_digest": digest, "exclude_product_ids": [product_id],
+                "accept_missing_product_ids": [product_id],
+            })
+            self.assertEqual(cart_summary(accepted["cart"])["items"], [])
+            calls = sum(tool == "manipulate_cart" for tool, _arguments in provider.calls)
+            repeated = self.sync(application, product_id)
+            self.assertTrue(repeated["idempotent"])
+            self.assertEqual(cart_summary(repeated["cart"])["items"], [])
+            self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), calls)
+
+    def test_approved_selective_exclusion_is_not_readded_by_repeated_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _store, provider, _browser, application, product_id = self.app(directory, "oda")
+            provider._mutate_cart({"operations": [{"productId": 20, "quantity": 1}]})
+            self.sync(application, product_id)
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            accepted = application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "keep_current",
+                "cart_digest": stopped["cart_plan"]["cart_digest"], "exclude_product_ids": ["20"],
+            })
+            self.assertEqual(
+                {item["product_id"]: item["quantity"] for item in cart_summary(accepted["cart"])["items"]},
+                {"10": 2},
+            )
+            calls = sum(tool == "manipulate_cart" for tool, _arguments in provider.calls)
+
+            repeated = self.sync(application, product_id)
+
+            self.assertTrue(repeated["idempotent"])
+            self.assertEqual(
+                {item["product_id"]: item["quantity"] for item in cart_summary(repeated["cart"])["items"]},
+                {"10": 2},
+            )
+            self.assertEqual(sum(tool == "manipulate_cart" for tool, _arguments in provider.calls), calls)
+
+    def test_change_after_decision_invalidates_digest_without_applying_the_old_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, provider, _browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            old_digest = stopped["cart_plan"]["cart_digest"]
+            provider._mutate_cart({"operations": [{"productId": 20, "quantity": 1}]})
+
+            result = application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "keep_current", "cart_digest": old_digest,
+            })
+
+            self.assertFalse(result["reconciled"])
+            self.assertEqual(result["reason"], "cart_changed_after_question")
+            self.assertNotEqual(result["cart_plan"]["cart_digest"], old_digest)
+            self.assertIsNone(store.read()["cart_plan"]["approved_cart_digest"])
+            self.assertTrue(any(str(item["product_id"]) == "20" for item in provider.cart["items"]))
+
+    def test_menu_revision_keeps_verified_old_delta_out_of_the_new_manual_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, _provider, _browser, application, product_id = self.app(directory, "oda")
+            self.sync(application, product_id)
+            with store.locked() as state:
+                state["menu"] = self.menu(revision=2, digest="b" * 64)
+
+            result = self.sync(application, product_id, quantity=1)
+
+            self.assertFalse(result["synced"])
+            plan = store.read()["cart_plan"]
+            self.assertEqual(plan["menu_ref"]["revision"], 2)
+            self.assertEqual(plan["baseline_quantities"][product_id], 1)
+            self.assertEqual(plan["added_quantities"][product_id], 1)
+            self.assertEqual(plan["status"], "needs_input")
+
+    def test_scheduled_checkout_stops_cart_ready_for_unapproved_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = {**CONFIG, "confirmation_policy": "standing"}
+            store = StateStore(Path(directory), settings)
+            provider = MutableFakeOda()
+            browser = FakeBrowser()
+            browser.oda = provider
+            application = Application(store, provider, browser)
+            with store.locked() as state:
+                state["menu"] = self.menu()
+            self.sync(application, "10")
+            application.handle({"operation": "schedule", "action": "update", "changes": {
+                "enabled": True, "weekday": "Wednesday", "time": "15:00", "timezone": "Europe/Oslo",
+                "mode": "auto_checkout", "delivery": {"weekday": "Saturday", "preferred_end": "15:00", "latest_end": "18:00"},
+                "maximum_total": 1000.0, "auto_checkout": True,
+            }})
+            application.handle({"operation": "schedule", "action": "set_cron_job", "cron_job_id": "cart-plan-test"})
+            current = datetime(2026, 9, 2, 13, 5, tzinfo=timezone.utc)
+            with mock.patch("service.now", return_value=current):
+                result = application.handle({"operation": "checkout", "action": "auto", "occurrence": "2026-W36"})
+            self.assertEqual(result["mode"], "cart_ready")
+            self.assertTrue(result["cart_reconciliation_required"])
+            self.assertEqual(store.read()["occurrences"]["2026-W36"]["status"], "needs_input")
+            self.assertEqual(browser.checkout_clicks, 0)
+
+    def test_meny_rereads_the_approved_cart_immediately_before_payment_click(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _store, provider, _browser, application, product_id = self.app(directory, "meny")
+            self.sync(application, product_id)
+            stopped = application.handle({"operation": "checkout", "action": "prepare"})
+            application.handle({
+                "operation": "cart", "action": "reconcile", "decision": "keep_current",
+                "cart_digest": stopped["cart_plan"]["cart_digest"],
+            })
+            prepared = application.handle({"operation": "checkout", "action": "prepare"})
+
+            def change_before_click(cart, review, before_click=None, **_kwargs):
+                provider._mutate_cart({"operations": [{"productId": product_id, "quantity": 1}]})
+                if before_click:
+                    before_click()
+                provider.checkout_clicks += 1
+
+            provider.submit_checkout = change_before_click
+            with self.assertRaisesRegex(CheckoutPreconditionError, "changed before the final click"):
+                application.handle({
+                    "operation": "checkout", "action": "confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                })
+            self.assertEqual(provider.checkout_clicks, 0)
+
+    def test_active_menu_raw_delta_change_is_rejected_in_favor_of_requirement_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _store, _provider, _browser, application, _product_id = self.app(directory, "oda")
+            with self.assertRaisesRegex(HouseholdError, "action=sync"):
+                application.handle({
+                    "operation": "cart", "action": "change",
+                    "operations": [{"product_id": "10", "quantity": 1}],
+                })
 
 
 class FlowTests(unittest.TestCase):
