@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 import ipaddress
@@ -25,6 +25,13 @@ from core import HouseholdError
 MAX_RECIPE_BYTES = 256 * 1024
 MAX_IMPORT_RECORDS = 10_000
 MAX_TEXT = 4_000
+DISCOVERY_TTL_DAYS = 30
+MAX_UNBOUND_DISCOVERY_SNAPSHOTS = 2_000
+MAX_UNBOUND_DISCOVERY_BYTES = 64 * 1024 * 1024
+FAILED_DISCOVERY_BINDING_TTL_DAYS = 30
+MAX_FAILED_DISCOVERY_BINDINGS = 2_000
+ACTIVE_DISCOVERY_BINDING_STATUSES = {"pending", "uncertain"}
+DISCOVERY_DESTINATION_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,62}")
 VALID_RELATIONSHIPS = {"original", "adapted", "inspired_by", "generated", "user_supplied", "unknown"}
 VALID_STORAGE = {"full", "link_only"}
 RESTRICTED_FULL_HOSTS = {"meny.no", "www.meny.no", "oda.com", "www.oda.com"}
@@ -457,66 +464,191 @@ class RecipeStore:
         self.path = Path(path)
         self.household = str(household)
 
-    def _schema(self, connection: sqlite3.Connection) -> None:
-        metadata_exists = connection.execute(
+    @staticmethod
+    def _metadata(connection: sqlite3.Connection) -> dict[str, str] | None:
+        exists = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='metadata'"
         ).fetchone()
-        if metadata_exists:
-            metadata = dict(connection.execute(
-                "SELECT key, value FROM metadata WHERE key IN ('household', 'schema_version')"
-            ).fetchall())
-            if metadata.get("household") not in {None, self.household}:
-                raise RecipeError("recipe bank belongs to a different household")
-            if metadata.get("schema_version") not in {None, "1"}:
-                raise RecipeError("recipe bank schema is newer than this meal planner")
-        connection.executescript("""
-            CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS recipes (
-                id TEXT PRIMARY KEY,
-                revision INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                name TEXT NOT NULL,
-                search_text TEXT NOT NULL,
-                source_key TEXT,
-                content_fingerprint TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                document TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                created_via TEXT NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS recipes_source_key ON recipes(source_key) WHERE source_key IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS recipes_search ON recipes(status, name);
-            CREATE INDEX IF NOT EXISTS recipes_fingerprint ON recipes(content_fingerprint);
-            CREATE TABLE IF NOT EXISTS revisions (
-                recipe_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                document TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (recipe_id, revision)
-            );
-            CREATE TABLE IF NOT EXISTS idempotency (
-                key TEXT PRIMARY KEY,
-                operation TEXT NOT NULL,
-                request_hash TEXT NOT NULL,
-                response_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-        """)
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(recipes)")}
-        if "created_via" not in columns:
-            connection.execute("ALTER TABLE recipes ADD COLUMN created_via TEXT NOT NULL DEFAULT 'hermes'")
+        if not exists:
+            return None
+        return dict(connection.execute(
+            "SELECT key, value FROM metadata WHERE key IN ('household', 'schema_version', 'discovery_namespace')"
+        ).fetchall())
+
+    @staticmethod
+    def _create_v1_schema(connection: sqlite3.Connection) -> None:
+        statements = (
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            """CREATE TABLE recipes (
+                id TEXT PRIMARY KEY, revision INTEGER NOT NULL, status TEXT NOT NULL,
+                name TEXT NOT NULL, search_text TEXT NOT NULL, source_key TEXT,
+                content_fingerprint TEXT NOT NULL, content_hash TEXT NOT NULL,
+                document TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                created_via TEXT NOT NULL)""",
+            "CREATE UNIQUE INDEX recipes_source_key ON recipes(source_key) WHERE source_key IS NOT NULL",
+            "CREATE INDEX recipes_search ON recipes(status, name)",
+            "CREATE INDEX recipes_fingerprint ON recipes(content_fingerprint)",
+            """CREATE TABLE revisions (
+                recipe_id TEXT NOT NULL, revision INTEGER NOT NULL, status TEXT NOT NULL,
+                document TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY (recipe_id, revision))""",
+            """CREATE TABLE idempotency (
+                key TEXT PRIMARY KEY, operation TEXT NOT NULL, request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL, created_at TEXT NOT NULL)""",
+        )
+        for statement in statements:
+            connection.execute(statement)
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        namespace = secrets.token_urlsafe(12)
+        connection.execute("""CREATE TABLE discovery_snapshots (
+            discovery_ref TEXT PRIMARY KEY, snapshot_key TEXT NOT NULL UNIQUE, document TEXT NOT NULL,
+            source_identity TEXT, content_hash TEXT NOT NULL, attribution_digest TEXT NOT NULL,
+            created_at TEXT NOT NULL, renewed_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+            document_bytes INTEGER NOT NULL)""")
+        connection.execute(
+            "CREATE INDEX discovery_snapshots_expiry ON discovery_snapshots(expires_at)"
+        )
+        connection.execute("""CREATE TABLE discovery_bindings (
+            destination TEXT NOT NULL, discovery_ref TEXT NOT NULL,
+            snapshot_key TEXT NOT NULL, status TEXT NOT NULL,
+            recipe_id TEXT, recipe_revision INTEGER,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            PRIMARY KEY(destination, discovery_ref))""")
+        connection.execute(
+            "CREATE INDEX discovery_bindings_pin ON discovery_bindings(discovery_ref, status)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX discovery_bindings_builtin_revision "
+            "ON discovery_bindings(destination, recipe_id, recipe_revision) "
+            "WHERE destination='builtin' AND status='confirmed'"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX discovery_bindings_confirmed_snapshot "
+            "ON discovery_bindings(destination, snapshot_key) WHERE status='confirmed'"
+        )
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES('discovery_namespace', ?)", (namespace,)
+        )
+        cursor = connection.execute(
+            "UPDATE metadata SET value='2' WHERE key='schema_version' AND value='1'"
+        )
+        if cursor.rowcount != 1:
+            raise RecipeError("recipe bank migration could not advance schema version")
+
+    def _schema(self, connection: sqlite3.Connection) -> None:
+        metadata = self._metadata(connection)
+        if metadata is None:
+            self._create_v1_schema(connection)
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES(?,?)",
+                (("household", self.household), ("schema_version", "1")),
+            )
+            metadata = {"household": self.household, "schema_version": "1"}
+        if metadata.get("household") not in {None, self.household}:
+            raise RecipeError("recipe bank belongs to a different household")
+        version = metadata.get("schema_version")
+        if version is None:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
+            )
+            version = "1"
+        if version not in {"1", "2"}:
+            raise RecipeError("recipe bank schema is newer than this meal planner")
         row = connection.execute("SELECT value FROM metadata WHERE key='household'").fetchone()
         if row is None:
-            connection.execute("INSERT INTO metadata(key, value) VALUES('household', ?)", (self.household,))
-        elif row[0] != self.household:
-            raise RecipeError("recipe bank belongs to a different household")
-        connection.execute("INSERT OR IGNORE INTO metadata(key, value) VALUES('schema_version', '1')")
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES('household', ?)", (self.household,)
+            )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(recipes)")}
+        if "created_via" not in columns:
+            connection.execute(
+                "ALTER TABLE recipes ADD COLUMN created_via TEXT NOT NULL DEFAULT 'hermes'"
+            )
+        if version == "1":
+            self._migrate_v1_to_v2(connection)
+        namespace = connection.execute(
+            "SELECT value FROM metadata WHERE key='discovery_namespace'"
+        ).fetchone()
+        if namespace is None or re.fullmatch(r"[A-Za-z0-9_-]{16}", namespace[0]) is None:
+            raise RecipeError("recipe bank discovery namespace is invalid")
+
+    @staticmethod
+    def _v1_digest(connection: sqlite3.Connection) -> str:
+        digest = hashlib.sha256()
+        for table, order in (
+            ("metadata", "key"),
+            ("recipes", "id"),
+            ("revisions", "recipe_id, revision"),
+            ("idempotency", "key"),
+        ):
+            digest.update(table.encode())
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
+                digest.update(_canonical(list(row)).encode())
+        return digest.hexdigest()
+
+    def _validate_v1_backup(
+        self, backup: Path, current: sqlite3.Connection
+    ) -> None:
+        if not backup.is_file():
+            raise RecipeError("existing recipe v1 backup is invalid")
+        try:
+            source = sqlite3.connect(
+                f"{backup.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            try:
+                if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise RecipeError("existing recipe v1 backup is invalid")
+                metadata = dict(source.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('household', 'schema_version')"
+                ).fetchall())
+                if (
+                    metadata.get("household") != self.household
+                    or metadata.get("schema_version") != "1"
+                ):
+                    raise RecipeError("existing recipe v1 backup is invalid")
+                source.execute("SELECT 1 FROM recipes LIMIT 1").fetchone()
+                source.execute("SELECT 1 FROM revisions LIMIT 1").fetchone()
+                source.execute("SELECT 1 FROM idempotency LIMIT 1").fetchone()
+                if self._v1_digest(source) != self._v1_digest(current):
+                    raise RecipeError("existing recipe v1 backup is stale")
+            finally:
+                source.close()
+        except sqlite3.Error as exc:
+            raise RecipeError("existing recipe v1 backup is invalid") from exc
+        if backup.stat().st_mode & 0o777 != 0o600:
+            raise RecipeError("existing recipe v1 backup is not private")
+
+    def _backup_v1(self, connection: sqlite3.Connection) -> None:
+        backup = self.path.with_name("recipes-v1.backup.sqlite3")
+        if backup.exists():
+            self._validate_v1_backup(backup, connection)
+            return
+        created = False
+        try:
+            descriptor = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(descriptor)
+            created = True
+            source = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            destination = sqlite3.connect(str(backup), timeout=2.0)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+            os.chmod(backup, 0o600)
+            self._validate_v1_backup(backup, connection)
+        except Exception:
+            if created and backup.exists():
+                backup.unlink()
+            raise
 
     def _connect(self, target: str | None = None) -> sqlite3.Connection:
         if target is None:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            existed = self.path.exists()
             connection = sqlite3.connect(str(self.path), timeout=2.0)
             os.chmod(self.path, 0o600)
         else:
@@ -524,10 +656,32 @@ class RecipeStore:
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout=2000")
+            connection.execute("BEGIN IMMEDIATE")
+            metadata = self._metadata(connection)
+            if metadata is not None:
+                if metadata.get("household") not in {None, self.household}:
+                    raise RecipeError("recipe bank belongs to a different household")
+                if metadata.get("schema_version") not in {None, "1", "2"}:
+                    raise RecipeError("recipe bank schema is newer than this meal planner")
+            recipes_exist = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recipes'"
+            ).fetchone()
+            nonempty_v1 = (
+                target is None
+                and existed
+                and metadata is not None
+                and metadata.get("schema_version") in {None, "1"}
+                and recipes_exist is not None
+                and connection.execute("SELECT 1 FROM recipes LIMIT 1").fetchone() is not None
+            )
+            if nonempty_v1:
+                self._backup_v1(connection)
             self._schema(connection)
+            self._cleanup_discoveries(connection)
             connection.commit()
             return connection
         except Exception:
+            connection.rollback()
             connection.close()
             raise
 
@@ -590,6 +744,336 @@ class RecipeStore:
                 "INSERT INTO idempotency(key, operation, request_hash, response_json, created_at) VALUES(?,?,?,?,?)",
                 (key, operation, request_hash, _canonical(response), _now()),
             )
+
+    @staticmethod
+    def _snapshot_parts(recipe: Mapping[str, Any]) -> tuple[dict[str, Any], str, str, str]:
+        document = normalize_recipe(recipe)
+        source_identity = source_key(document)
+        if not source_identity:
+            raise RecipeError("discovered recipes require an exact source identity")
+        stable_document = deepcopy(document)
+        snapshot = stable_document.get("external_snapshot")
+        if isinstance(snapshot, dict):
+            snapshot.pop("fetched_at", None)
+        content_hash = _hash({
+            key: value for key, value in stable_document.items()
+            if key not in {"source", "rights", "external_snapshot"}
+        })
+        attribution_digest = _hash({
+            "source": stable_document.get("source"),
+            "rights": stable_document.get("rights"),
+            "external_snapshot": stable_document.get("external_snapshot"),
+        })
+        snapshot_key = _hash({
+            "source_identity": source_identity,
+            "content_hash": content_hash,
+            "attribution_digest": attribution_digest,
+        })
+        return document, snapshot_key, content_hash, attribution_digest
+
+    @staticmethod
+    def _expiry(current: datetime | None = None) -> str:
+        return ((current or datetime.now(timezone.utc)) + timedelta(days=DISCOVERY_TTL_DAYS)).isoformat()
+
+    @staticmethod
+    def _destination(value: Any) -> str:
+        destination = _bounded_text(value, "discovery destination", required=True, maximum=63)
+        if DISCOVERY_DESTINATION_PATTERN.fullmatch(destination or "") is None:
+            raise RecipeError("discovery destination is invalid")
+        return destination
+
+    def _discovery_ref(self, connection: sqlite3.Connection, value: Any) -> str:
+        ref = _bounded_text(value, "discovery_ref", required=True, maximum=200)
+        match = re.fullmatch(
+            r"discovery:v1:([A-Za-z0-9_-]{16}):([A-Za-z0-9_-]{16,64})", ref or ""
+        )
+        namespace = connection.execute(
+            "SELECT value FROM metadata WHERE key='discovery_namespace'"
+        ).fetchone()
+        if match is None or namespace is None or match.group(1) != namespace[0]:
+            raise RecipeError("discovery reference was not found")
+        return ref
+
+    def _resolved_snapshot(self, connection: sqlite3.Connection, ref: str) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT * FROM discovery_snapshots WHERE discovery_ref=?", (ref,)
+        ).fetchone()
+        active_pin = connection.execute(
+            "SELECT 1 FROM discovery_bindings WHERE discovery_ref=? AND status IN ('pending','uncertain') LIMIT 1",
+            (ref,),
+        ).fetchone()
+        if row is None or (row["expires_at"] <= _now() and active_pin is None):
+            raise RecipeError("discovery reference was not found")
+        recipe = _stored_recipe_document(row["document"])
+        _, snapshot_key, content_hash, attribution_digest = self._snapshot_parts(recipe)
+        if (
+            snapshot_key != row["snapshot_key"]
+            or content_hash != row["content_hash"]
+            or attribution_digest != row["attribution_digest"]
+        ):
+            raise RecipeError("recipe bank is unavailable")
+        return {
+            "recipe": recipe,
+            "discovery_ref": row["discovery_ref"],
+            "content_hash": row["content_hash"],
+            "attribution_digest": row["attribution_digest"],
+            "expires_at": row["expires_at"],
+        }
+
+    def _cleanup_discoveries(self, connection: sqlite3.Connection) -> None:
+        current = _now()
+        failed_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=FAILED_DISCOVERY_BINDING_TTL_DAYS)
+        ).isoformat()
+        connection.execute(
+            "DELETE FROM discovery_bindings WHERE status='failed' AND updated_at <= ?",
+            (failed_cutoff,),
+        )
+        failed = connection.execute(
+            "SELECT destination, discovery_ref FROM discovery_bindings "
+            "WHERE status='failed' ORDER BY updated_at, destination, discovery_ref"
+        ).fetchall()
+        while len(failed) > MAX_FAILED_DISCOVERY_BINDINGS:
+            row = failed.pop(0)
+            connection.execute(
+                "DELETE FROM discovery_bindings WHERE destination=? AND discovery_ref=?",
+                (row["destination"], row["discovery_ref"]),
+            )
+        connection.execute("""
+            DELETE FROM discovery_snapshots
+            WHERE expires_at <= ? AND NOT EXISTS (
+                SELECT 1 FROM discovery_bindings
+                WHERE discovery_bindings.discovery_ref = discovery_snapshots.discovery_ref
+                  AND discovery_bindings.status IN ('pending', 'uncertain')
+            )
+        """, (current,))
+        rows = connection.execute("""
+            SELECT discovery_ref, document_bytes FROM discovery_snapshots
+            WHERE NOT EXISTS (
+                SELECT 1 FROM discovery_bindings
+                WHERE discovery_bindings.discovery_ref = discovery_snapshots.discovery_ref
+                  AND discovery_bindings.status IN ('pending', 'uncertain')
+            )
+            ORDER BY expires_at, discovery_ref
+        """).fetchall()
+        total = sum(row["document_bytes"] for row in rows)
+        while len(rows) > MAX_UNBOUND_DISCOVERY_SNAPSHOTS or total > MAX_UNBOUND_DISCOVERY_BYTES:
+            row = rows.pop(0)
+            connection.execute("DELETE FROM discovery_snapshots WHERE discovery_ref=?", (row["discovery_ref"],))
+            total -= row["document_bytes"]
+
+    def cleanup_discoveries(self) -> None:
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._cleanup_discoveries(connection)
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def persist_discovery(self, value: Any) -> dict[str, Any]:
+        document, snapshot_key, content_hash, attribution_digest = self._snapshot_parts(value)
+        serialized = _canonical(document)
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._cleanup_discoveries(connection)
+                row = connection.execute(
+                    "SELECT discovery_ref FROM discovery_snapshots WHERE snapshot_key=?", (snapshot_key,)
+                ).fetchone()
+                current = datetime.now(timezone.utc)
+                if row is None:
+                    binding = connection.execute(
+                        "SELECT discovery_ref, recipe_id, recipe_revision FROM discovery_bindings "
+                        "WHERE destination='builtin' AND status='confirmed' AND snapshot_key=?",
+                        (snapshot_key,),
+                    ).fetchone()
+                    if binding is None:
+                        namespace = connection.execute(
+                            "SELECT value FROM metadata WHERE key='discovery_namespace'"
+                        ).fetchone()[0]
+                        ref = f"discovery:v1:{namespace}:{secrets.token_urlsafe(18)}"
+                    else:
+                        ref = binding["discovery_ref"]
+                        revision = connection.execute(
+                            "SELECT document FROM revisions WHERE recipe_id=? AND revision=?",
+                            (binding["recipe_id"], binding["recipe_revision"]),
+                        ).fetchone()
+                        if revision is None:
+                            raise RecipeError("recipe bank is unavailable")
+                        document, bound_key, content_hash, attribution_digest = (
+                            self._snapshot_parts(_stored_recipe_document(revision["document"]))
+                        )
+                        if bound_key != snapshot_key:
+                            raise RecipeError("recipe bank is unavailable")
+                        serialized = _canonical(document)
+                    created = current.isoformat()
+                    connection.execute("""
+                        INSERT INTO discovery_snapshots(
+                            discovery_ref, snapshot_key, document, source_identity, content_hash, attribution_digest,
+                            created_at, renewed_at, expires_at, document_bytes
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    """, (ref, snapshot_key, serialized, source_key(document), content_hash, attribution_digest,
+                          created, created, self._expiry(current), len(serialized.encode("utf-8"))))
+                else:
+                    ref = row["discovery_ref"]
+                    connection.execute(
+                        "UPDATE discovery_snapshots SET renewed_at=?, expires_at=? WHERE discovery_ref=?",
+                        (current.isoformat(), self._expiry(current), ref),
+                    )
+                self._cleanup_discoveries(connection)
+                return self._resolved_snapshot(connection, ref)
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def resolve_discovery(
+        self,
+        value: Any,
+        *,
+        destination: Any = None,
+        binding_status: Any = None,
+    ) -> dict[str, Any]:
+        if (destination is None) != (binding_status is None):
+            raise RecipeError("destination and binding_status must be supplied together")
+        resolved_destination = None if destination is None else self._destination(destination)
+        if resolved_destination == "builtin":
+            raise RecipeError("built-in discovery bindings are created only by save")
+        if binding_status is not None and (
+            not isinstance(binding_status, str)
+            or binding_status not in ACTIVE_DISCOVERY_BINDING_STATUSES
+        ):
+            raise RecipeError("discovery binding status must be pending or uncertain")
+        try:
+            with self._connection() as connection:
+                connection.execute(
+                    "BEGIN IMMEDIATE" if resolved_destination is not None else "BEGIN"
+                )
+                ref = self._discovery_ref(connection, value)
+                resolved = self._resolved_snapshot(connection, ref)
+                if resolved_destination is not None:
+                    existing = connection.execute(
+                        "SELECT status FROM discovery_bindings WHERE destination=? AND discovery_ref=?",
+                        (resolved_destination, ref),
+                    ).fetchone()
+                    if existing is not None and existing["status"] not in ACTIVE_DISCOVERY_BINDING_STATUSES:
+                        raise RecipeError("discovery binding is already terminal")
+                    timestamp = _now()
+                    connection.execute("""
+                        INSERT INTO discovery_bindings(
+                            destination, discovery_ref, snapshot_key, status,
+                            recipe_id, recipe_revision,
+                            created_at, updated_at
+                        ) VALUES(?,?,?, ?,NULL,NULL,?,?)
+                        ON CONFLICT(destination, discovery_ref) DO UPDATE SET
+                            snapshot_key=excluded.snapshot_key,
+                            status=excluded.status, updated_at=excluded.updated_at
+                    """, (
+                        resolved_destination, ref,
+                        connection.execute(
+                            "SELECT snapshot_key FROM discovery_snapshots WHERE discovery_ref=?", (ref,)
+                        ).fetchone()[0],
+                        binding_status, timestamp, timestamp,
+                    ))
+                    resolved["binding"] = {
+                        "destination": resolved_destination,
+                        "status": binding_status,
+                    }
+                return resolved
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def _bound_builtin_recipe(
+        self, connection: sqlite3.Connection, binding: sqlite3.Row
+    ) -> dict[str, Any]:
+        current = connection.execute(
+            "SELECT * FROM recipes WHERE id=?", (binding["recipe_id"],)
+        ).fetchone()
+        revision = connection.execute(
+            "SELECT status, document, created_at FROM revisions WHERE recipe_id=? AND revision=?",
+            (binding["recipe_id"], binding["recipe_revision"]),
+        ).fetchone()
+        if current is None or revision is None:
+            raise RecipeError("recipe bank is unavailable")
+        result = _stored_recipe_document(revision["document"])
+        result.update({
+            "id": current["id"],
+            "revision": binding["recipe_revision"],
+            "status": revision["status"],
+            "created_at": current["created_at"],
+            "updated_at": revision["created_at"],
+            "created_via": current["created_via"],
+            "content_fingerprint": content_fingerprint(result),
+            "recipe_key": f"bank:{current['id']}",
+            "created": False,
+            "idempotent": True,
+        })
+        return result
+
+    def save_discovery(self, value: Any, *, status: str = "active", idempotency_key: Any = None) -> dict[str, Any]:
+        if not isinstance(status, str) or status not in {"active", "draft"}:
+            raise RecipeError("recipe status must be active or draft")
+        ref = _bounded_text(value, "discovery_ref", required=True, maximum=200)
+        key = self._idempotency_key(idempotency_key)
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                ref = self._discovery_ref(connection, ref)
+                request_hash = _hash({"discovery_ref": ref, "status": status})
+                if existing := self._idem(connection, key, "save_discovery", request_hash):
+                    return existing
+                bound = connection.execute(
+                    "SELECT * FROM discovery_bindings WHERE destination='builtin' AND discovery_ref=?",
+                    (ref,),
+                ).fetchone()
+                if bound is not None:
+                    if bound["status"] != "confirmed":
+                        raise RecipeError("built-in discovery binding is invalid")
+                    result = self._bound_builtin_recipe(connection, bound)
+                    self._store_idem(connection, key, "save_discovery", request_hash, result)
+                    return result
+                resolved = self._resolved_snapshot(connection, ref)
+                recipe = resolved["recipe"]
+                source_identity = source_key(recipe)
+                existing = connection.execute("SELECT * FROM recipes WHERE source_key=?", (source_identity,)).fetchone() if source_identity else None
+                if existing is not None:
+                    _, _, existing_content_hash, existing_attribution_digest = self._snapshot_parts(
+                        _stored_recipe_document(existing["document"])
+                    )
+                    if (
+                        existing_content_hash != resolved["content_hash"]
+                        or existing_attribution_digest != resolved["attribution_digest"]
+                    ):
+                        result = self._record(existing, created=False)
+                        result["conflict"] = {
+                            "kind": "source_changed",
+                            "discovery_ref": ref,
+                            "existing_recipe_ref": {
+                                "id": existing["id"],
+                                "revision": existing["revision"],
+                            },
+                            "requires": "explicit update with expected_revision",
+                        }
+                        self._store_idem(connection, key, "save_discovery", request_hash, result)
+                        return result
+                result = self._record(existing, created=False) if existing is not None else self._save(connection, recipe, status, None, "discovery")
+                timestamp = _now()
+                connection.execute("""
+                    INSERT INTO discovery_bindings(
+                        destination, discovery_ref, snapshot_key, status,
+                        recipe_id, recipe_revision,
+                        created_at, updated_at
+                    ) VALUES('builtin',?,?,'confirmed',?,?,?,?)
+                """, (
+                    ref,
+                    connection.execute(
+                        "SELECT snapshot_key FROM discovery_snapshots WHERE discovery_ref=?", (ref,)
+                    ).fetchone()[0],
+                    result["id"], result["revision"], timestamp, timestamp,
+                ))
+                self._store_idem(connection, key, "save_discovery", request_hash, result)
+                self._cleanup_discoveries(connection)
+                return result
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
 
     def _save(self, connection: sqlite3.Connection, recipe: Mapping[str, Any], status: str, key: str | None, created_via: str) -> dict[str, Any]:
         request_hash = _hash({"recipe": recipe, "status": status})

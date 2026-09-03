@@ -22,6 +22,7 @@ sys.path.insert(0, str(CORE))
 
 import core as meal_core  # noqa: E402
 from core import DEFAULT_PROFILE, HouseholdError, StateStore, cart_summary  # noqa: E402
+import recipes as recipe_module  # noqa: E402
 from recipes import RecipeError, RecipeStore, normalize_recipe, scale_recipe  # noqa: E402
 import recipe_sources as source_module  # noqa: E402
 from recipe_sources import RecipeSourceError, TheMealDBSource, WikibooksSource  # noqa: E402
@@ -81,6 +82,51 @@ def menu(week: str, recipe: dict | None = None) -> dict:
     return {"week": week, "dishes": [deepcopy(recipe or full_recipe())], "salads": []}
 
 
+def create_v1_bank(path: Path, recipe: dict) -> None:
+    document = normalize_recipe(recipe)
+    serialized = json.dumps(
+        document, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    timestamp = "2026-09-01T12:00:00+00:00"
+    with closing(sqlite3.connect(path)) as connection:
+        connection.executescript("""
+            CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE recipes (
+                id TEXT PRIMARY KEY, revision INTEGER NOT NULL, status TEXT NOT NULL,
+                name TEXT NOT NULL, search_text TEXT NOT NULL, source_key TEXT,
+                content_fingerprint TEXT NOT NULL, content_hash TEXT NOT NULL,
+                document TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE revisions (
+                recipe_id TEXT NOT NULL, revision INTEGER NOT NULL, status TEXT NOT NULL,
+                document TEXT NOT NULL, created_at TEXT NOT NULL,
+                PRIMARY KEY (recipe_id, revision));
+            CREATE TABLE idempotency (
+                key TEXT PRIMARY KEY, operation TEXT NOT NULL, request_hash TEXT NOT NULL,
+                response_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        """)
+        connection.executemany(
+            "INSERT INTO metadata VALUES(?,?)",
+            (("household", "Hus A"), ("schema_version", "1")),
+        )
+        connection.execute(
+            "INSERT INTO recipes VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "rec_v1", 1, "active", document["name"], document["name"].casefold(),
+                "familien:migrated-v1", "fingerprint", "content-hash", serialized,
+                timestamp, timestamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO revisions VALUES(?,?,?,?,?)",
+            ("rec_v1", 1, "active", serialized, timestamp),
+        )
+        connection.execute(
+            "INSERT INTO idempotency VALUES(?,?,?,?,?)",
+            ("v1-key", "save", "request-hash", '{"id":"rec_v1"}', timestamp),
+        )
+        connection.commit()
+
+
 class RecipeStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -95,6 +141,9 @@ class RecipeStoreTests(unittest.TestCase):
         repeated = self.store.save(full_recipe(external_id="fisk-1"), idempotency_key="save-1")
         self.assertEqual(saved["id"], repeated["id"])
         self.assertTrue(repeated["idempotent"])
+        existing = self.store.save(external_recipe("themealdb", "Existing soup", "existing"))
+        existing_ref = self.store.persist_discovery(external_recipe("themealdb", "Existing soup", "existing"))["discovery_ref"]
+        self.assertEqual(self.store.save_discovery(existing_ref)["id"], existing["id"])
         with closing(sqlite3.connect(self.path)) as connection:
             self.assertIn("recipes_fingerprint", {row[1] for row in connection.execute("PRAGMA index_list(recipes)")})
         self.assertEqual(self.store.search("fisk")[0]["recipe_key"], f"bank:{saved['id']}")
@@ -127,6 +176,445 @@ class RecipeStoreTests(unittest.TestCase):
         self.assertEqual(duplicate["duplicate"], "source_key")
         with self.assertRaisesRegex(RecipeError, "different recipe revision"):
             self.store.save(full_recipe("Endret", external_id="same"))
+
+    def test_discovery_reference_is_store_bound_frozen_and_replays_bound_revision(self):
+        original = external_recipe("themealdb", "Frozen soup", "frozen")
+        persisted = self.store.persist_discovery(original)
+        ref = persisted["discovery_ref"]
+        rediscovered = deepcopy(original)
+        rediscovered["external_snapshot"]["fetched_at"] = "2026-09-03T12:00:00+00:00"
+        repeated_discovery = self.store.persist_discovery(rediscovered)
+        self.assertEqual(repeated_discovery["discovery_ref"], ref)
+        self.assertEqual(repeated_discovery["recipe"], original)
+        self.assertGreaterEqual(repeated_discovery["expires_at"], persisted["expires_at"])
+        self.assertEqual(self.store.resolve_discovery(ref)["recipe"], original)
+
+        saved = self.store.save_discovery(ref)
+        changed = deepcopy(original)
+        changed["name"] = "Explicit later update"
+        self.store.update(saved["id"], saved["revision"], changed)
+        replayed = RecipeStore(self.path, "Hus A").save_discovery(ref)
+        self.assertEqual((replayed["id"], replayed["revision"]), (saved["id"], saved["revision"]))
+        self.assertEqual(replayed["name"], "Frozen soup")
+        self.assertTrue(replayed["idempotent"])
+
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            RecipeStore(Path(self.temp.name) / "other.sqlite3", "Hus B").resolve_discovery(ref)
+
+    def test_discovery_identity_changes_and_source_conflicts_are_structured(self):
+        original = external_recipe("themealdb", "Identity soup", "identity")
+        original_ref = self.store.persist_discovery(original)["discovery_ref"]
+        saved = self.store.save_discovery(original_ref)
+        variants = []
+        for path, value in (
+            (("ingredients", 0, "item"), "parsnip"),
+            (("external_snapshot", "source_revision_id"), "revision-2"),
+            (("source", "relationship"), "adapted"),
+            (("rights", "credit"), "Changed credit"),
+            (("rights", "license"), "Changed license"),
+        ):
+            changed = deepcopy(original)
+            target = changed
+            for part in path[:-1]:
+                target = target[part]
+            target[path[-1]] = value
+            variants.append(changed)
+
+        refs = [self.store.persist_discovery(value)["discovery_ref"] for value in variants]
+        self.assertEqual(len(set(refs + [original_ref])), len(refs) + 1)
+        for ref in refs:
+            conflict = self.store.save_discovery(ref)
+            self.assertEqual(conflict["id"], saved["id"])
+            self.assertEqual(conflict["revision"], saved["revision"])
+            self.assertEqual(conflict["conflict"]["kind"], "source_changed")
+            self.assertIn("expected_revision", conflict["conflict"]["requires"])
+        self.assertEqual(self.store.get(saved["id"])["name"], "Identity soup")
+
+    def test_discovery_rejects_missing_identity_and_invalid_expired_or_unknown_refs(self):
+        with self.assertRaisesRegex(RecipeError, "source identity"):
+            self.store.persist_discovery(full_recipe())
+        original = external_recipe("themealdb", "No fallback soup", "no-fallback")
+        existing = self.store.save(original)
+        ref = self.store.persist_discovery(original)["discovery_ref"]
+        namespace = ref.split(":")[2]
+        for invalid in ("not-a-ref", f"discovery:v1:{namespace}:{'z' * 24}"):
+            with self.assertRaisesRegex(RecipeError, "not found"):
+                self.store.resolve_discovery(invalid)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "UPDATE discovery_snapshots SET expires_at='2000-01-01T00:00:00+00:00' WHERE discovery_ref=?",
+                (ref,),
+            )
+            connection.commit()
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            self.store.save_discovery(ref)
+        self.assertEqual(self.store.search("No fallback")[0]["id"], existing["id"])
+
+    def test_concurrent_fresh_discovery_and_save_have_one_ref_and_recipe(self):
+        self.path.touch()
+        recipe = external_recipe("themealdb", "Concurrent soup", "concurrent-ref")
+        barrier = threading.Barrier(12)
+        refs = []
+        errors = []
+
+        def discover() -> None:
+            try:
+                barrier.wait()
+                refs.append(self.store.persist_discovery(recipe)["discovery_ref"])
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=discover) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(refs), 12)
+        self.assertEqual(len(set(refs)), 1)
+
+        barrier = threading.Barrier(12)
+        saves = []
+
+        def save() -> None:
+            try:
+                barrier.wait()
+                saves.append(self.store.save_discovery(refs[0]))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=save) for _ in range(12)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual({(item["id"], item["revision"]) for item in saves}, {(saves[0]["id"], 1)})
+        self.assertEqual(sum(item.get("created") is True for item in saves), 1)
+        self.assertEqual(sum(item.get("idempotent") is True for item in saves), 11)
+
+    def test_discovery_cleanup_enforces_count_bytes_and_active_pins(self):
+        with mock.patch.object(recipe_module, "MAX_UNBOUND_DISCOVERY_SNAPSHOTS", 2):
+            refs = [
+                self.store.persist_discovery(external_recipe("themealdb", f"Count {index}", f"count-{index}"))["discovery_ref"]
+                for index in range(2)
+            ]
+            cleanup_base = datetime.now(timezone.utc)
+            with closing(sqlite3.connect(self.path)) as connection:
+                connection.execute(
+                    "UPDATE discovery_snapshots SET expires_at=? WHERE discovery_ref=?",
+                    ((cleanup_base + timedelta(days=1)).isoformat(), refs[0]),
+                )
+                connection.execute(
+                    "UPDATE discovery_snapshots SET expires_at=? WHERE discovery_ref=?",
+                    ((cleanup_base + timedelta(days=2)).isoformat(), refs[1]),
+                )
+                connection.commit()
+            newest = self.store.persist_discovery(
+                external_recipe("themealdb", "Count 2", "count-2")
+            )["discovery_ref"]
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            self.store.resolve_discovery(refs[0])
+        self.store.resolve_discovery(refs[1])
+        self.store.resolve_discovery(newest)
+
+        byte_path = Path(self.temp.name) / "byte-limit.sqlite3"
+        byte_store = RecipeStore(byte_path, "Hus A")
+        first = byte_store.persist_discovery(
+            external_recipe("themealdb", "A", "byte-a")
+        )["discovery_ref"]
+        with closing(sqlite3.connect(byte_path)) as connection:
+            byte_limit = connection.execute(
+                "SELECT document_bytes FROM discovery_snapshots WHERE discovery_ref=?", (first,)
+            ).fetchone()[0]
+        with mock.patch.object(recipe_module, "MAX_UNBOUND_DISCOVERY_BYTES", byte_limit):
+            second = byte_store.persist_discovery(
+                external_recipe("themealdb", "B", "byte-b")
+            )["discovery_ref"]
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            byte_store.resolve_discovery(first)
+        byte_store.resolve_discovery(second)
+
+        pin_path = Path(self.temp.name) / "pin.sqlite3"
+        pin_store = RecipeStore(pin_path, "Hus A")
+        pinned = pin_store.persist_discovery(
+            external_recipe("themealdb", "Pinned", "pinned")
+        )["discovery_ref"]
+        pin_store.resolve_discovery(
+            pinned, destination="family-mealie", binding_status="pending"
+        )
+        with closing(sqlite3.connect(pin_path)) as connection:
+            connection.execute(
+                "UPDATE discovery_snapshots SET expires_at='2000-01-01T00:00:00+00:00'"
+            )
+            connection.execute(
+                "UPDATE discovery_bindings SET status='uncertain' WHERE discovery_ref=?", (pinned,)
+            )
+            connection.commit()
+        self.assertEqual(pin_store.resolve_discovery(pinned)["recipe"]["name"], "Pinned")
+        with closing(sqlite3.connect(pin_path)) as connection:
+            connection.execute(
+                "UPDATE discovery_bindings SET status='failed' WHERE discovery_ref=?", (pinned,)
+            )
+            connection.commit()
+        pin_store.cleanup_discoveries()
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            pin_store.resolve_discovery(pinned)
+        with closing(sqlite3.connect(pin_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT status FROM discovery_bindings").fetchone()[0], "failed"
+            )
+            connection.execute(
+                "UPDATE discovery_bindings SET updated_at='2000-01-01T00:00:00+00:00'"
+            )
+            connection.commit()
+        pin_store.cleanup_discoveries()
+        with closing(sqlite3.connect(pin_path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM discovery_bindings").fetchone()[0], 0
+            )
+
+    def test_confirmed_binding_survives_snapshot_cleanup(self):
+        document = external_recipe("themealdb", "Bound", "bound")
+        ref = self.store.persist_discovery(document)["discovery_ref"]
+        saved = self.store.save_discovery(ref)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                "UPDATE discovery_snapshots SET expires_at='2000-01-01T00:00:00+00:00'"
+            )
+            connection.commit()
+        self.store.cleanup_discoveries()
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            self.store.resolve_discovery(ref)
+        repeated = self.store.save_discovery(ref)
+        self.assertEqual((repeated["id"], repeated["revision"]), (saved["id"], saved["revision"]))
+        self.assertTrue(repeated["idempotent"])
+        later_fetch = deepcopy(document)
+        later_fetch["external_snapshot"]["fetched_at"] = "2026-09-03T15:00:00+00:00"
+        rediscovered = self.store.persist_discovery(later_fetch)
+        self.assertEqual(rediscovered["discovery_ref"], ref)
+        self.assertEqual(
+            rediscovered["recipe"]["external_snapshot"]["fetched_at"],
+            document["external_snapshot"]["fetched_at"],
+        )
+        rebound = self.store.save_discovery(rediscovered["discovery_ref"])
+        self.assertEqual(
+            (rebound["id"], rebound["revision"]),
+            (saved["id"], saved["revision"]),
+        )
+        self.assertTrue(rebound["idempotent"])
+        self.assertEqual(
+            rebound["external_snapshot"]["fetched_at"],
+            rediscovered["recipe"]["external_snapshot"]["fetched_at"],
+        )
+
+    def test_cleanup_racing_with_save_cannot_remove_the_resolved_document(self):
+        resolved = threading.Event()
+        finish_save = threading.Event()
+
+        class PausingStore(RecipeStore):
+            pause = False
+
+            def _resolved_snapshot(self, connection, ref):
+                result = super()._resolved_snapshot(connection, ref)
+                if self.pause:
+                    resolved.set()
+                    self.assert_finish()
+                return result
+
+            @staticmethod
+            def assert_finish():
+                if not finish_save.wait(5):
+                    raise AssertionError("save race did not resume")
+
+        store = PausingStore(Path(self.temp.name) / "race.sqlite3", "Hus A")
+        ref = store.persist_discovery(
+            external_recipe("themealdb", "Race", "race")
+        )["discovery_ref"]
+        store.pause = True
+        outcomes = []
+
+        def save() -> None:
+            try:
+                outcomes.append(store.save_discovery(ref))
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcomes.append(exc)
+
+        saver = threading.Thread(target=save)
+        saver.start()
+        self.assertTrue(resolved.wait(5))
+        with mock.patch.object(recipe_module, "MAX_UNBOUND_DISCOVERY_SNAPSHOTS", 0):
+            cleaner = threading.Thread(target=store.cleanup_discoveries)
+            cleaner.start()
+            threading.Event().wait(0.05)
+            finish_save.set()
+            saver.join(5)
+            cleaner.join(5)
+        self.assertFalse(saver.is_alive())
+        self.assertFalse(cleaner.is_alive())
+        self.assertEqual(len(outcomes), 1)
+        self.assertIsInstance(outcomes[0], dict)
+        repeated = store.save_discovery(ref)
+        self.assertEqual(
+            (repeated["id"], repeated["revision"]),
+            (outcomes[0]["id"], outcomes[0]["revision"]),
+        )
+
+    def test_cleanup_racing_with_resolve_cannot_remove_the_active_snapshot(self):
+        resolved = threading.Event()
+        finish_resolve = threading.Event()
+
+        class PausingStore(RecipeStore):
+            pause = False
+
+            def _resolved_snapshot(self, connection, ref):
+                result = super()._resolved_snapshot(connection, ref)
+                if self.pause:
+                    resolved.set()
+                    if not finish_resolve.wait(5):
+                        raise AssertionError("resolve race did not resume")
+                return result
+
+        store = PausingStore(Path(self.temp.name) / "resolve-race.sqlite3", "Hus A")
+        ref = store.persist_discovery(
+            external_recipe("themealdb", "Resolve race", "resolve-race")
+        )["discovery_ref"]
+        store.pause = True
+        outcomes = []
+        cleaner_outcomes = []
+
+        def resolve() -> None:
+            try:
+                outcomes.append(store.resolve_discovery(ref))
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcomes.append(exc)
+
+        def cleanup() -> None:
+            try:
+                with mock.patch.object(recipe_module, "MAX_UNBOUND_DISCOVERY_SNAPSHOTS", 0):
+                    store.cleanup_discoveries()
+                cleaner_outcomes.append(None)
+            except Exception as exc:  # pragma: no cover - asserted below
+                cleaner_outcomes.append(exc)
+
+        resolver = threading.Thread(target=resolve)
+        resolver.start()
+        self.assertTrue(resolved.wait(5))
+        cleaner = threading.Thread(target=cleanup)
+        cleaner.start()
+        threading.Event().wait(0.05)
+        self.assertTrue(cleaner.is_alive())
+        self.assertEqual(cleaner_outcomes, [])
+        finish_resolve.set()
+        resolver.join(5)
+        cleaner.join(5)
+        self.assertFalse(resolver.is_alive())
+        self.assertFalse(cleaner.is_alive())
+        self.assertEqual(cleaner_outcomes, [None])
+        self.assertEqual(outcomes[0]["recipe"]["name"], "Resolve race")
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            store.resolve_discovery(ref)
+
+    def test_populated_v1_migration_backup_and_failure_are_atomic(self):
+        recipe = full_recipe("Migrated v1", external_id="migrated-v1")
+        create_v1_bank(self.path, recipe)
+        backup = self.path.with_name("recipes-v1.backup.sqlite3")
+        observed_creation_modes = []
+        real_connect = recipe_module.sqlite3.connect
+
+        def observe_backup_open(database, *args, **kwargs):
+            if str(database) == str(backup):
+                observed_creation_modes.append(backup.stat().st_mode & 0o777)
+            return real_connect(database, *args, **kwargs)
+
+        class BrokenMigrationStore(RecipeStore):
+            def _migrate_v1_to_v2(self, connection):
+                super()._migrate_v1_to_v2(connection)
+                raise RecipeError("injected migration failure")
+
+        with mock.patch.object(recipe_module.sqlite3, "connect", side_effect=observe_backup_open):
+            with self.assertRaisesRegex(RecipeError, "injected migration failure"):
+                BrokenMigrationStore(self.path, "Hus A").search("")
+        self.assertEqual(observed_creation_modes, [0o600])
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],
+                "1",
+            )
+            self.assertEqual(connection.execute("SELECT name FROM recipes").fetchone()[0], "Migrated v1")
+            self.assertNotIn(
+                "discovery_snapshots",
+                {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")},
+            )
+        with closing(sqlite3.connect(backup)) as connection:
+            self.assertEqual(connection.execute("SELECT name FROM recipes").fetchone()[0], "Migrated v1")
+            self.assertEqual(connection.execute("SELECT key FROM idempotency").fetchone()[0], "v1-key")
+        before = backup.read_bytes()
+        self.assertEqual(RecipeStore(self.path, "Hus A").search("")[0]["id"], "rec_v1")
+        self.assertEqual(backup.read_bytes(), before)
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],
+                "2",
+            )
+
+    def test_v1_backup_waits_for_and_includes_a_concurrent_writer(self):
+        path = Path(self.temp.name) / "writer.sqlite3"
+        original = full_recipe("Before writer", external_id="migrated-v1")
+        create_v1_bank(path, original)
+        changed = normalize_recipe(
+            full_recipe("Committed before migration", external_id="migrated-v1")
+        )
+        serialized = json.dumps(
+            changed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        writer = sqlite3.connect(path, timeout=2.0)
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "UPDATE recipes SET name=?, search_text=?, document=? WHERE id='rec_v1'",
+            (changed["name"], changed["name"].casefold(), serialized),
+        )
+        writer.execute(
+            "UPDATE revisions SET document=? WHERE recipe_id='rec_v1' AND revision=1",
+            (serialized,),
+        )
+        outcomes = []
+
+        def migrate() -> None:
+            try:
+                outcomes.append(RecipeStore(path, "Hus A").search("")[0]["name"])
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcomes.append(exc)
+
+        thread = threading.Thread(target=migrate)
+        thread.start()
+        threading.Event().wait(0.05)
+        writer.commit()
+        writer.close()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcomes, ["Committed before migration"])
+        with closing(sqlite3.connect(path.with_name("recipes-v1.backup.sqlite3"))) as backup:
+            self.assertEqual(
+                json.loads(backup.execute("SELECT document FROM recipes").fetchone()[0])["name"],
+                "Committed before migration",
+            )
+
+    def test_reference_docs_cover_selection_confirmation_and_three_ref_types(self):
+        readme = (CORE / "README.md").read_text(encoding="utf-8")
+        skill = (CORE / "skill" / "SKILL.md").read_text(encoding="utf-8")
+        tool = (CORE / "mcp_server.py").read_text(encoding="utf-8")
+        for text in (readme, skill, tool):
+            self.assertIn("discovery_ref", text)
+            self.assertIn("recipe_ref", text)
+            self.assertIn("library_recipe_ref", text)
+        self.assertIn("selection is", readme)
+        self.assertIn("ambiguous", readme)
+        self.assertIn("confirm the returned recipe name, source", skill)
+        self.assertIn("library_id=builtin", tool)
 
     def test_content_duplicate_warns_without_merging(self):
         first = self.store.save(full_recipe())
@@ -207,6 +695,41 @@ class RecipeStoreTests(unittest.TestCase):
         normalized_whitespace = normalize_recipe(whitespace_urls)
         self.assertIsNone(normalized_whitespace["source"]["url"])
         self.assertIsNone(normalized_whitespace["rights"]["license_url"])
+
+    def test_discovery_save_preserves_link_only_and_external_attribution(self):
+        for publisher, host in (("MENY", "meny.no"), ("Oda", "oda.com")):
+            candidate = {
+                "name": f"{publisher}-lenke",
+                "source": {
+                    "kind": "provider", "publisher": publisher,
+                    "url": f"https://{host}/recipes/exact?session=discarded",
+                    "external_id": f"{publisher.casefold()}-exact",
+                    "relationship": "original",
+                },
+                "rights": {
+                    "storage": "link_only", "license": None,
+                    "license_url": None, "credit": f"{publisher} original",
+                },
+                "notes": "Open the source link.",
+            }
+            normalized = normalize_recipe(candidate)
+            ref = self.store.persist_discovery(candidate)["discovery_ref"]
+            saved = self.store.save_discovery(ref)
+            self.assertEqual(
+                {key: saved[key] for key in normalized},
+                normalized,
+            )
+            self.assertEqual(saved["ingredients"], [])
+            self.assertEqual(saved["source"]["url"], f"https://{host}/recipes/exact")
+
+        for source in ("themealdb", "wikibooks"):
+            candidate = external_recipe(source, f"{source} exact", f"{source}-exact")
+            ref = self.store.persist_discovery(candidate)["discovery_ref"]
+            saved = self.store.save_discovery(ref)
+            self.assertEqual(
+                {key: saved[key] for key in candidate},
+                candidate,
+            )
 
     def test_bounds_nonfinite_and_server_fields(self):
         value = full_recipe()
@@ -839,6 +1362,14 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertEqual([item["discovery_source"] for item in discovered["recipes"]], [
             "internal", "oda", "meny", "themealdb", "wikibooks",
         ])
+        self.assertNotIn("discovery_ref", discovered["recipes"][0])
+        self.assertEqual(discovered["recipes"][0]["already_saved"], "builtin")
+        self.assertTrue(all("discovery_ref" in item for item in discovered["recipes"][1:]))
+        with closing(sqlite3.connect(app.recipes.path)) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM discovery_snapshots").fetchone()[0],
+                4,
+            )
         self.assertEqual(discovered["balanced_limit_per_source"], 1)
         self.assertTrue(all(source["count"] == 1 for source in discovered["sources"]))
 
@@ -909,6 +1440,72 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertEqual(status["themealdb"], "unavailable")
         self.assertIn("checkout now", result["recipes"][1]["steps"][0])
         self.assertEqual(self.browser.checkout_clicks, 0)
+
+    def test_save_discovery_ref_uses_only_the_frozen_local_document(self):
+        class Source:
+            def __init__(self):
+                self.calls = 0
+
+            def search(self, _query, _limit):
+                self.calls += 1
+                recipe = external_recipe(
+                    "themealdb", "Frozen after discovery", "frozen-save"
+                )
+                recipe["external_snapshot"]["fetched_at"] = (
+                    f"2026-09-0{self.calls}T12:00:00+00:00"
+                )
+                return [recipe]
+
+        source = Source()
+        self.app.external_recipe_sources = {"themealdb": source}
+        with self.store.locked() as state:
+            state["setup"]["status"] = "complete"
+            state["profile"]["recipes"]["sources"] = {
+                "internal": False, "oda": False, "meny": False, "themealdb": True, "wikibooks": False,
+            }
+        discovered = self.app.handle({
+            "operation": "recipes", "action": "discover", "query": "frozen", "limit": 1,
+        })["recipes"][0]
+        self.assertEqual(source.calls, 1)
+        rediscovered = self.app.handle({
+            "operation": "recipes", "action": "discover", "query": "frozen", "limit": 1,
+        })["recipes"][0]
+        self.assertEqual(rediscovered["discovery_ref"], discovered["discovery_ref"])
+        self.assertEqual(
+            rediscovered["external_snapshot"]["fetched_at"],
+            discovered["external_snapshot"]["fetched_at"],
+        )
+
+        class MissingSource:
+            def search(self, _query, _limit):
+                raise AssertionError("save attempted to refetch the source")
+
+        self.app.external_recipe_sources["themealdb"] = MissingSource()
+        response = self.app.handle({
+            "operation": "recipes", "action": "save",
+            "discovery_ref": discovered["discovery_ref"],
+        })
+        self.assertTrue(response["saved"])
+        self.assertEqual(response["library_id"], "builtin")
+        self.assertEqual(response["recipe"]["name"], "Frozen after discovery")
+        self.assertEqual(response["recipe"]["source"], discovered["source"])
+        self.assertEqual(response["recipe"]["rights"], discovered["rights"])
+        self.assertEqual(source.calls, 2)
+        with self.assertRaisesRegex(HouseholdError, "exactly one"):
+            self.app.handle({"operation": "recipes", "action": "save", "recipe": full_recipe(), "discovery_ref": discovered["discovery_ref"]})
+        with self.assertRaisesRegex(HouseholdError, "exactly one"):
+            self.app.handle({"operation": "recipes", "action": "save"})
+
+        changed = external_recipe("themealdb", "Changed source", "frozen-save")
+        changed_ref = self.app.recipes.persist_discovery(changed)["discovery_ref"]
+        conflict = self.app.handle({
+            "operation": "recipes", "action": "save", "discovery_ref": changed_ref,
+        })
+        self.assertFalse(conflict["saved"])
+        self.assertEqual(conflict["library_id"], "builtin")
+        self.assertEqual(conflict["recipe"]["id"], response["recipe"]["id"])
+        self.assertEqual(conflict["conflict"]["kind"], "source_changed")
+
 
     def test_external_snapshot_survives_restart_and_flows_to_cart_for_both_providers(self):
         class StaticSource:

@@ -369,6 +369,35 @@ round-robin balanced and conservatively deduplicated by exact source identity
 or exact normalized name-and-ingredient content. No arbitrary recipe URL is
 fetched.
 
+Every external discovery result carries an opaque, store-bound `discovery_ref`
+for its exact normalized household-local snapshot. Tell Hermes to “save this
+recipe” while one displayed result is clearly selected. It passes that exact ref
+to `recipes save`; the built-in library stores the frozen document without
+fetching the source or guessing from a title, URL, ordinal, or latest result. The
+result includes `library_id="builtin"`, so the user-facing confirmation can name
+the saved recipe, its source, and the destination library. If the selection is
+ambiguous, Hermes asks which displayed recipe.
+
+A `discovery_ref` is not a built-in menu `recipe_ref: {id, revision}`, and
+neither is issue #1's provider-neutral
+`library_recipe_ref: {library_id, recipe_id, version}`. Identical rediscovery
+reuses the original frozen document and ref while renewing its 30-day expiry.
+Unpinned snapshots are capped at 2,000 documents and 64 MiB, oldest-expiring
+first. Pending or uncertain destination work pins its snapshot; failed pins are
+released and their small records expire after 30 days, while a confirmed
+built-in mapping remains without retaining or depending on the snapshot
+document. Repeating a confirmed save returns the exact originally bound recipe
+ID and revision even after cleanup or a later explicit recipe update.
+
+The first write to a non-empty v1 recipe bank creates one transactionally
+consistent private `recipes-v1.backup.sqlite3`, then upgrades the bank to v2 in
+the same writer-serialized migration. The schema version advances only after
+the snapshot and destination-binding tables are complete. Migration failure
+rolls back to usable v1, and an unknown newer schema fails closed. A changed
+snapshot never updates an existing same-source recipe silently: save returns
+that existing recipe plus a conflict requiring an explicit update with its
+`expected_revision`.
+
 TheMealDB uses its official V1 API with the public/private-use test key `1` by
 default; a private key can be supplied only through `THEMEALDB_API_KEY`. Review
 TheMealDB's current terms before using this integration in a public app.

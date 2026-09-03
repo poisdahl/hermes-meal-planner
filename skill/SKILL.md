@@ -95,10 +95,20 @@ the decision and requires one new combined question. If no issue exists, do not
 ask. An unattended scheduled run with any unresolved cart state stops in
 `cart_ready`/`needs_input`; it never applies the suggested default automatically.
 
-Save a recipe only on a clear request. Preserve explicit source and rights
-facts; do not guess a license or claim authorship. Store original Oda/MENY
-recipes as link-only. A materially rewritten recipe may be saved as adapted or
-inspired only when that relationship is true. Prefer structured quantities for
+Save a discovered recipe only on a clear request. When one displayed result is
+clearly selected, pass its exact `discovery_ref` to `recipes save`; never copy
+the document field by field, refetch it, or guess from its name or position. If
+“this” is ambiguous, ask which displayed recipe. A `discovery_ref` is separate
+from the built-in menu `recipe_ref: {id, revision}` and from the
+provider-neutral `library_recipe_ref: {library_id, recipe_id, version}` defined
+by the optional library boundary; none of these technical references is
+user-facing. After a successful save, confirm the returned recipe name, source,
+and exact `library_id`. On a returned source-change conflict, explain that the
+existing recipe was not changed and ask whether the user wants a separate
+explicit update using its returned revision. Preserve explicit source and
+rights facts; do not guess a license or claim authorship. Store original
+Oda/MENY recipes as link-only. A materially rewritten recipe may be saved as
+adapted or inspired only when that relationship is true. Prefer structured quantities for
 ingredients that scale and plain `raw` text for “to taste”, whole packages and
 other non-scalable amounts. Use returned revisions for update/archive and a
 stable idempotency key when retrying the same write. A duplicate warning is not
