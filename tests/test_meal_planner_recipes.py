@@ -4,6 +4,7 @@ import argparse
 from contextlib import closing
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from urllib.error import HTTPError, URLError
 from unittest import mock
 
 
@@ -41,6 +43,13 @@ from recipe_libraries import (  # noqa: E402
     validate_library_recipe_ref,
 )
 import recipe_library_setup as library_setup  # noqa: E402
+from recipe_library_mealie import (  # noqa: E402
+    MARKER_EXTRA,
+    MINIMUM_MEALIE_VERSION_TEXT,
+    ORIGIN_EXTRA,
+    RECIPE_EXTRA,
+    MealieAdapter,
+)
 import recipe_sources as source_module  # noqa: E402
 from recipe_sources import RecipeSourceError, TheMealDBSource, WikibooksSource  # noqa: E402
 from service import (  # noqa: E402
@@ -1835,6 +1844,26 @@ class RecipeLibraryContractTests(unittest.TestCase):
             self.assertEqual(load_library_secret(home, "family-mealie"), {"token": "fixture-secret"})
 
             primary_args = argparse.Namespace(config=config_path, home=home, library_id="family-mealie")
+            read_only_adapter = SyntheticLibraryAdapter(
+                "family-mealie", recipe, read_only=True
+            )
+            with mock.patch.object(
+                    library_setup, "load_optional_adapter", return_value=read_only_adapter
+                ), mock.patch("builtins.input") as confirmation, mock.patch.object(
+                    library_setup, "_restart_running_service"
+                ) as restart, self.assertRaisesRegex(
+                    RecipeLibraryError, "cannot be primary because it cannot save"
+                ):
+                library_setup.set_primary(
+                    primary_args, library_setup._read_config(config_path)
+                )
+            confirmation.assert_not_called()
+            restart.assert_not_called()
+            self.assertEqual(
+                json.loads(config_path.read_text(encoding="utf-8"))["primary_recipe_library_id"],
+                "builtin",
+            )
+
             with mock.patch.object(library_setup, "load_optional_adapter", return_value=adapter), \
                     mock.patch("builtins.input", return_value="set primary family-mealie"), \
                     mock.patch.object(library_setup, "_restart_running_service"):
@@ -4449,6 +4478,592 @@ class RecipeFlowTests(unittest.TestCase):
         result = self.app._usage_summary(self.store.read(), "content:future", "9999-W52")
         self.assertFalse(result["eligible"])
         self.assertIsNone(result["next_eligible_week"])
+
+
+class _FakeMealieResponse:
+    def __init__(self, status, value):
+        self.status = status
+        self.payload = b"" if value is None else json.dumps(value).encode("utf-8")
+        self.headers = {"Content-Length": str(len(self.payload))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def getcode(self):
+        return self.status
+
+    def read(self, limit):
+        return self.payload[:limit]
+
+
+class _FakeMealieOpener:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def open(self, request, timeout):
+        self.requests.append((request, timeout))
+        if not self.responses:
+            raise AssertionError("unexpected Mealie request")
+        response = self.responses.pop(0)
+        if callable(response):
+            response = response(request)
+        if isinstance(response, Exception):
+            raise response
+        status, value = response
+        return _FakeMealieResponse(status, value)
+
+
+class MealieAdapterTests(unittest.TestCase):
+    recipe_id = "11111111-1111-4111-8111-111111111111"
+
+    def setUp(self):
+        path = Path(__file__).parent / "fixtures" / "mealie" / "v3.24.0.json"
+        self.fixture_text = path.read_text(encoding="utf-8")
+        self.fixture = json.loads(self.fixture_text)
+        self.connection = {
+            "library_id": "family-mealie",
+            "provider": "mealie",
+            "base_url": "https://recipes.example",
+            "read_only": False,
+        }
+        self.credential = {"token": "fixture-token-never-serialized"}
+
+    def adapter(self, *responses, connection=None):
+        opener = _FakeMealieOpener(*responses)
+        adapter = MealieAdapter(connection or self.connection, self.credential, opener=opener)
+        return adapter, opener
+
+    @staticmethod
+    def operation(*, operation_id="libop:v1:abcdefghijklmnop"):
+        return {
+            "operation_id": operation_id,
+            "kind": "create",
+            "library_id": "family-mealie",
+            "snapshot_digest": "a" * 64,
+            "source_identity": "familien:fixture-recipe",
+            "status": "pending",
+        }
+
+    def patched_recipe(self, adapter, snapshot, operation):
+        payload, _document = adapter._native_payload(snapshot, operation)
+        return {
+            **deepcopy(payload),
+            "id": self.recipe_id,
+            "slug": "fixture-created",
+            "tags": [{"name": tag, "slug": tag} for tag in payload["tags"]],
+            "updatedAt": "2026-09-03T19:15:00Z",
+        }
+
+    def created_stub(self, operation, *, slug="fixture-created"):
+        marker = hashlib.sha256(operation["operation_id"].encode()).hexdigest()
+        return {
+            "id": self.recipe_id,
+            "name": f"Hermes import {marker}",
+            "slug": slug,
+        }
+
+    def test_sanitized_fixture_and_read_only_capability_probe_match_supported_contract(self):
+        metadata = self.fixture["fixture"]
+        self.assertEqual(metadata["minimum_supported_version"], MINIMUM_MEALIE_VERSION_TEXT)
+        for forbidden in (
+            "fixture-token-never-serialized", "internal.local", "/Users/", "/opt/",
+        ):
+            self.assertNotIn(forbidden, self.fixture_text)
+        self.assertEqual(set(self.fixture["authenticated_user"]), {
+            "id", "username", "fullName", "email", "authMethod", "admin", "group",
+            "household", "advanced", "showAnnouncements", "lastReadAnnouncement",
+            "canInvite", "canManage", "canManageHousehold", "canOrganize", "groupId",
+            "groupSlug", "householdId", "householdSlug", "tokens", "cacheKey",
+        })
+        self.assertEqual(set(self.fixture["recipe_page"]["items"][0]), {
+            "id", "userId", "householdId", "groupId", "name", "slug", "image",
+            "recipeServings", "recipeYieldQuantity", "recipeYield", "totalTime",
+            "prepTime", "cookTime", "performTime", "description", "recipeCategory",
+            "tags", "tools", "rating", "orgURL", "dateAdded", "dateUpdated",
+            "createdAt", "updatedAt", "lastMade",
+        })
+        self.assertEqual(
+            set(self.fixture["recipe_page"]["items"][0]["tags"][0]),
+            {"id", "groupId", "name", "slug"},
+        )
+        self.assertEqual(
+            set(self.fixture["recipe_get"]["tags"][0]),
+            {"id", "groupId", "name", "slug"},
+        )
+        self.assertEqual(
+            set(self.fixture["create"]["finalize_response"]),
+            set(self.fixture["recipe_get"]),
+        )
+        adapter, opener = self.adapter(
+            (200, self.fixture["app_about"]),
+            (200, self.fixture["authenticated_user"]),
+            (200, self.fixture["recipe_page"]),
+            (200, self.fixture["favorites"]),
+        )
+        capabilities = adapter.capabilities()
+        self.assertEqual(capabilities["server_version"], "v3.24.0")
+        for name in ("search", "get", "create_from_discovery", "reconcile_create", "favorite_read"):
+            self.assertTrue(capabilities[name])
+        for name in (
+            "conditional_update", "archive_desired_state", "delete",
+            "favorite_write_desired_state", "favorite_conditional_write",
+            "reconcile_archive", "reconcile_delete", "favorite_reconcile",
+        ):
+            self.assertFalse(capabilities[name])
+        self.assertEqual([request.method for request, _timeout in opener.requests], ["GET"] * 4)
+        self.assertTrue(all(request.headers["Authorization"] == "Bearer fixture-token-never-serialized" for request, _ in opener.requests))
+
+        read_only = {**self.connection, "read_only": True}
+        adapter, _ = self.adapter(
+            (200, self.fixture["app_about"]),
+            (200, self.fixture["authenticated_user"]),
+            (200, self.fixture["recipe_page"]),
+            (200, self.fixture["favorites"]),
+            connection=read_only,
+        )
+        checked = library_module.verified_capabilities(adapter, read_only)
+        self.assertTrue(checked["search"])
+        self.assertTrue(checked["get"])
+        self.assertFalse(checked["create_from_discovery"])
+        self.assertFalse(checked["reconcile_create"])
+
+    def test_incompatible_version_authentication_and_redirects_fail_without_following(self):
+        old = {**self.fixture["app_about"], "version": "v3.23.1"}
+        adapter, opener = self.adapter((200, old))
+        with self.assertRaisesRegex(RecipeLibraryError, "3.24.0 or newer"):
+            adapter.capabilities()
+        self.assertEqual(len(opener.requests), 1)
+
+        for version in ("v3.24.0-rc.1", "v3.24.0-dev", "nightly"):
+            with self.subTest(version=version):
+                incompatible = {**self.fixture["app_about"], "version": version}
+                adapter, opener = self.adapter((200, incompatible))
+                with self.assertRaisesRegex(RecipeLibraryError, "version is incompatible"):
+                    adapter.capabilities()
+                self.assertEqual(len(opener.requests), 1)
+
+        unauthorized = HTTPError("https://recipes.example/api/users/self", 401, "unauthorized", {}, None)
+        adapter, _ = self.adapter((200, self.fixture["app_about"]), unauthorized)
+        with self.assertRaisesRegex(RecipeLibraryError, "authentication failed"):
+            adapter.capabilities()
+
+        redirect = HTTPError("https://recipes.example/api/app/about", 302, "redirect", {"Location": "https://attacker.invalid"}, None)
+        adapter, opener = self.adapter(redirect)
+        with self.assertRaisesRegex(RecipeLibraryError, "redirects"):
+            adapter.capabilities()
+        self.assertEqual(len(opener.requests), 1)
+        self.assertNotIn("attacker.invalid", opener.requests[0][0].full_url)
+
+    def test_paginated_search_and_exact_get_use_uuid_identity_and_display_only_slug(self):
+        next_page = deepcopy(self.fixture["recipe_page"])
+        next_page["total"] = 2
+        next_page["totalPages"] = 2
+        adapter, opener = self.adapter((200, next_page), (200, self.fixture["recipe_get"]))
+        page = adapter.search("vegetable", {"tags": ["fixture"]}, None, 1)
+        self.assertEqual(page["cursor"], "page:2")
+        summary = page["recipes"][0]
+        self.assertEqual(summary["library_recipe_ref"], {
+            "library_id": "family-mealie", "recipe_id": self.recipe_id,
+            "version": "2026-08-24T12:00:00Z",
+        })
+        self.assertEqual(summary["provider_slug"], "fixture-vegetable-soup")
+        self.assertNotIn("slug", summary["library_recipe_ref"])
+        self.assertIn("search=vegetable", opener.requests[0][0].full_url)
+        self.assertIn("tags=fixture", opener.requests[0][0].full_url)
+
+        recipe = adapter.get(summary["library_recipe_ref"])
+        self.assertEqual(recipe["name"], "Fixture vegetable soup")
+        self.assertEqual(recipe["provider_slug"], "fixture-vegetable-soup")
+        self.assertIn(f"/api/recipes/{self.recipe_id}", opener.requests[1][0].full_url)
+        self.assertNotIn("fixture-vegetable-soup", opener.requests[1][0].full_url)
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = Application(
+                StateStore(Path(directory) / "state", CONFIG), FakeOda(), FakeBrowser()
+            )
+            normalized = app._normalize_library_search_item(summary, "family-mealie")
+            self.assertEqual(normalized["provider_slug"], "fixture-vegetable-soup")
+
+    def test_full_create_maps_native_fields_and_round_trips_exact_frozen_document(self):
+        snapshot = normalize_recipe(full_recipe("Fixture family soup", external_id="fixture-recipe"))
+        operation = self.operation()
+        adapter, opener = self.adapter(
+            (201, self.fixture["create"]["response"]),
+            (200, self.fixture["create"]["stub_get"]),
+            (200, self.fixture["create"]["finalize_response"]),
+        )
+        result = adapter.create_from_snapshot(snapshot, operation)
+        self.assertEqual(result["library_recipe_ref"]["recipe_id"], self.recipe_id)
+        self.assertEqual(result["recipe"]["source"], snapshot["source"])
+        self.assertEqual(result["recipe"]["rights"], snapshot["rights"])
+        self.assertEqual(result["recipe"]["ingredients"], snapshot["ingredients"])
+
+        self.assertEqual([request.method for request, _ in opener.requests], ["POST", "GET", "PATCH"])
+        create_body = json.loads(opener.requests[0][0].data)
+        self.assertEqual(create_body, self.fixture["create"]["request"])
+        patch_request = opener.requests[2][0]
+        self.assertTrue(patch_request.full_url.endswith(f"/api/recipes/{self.recipe_id}"))
+        patch_body = json.loads(patch_request.data)
+        origin = json.loads(patch_body["extras"][ORIGIN_EXTRA])
+        self.assertEqual(origin, {
+            "library_id": "family-mealie",
+            "operation_id": operation["operation_id"],
+            "snapshot_digest": operation["snapshot_digest"],
+            "source_identity": operation["source_identity"],
+        })
+        self.assertEqual(json.loads(patch_body["extras"][RECIPE_EXTRA]), snapshot)
+        self.assertEqual(patch_body["tags"], [])
+        self.assertIn("Hermes attribution", patch_body["description"])
+        self.assertIn("Credit: Familieoppskrift", patch_body["description"])
+        self.assertIn("Relationship: user_supplied", patch_body["description"])
+        finalized = self.fixture["create"]["finalize_response"]
+        for key in (
+            "name", "description", "orgURL", "recipeServings", "recipeYieldQuantity",
+            "recipeYield", "notes", "extras",
+        ):
+            self.assertEqual(patch_body[key], finalized[key])
+
+        for field, value in (
+            ("recipeServings", 4.0000000001),
+            ("recipeYieldQuantity", 5),
+            ("recipeYield", "bowls"),
+        ):
+            with self.subTest(native_yield_drift=field):
+                drifted = deepcopy(finalized)
+                drifted[field] = value
+                adapter, _ = self.adapter(
+                    (201, self.fixture["create"]["response"]),
+                    (200, self.fixture["create"]["stub_get"]),
+                    (200, drifted),
+                )
+                with self.assertRaises(RecipeLibraryUncertainError):
+                    adapter.create_from_snapshot(snapshot, operation)
+
+    def test_link_only_create_transmits_no_unauthorized_full_text(self):
+        secret_text = "PRIVATE FULL RECIPE TEXT MUST NOT LEAVE"
+        snapshot = normalize_recipe({
+            "name": "Link only fixture",
+            "language": "zz-PRIVATE",
+            "tags": ["PRIVATE CLASSIFICATION"],
+            "source": {
+                "kind": "publisher", "publisher": "Fixture Publisher",
+                "title": "Link only fixture", "author": "Fixture Author",
+                "url": "https://publisher.example/fixture", "external_id": "link-only",
+                "relationship": "original",
+            },
+            "rights": {"storage": "link_only", "credit": "Fixture Publisher", "license": "CC BY"},
+            "notes": secret_text,
+            "external_snapshot": {
+                "fetched_at": "2026-09-03T12:00:00+00:00",
+                "content_hash": "b" * 64,
+                "source_revision_id": "PRIVATE SOURCE REVISION",
+                "permanent_url": "https://publisher.example/fixture",
+                "changes": "PRIVATE SNAPSHOT METADATA",
+            },
+        })
+        operation = self.operation(operation_id="libop:v1:qrstuvwxyzABCDEF")
+        probe, _ = self.adapter()
+        patched = self.patched_recipe(probe, snapshot, operation)
+        adapter, opener = self.adapter(
+            (201, "fixture-created"),
+            (200, self.created_stub(operation)),
+            (200, patched),
+        )
+        result = adapter.create_from_snapshot(snapshot, operation)
+        self.assertEqual(result["recipe"]["rights"]["storage"], "link_only")
+        self.assertEqual(result["recipe"]["source"], snapshot["source"])
+        self.assertEqual(result["recipe"]["rights"], snapshot["rights"])
+        self.assertEqual(result["recipe"]["external_snapshot"], snapshot["external_snapshot"])
+        self.assertIsNone(result["recipe"]["notes"])
+        with tempfile.TemporaryDirectory() as directory:
+            app = Application(
+                StateStore(Path(directory) / "state", CONFIG), FakeOda(), FakeBrowser()
+            )
+            reference, _returned = app._validated_library_create_result(
+                result, app._outbound_library_snapshot(snapshot), "family-mealie"
+            )
+        self.assertEqual(reference["recipe_id"], self.recipe_id)
+        patch_body = json.loads(opener.requests[2][0].data)
+        self.assertEqual(patch_body["recipeIngredient"], [])
+        self.assertEqual(patch_body["recipeInstructions"], [])
+        self.assertEqual(patch_body["notes"], [])
+        self.assertEqual(patch_body["tags"], [])
+        stored = json.loads(patch_body["extras"][RECIPE_EXTRA])
+        self.assertEqual(set(stored), {"name", "source", "rights"})
+        self.assertEqual(set(stored["source"]), {
+            "kind", "publisher", "title", "author", "url", "relationship",
+        })
+        self.assertNotIn("external_id", stored["source"])
+        serialized = json.dumps(patch_body)
+        for private_value in (
+            secret_text, "PRIVATE CLASSIFICATION", "zz-PRIVATE",
+            "PRIVATE SOURCE REVISION", "PRIVATE SNAPSHOT METADATA",
+        ):
+            self.assertNotIn(private_value, serialized)
+
+        for field, malformed_value in (
+            ("notes", ["unexpected text"]),
+            ("recipeServings", False),
+            ("recipeServings", ""),
+        ):
+            with self.subTest(malformed_readback=field, value=malformed_value):
+                malformed = deepcopy(patched)
+                malformed[field] = malformed_value
+                adapter, _ = self.adapter(
+                    (201, "fixture-created"),
+                    (200, self.created_stub(operation)),
+                    (200, malformed),
+                )
+                with self.assertRaises(RecipeLibraryUncertainError):
+                    adapter.create_from_snapshot(snapshot, operation)
+
+    def test_reconciliation_requires_unique_origin_digest_source_and_content_agreement(self):
+        snapshot = normalize_recipe(full_recipe("Reconcile fixture", external_id="fixture-recipe"))
+        operation = self.operation()
+        probe, _ = self.adapter()
+        patched = self.patched_recipe(probe, snapshot, operation)
+        summary = {
+            key: patched[key]
+            for key in ("id", "name", "slug", "tags", "orgURL", "updatedAt")
+        }
+        page = {"page": 1, "perPage": 50, "total": 1, "totalPages": 1, "items": [summary]}
+        adapter, _ = self.adapter((200, page), (200, patched))
+        reconciled = adapter.reconcile_create(snapshot, operation)
+        self.assertEqual(reconciled["library_recipe_ref"]["recipe_id"], self.recipe_id)
+
+        for field, value in (
+            ("operation_id", "libop:v1:0000000000000000"),
+            ("library_id", "other-mealie"),
+            ("snapshot_digest", "b" * 64),
+            ("source_identity", "familien:other-recipe"),
+        ):
+            with self.subTest(origin_mismatch=field):
+                collision = deepcopy(patched)
+                bad_origin = json.loads(collision["extras"][ORIGIN_EXTRA])
+                bad_origin[field] = value
+                collision["extras"][ORIGIN_EXTRA] = json.dumps(
+                    bad_origin, sort_keys=True, separators=(",", ":")
+                )
+                adapter, _ = self.adapter((200, page), (200, collision))
+                self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+
+        content_collision = deepcopy(patched)
+        content_collision["recipeIngredient"][0]["originalText"] = "different content"
+        adapter, _ = self.adapter((200, page), (200, content_collision))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+
+        marker_only = deepcopy(patched)
+        marker_only["extras"] = {MARKER_EXTRA: patched["extras"][MARKER_EXTRA]}
+        adapter, _ = self.adapter((200, page), (200, marker_only))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+
+        malformed_notes = deepcopy(patched)
+        malformed_notes["notes"] = ["unexpected text"]
+        adapter, _ = self.adapter((200, page), (200, malformed_notes))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+
+        duplicate_page = {**page, "total": 2, "items": [summary, summary]}
+        adapter, opener = self.adapter((200, duplicate_page))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+        self.assertEqual(len(opener.requests), 1)
+
+        hidden_duplicate_page = {**page, "total": 2, "items": [summary]}
+        adapter, opener = self.adapter((200, hidden_duplicate_page))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_native_edit_preserves_frozen_metadata_without_native_representation(self):
+        snapshot = external_recipe(
+            "themealdb", "Edited fixture", "fixture-recipe",
+            content_hash="c" * 64,
+        )
+        snapshot["tags"] = ["themealdb", "frozen tag"]
+        snapshot["times"] = {"total": "PT25M"}
+        snapshot["storage"] = "Keep refrigerated."
+        snapshot["reheating"] = "Warm gently."
+        operation = self.operation()
+        probe, _ = self.adapter()
+        changed = self.patched_recipe(probe, snapshot, operation)
+        changed["recipeInstructions"][0]["text"] = "Provider-edited instruction."
+        changed["updatedAt"] = "2026-09-03T20:00:00Z"
+        adapter, _ = self.adapter((200, changed))
+        recipe = adapter.get({
+            "library_id": "family-mealie",
+            "recipe_id": self.recipe_id,
+            "version": changed["updatedAt"],
+        })
+        self.assertEqual(recipe["steps"], ["Provider-edited instruction."])
+        for field in ("tags", "times", "storage", "reheating", "external_snapshot"):
+            self.assertEqual(recipe[field], snapshot[field])
+
+    def test_real_adapter_save_materializes_once_and_menu_stays_frozen_during_outage(self):
+        snapshot = normalize_recipe(full_recipe("Mealie menu fixture", external_id="fixture-recipe"))
+        created = {}
+
+        def patch_response(request):
+            payload = json.loads(request.data)
+            created["raw"] = {
+                **payload,
+                "id": self.recipe_id,
+                "slug": "fixture-created",
+                "tags": [{"name": tag, "slug": tag} for tag in payload["tags"]],
+                "updatedAt": "2026-09-03T19:15:00Z",
+            }
+            return 200, created["raw"]
+
+        def exact_get_response(_request):
+            return 200, created["raw"]
+
+        def stub_response(_request):
+            create_request = next(
+                request for request, _timeout in opener.requests if request.method == "POST"
+            )
+            return 200, {
+                "id": self.recipe_id,
+                "name": json.loads(create_request.data)["name"],
+                "slug": "fixture-created",
+            }
+
+        capability_responses = (
+            (200, self.fixture["app_about"]),
+            (200, self.fixture["authenticated_user"]),
+            (200, self.fixture["recipe_page"]),
+            (200, self.fixture["favorites"]),
+        )
+        adapter, opener = self.adapter(
+            *capability_responses,
+            (201, "fixture-created"), stub_response, patch_response,
+            *capability_responses,
+            exact_get_response,
+        )
+        settings = {
+            **CONFIG,
+            "primary_recipe_library_id": "family-mealie",
+            "recipe_libraries": [self.connection],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory), settings)
+            app = Application(
+                store, FakeOda(), FakeBrowser(),
+                recipe_library_adapters={"family-mealie": adapter},
+            )
+            with store.locked() as state:
+                state["setup"]["status"] = "complete"
+            discovery_ref = app.recipes.persist_discovery(snapshot)["discovery_ref"]
+            saved = app.handle({
+                "operation": "recipes", "action": "save", "discovery_ref": discovery_ref,
+            })
+            self.assertEqual(saved["status"], "confirmed")
+            menu = app.handle({
+                "operation": "menu", "action": "save",
+                "menu": {
+                    "week": "2026-W40",
+                    "dishes": [{"library_recipe_ref": saved["library_recipe_ref"]}],
+                    "salads": [],
+                },
+            })["menu"]
+            self.assertEqual(menu["dishes"][0]["name"], snapshot["name"])
+            exact_gets = [
+                request for request, _timeout in opener.requests
+                if request.method == "GET" and request.full_url.endswith(f"/api/recipes/{self.recipe_id}")
+            ]
+            self.assertEqual(len(exact_gets), 1)
+            opener.responses = [URLError("provider outage")]
+            self.assertEqual(app.handle({"operation": "menu", "action": "get"})["menu"], menu)
+            self.assertEqual(len(opener.responses), 1)
+
+    def test_create_failures_are_definite_only_before_any_possible_provider_create(self):
+        snapshot = normalize_recipe(full_recipe("Failure fixture", external_id="fixture-recipe"))
+        operation = self.operation()
+        for status in (401, 403, 409, 422, 429):
+            with self.subTest(definite_status=status):
+                rejected = HTTPError(
+                    "https://recipes.example/api/recipes", status, "private detail", {}, None
+                )
+                adapter, _ = self.adapter(rejected)
+                with self.assertRaises(RecipeLibraryDefiniteError):
+                    adapter.create_from_snapshot(snapshot, operation)
+
+        adapter, _ = self.adapter(URLError("timeout"))
+        with self.assertRaises(RecipeLibraryUncertainError):
+            adapter.create_from_snapshot(snapshot, operation)
+
+        patch_rejected = HTTPError(
+            f"https://recipes.example/api/recipes/{self.recipe_id}", 422, "invalid", {}, None
+        )
+        adapter, _ = self.adapter(
+            (201, "fixture-created"),
+            (200, self.created_stub(operation)),
+            patch_rejected,
+        )
+        with self.assertRaises(RecipeLibraryUncertainError):
+            adapter.create_from_snapshot(snapshot, operation)
+
+        wrong_stub = {
+            **self.created_stub(operation),
+            "name": "An unrelated existing recipe",
+        }
+        adapter, opener = self.adapter((201, "fixture-created"), (200, wrong_stub))
+        with self.assertRaises(RecipeLibraryUncertainError):
+            adapter.create_from_snapshot(snapshot, operation)
+        self.assertEqual([request.method for request, _ in opener.requests], ["POST", "GET"])
+
+    def test_credentials_are_token_only_and_provider_errors_do_not_expose_details(self):
+        with self.assertRaisesRegex(RecipeLibraryError, "only token"):
+            MealieAdapter(self.connection, {"token": "value", "other": "secret"})
+        adapter, _ = self.adapter((500, {"detail": "private provider recipe payload"}))
+        with self.assertRaises(RecipeLibraryError) as raised:
+            adapter.search("", {}, None, 10)
+        self.assertNotIn("private provider recipe payload", str(raised.exception))
+        self.assertNotIn(self.credential["token"], str(raised.exception))
+
+
+@unittest.skipUnless(
+    os.environ.get("HERMES_MEALIE_LIVE_TEST") == "1",
+    "explicit Mealie live-test connection not supplied",
+)
+class MealieLiveContractTest(unittest.TestCase):
+    def test_one_uniquely_marked_recipe_is_removed_only_after_exact_confirmation(self):
+        base_url = os.environ["HERMES_MEALIE_TEST_BASE_URL"]
+        token = os.environ["HERMES_MEALIE_TEST_TOKEN"]
+        connection = {
+            "library_id": "live-mealie", "provider": "mealie", "base_url": base_url,
+            "read_only": False, "allow_insecure_http": base_url.startswith("http://"),
+        }
+        adapter = MealieAdapter(connection, {"token": token})
+        adapter.capabilities()
+        unique = hashlib.sha256(os.urandom(32)).hexdigest()
+        snapshot = normalize_recipe({
+            **full_recipe(f"Hermes live fixture {unique}", external_id=unique),
+            "source": {
+                "kind": "test", "publisher": "Hermes live contract test",
+                "title": f"Hermes live fixture {unique}", "external_id": unique,
+                "relationship": "generated",
+            },
+        })
+        operation = {
+            "operation_id": f"libop:v1:{unique[:24]}", "kind": "create",
+            "library_id": "live-mealie", "snapshot_digest": hashlib.sha256(canonical(snapshot).encode()).hexdigest(),
+            "source_identity": f"hermes-live:{unique}", "status": "pending",
+        }
+        confirmed = None
+        try:
+            try:
+                confirmed = adapter.create_from_snapshot(snapshot, operation)
+            except RecipeLibraryUncertainError:
+                confirmed = adapter.reconcile_create(snapshot, operation)
+                if confirmed is None:
+                    self.fail("Mealie live create is uncertain and requires inspection; create was not repeated")
+            recipe_id = confirmed["library_recipe_ref"]["recipe_id"]
+            self.assertEqual(adapter.get(confirmed["library_recipe_ref"])["name"], snapshot["name"])
+        finally:
+            if confirmed is not None:
+                recipe_id = confirmed["library_recipe_ref"]["recipe_id"]
+                adapter._request("DELETE", f"/api/recipes/{recipe_id}", expected=(200, 204))
 
 
 if __name__ == "__main__":

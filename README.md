@@ -341,9 +341,10 @@ Use a separate private installation and MCP registration for another provider.
 ## Personal recipe-library connections
 
 The built-in bank always exists as exact `library_id="builtin"` and is the
-zero-configuration primary. Optional Mealie and RecipeSage adapters are separate
-deliverables; merely adding either connection never selects it or blocks the
-built-in path. Connections live only in the private config and use stable IDs:
+zero-configuration primary. The Mealie adapter is included; RecipeSage remains
+a separate deliverable. Merely adding either connection never selects it or
+blocks the built-in path. Connections live only in the private config and use
+stable IDs:
 
 ```json
 {
@@ -385,6 +386,38 @@ python3 recipe_library_setup.py --config "$home/config.json" --home "$home" \
 python3 recipe_library_setup.py --config "$home/config.json" --home "$home" \
   set-primary --library-id family-mealie
 ```
+
+For Mealie, enter exactly `{"token":"<long-lived Mealie API token>"}` at the
+hidden credential prompt. The adapter supports Mealie `3.24.0` and newer when
+the probed response schemas remain compatible. Its read-only connection test
+checks `/api/app/about`, authenticated `/api/users/self`, one bounded recipe
+list page and the favorite-read response shape. It reports `search`, `get`,
+`create_from_discovery`, `reconcile_create` and `favorite_read`; it never
+reports update, archive, delete or favorite-write capabilities. A configured
+`read_only` connection retains search/get and favorite reporting but suppresses
+create/reconcile and cannot be selected as a writable primary.
+
+Mealie search is paginated and returns the immutable provider UUID in the
+namespaced `library_recipe_ref`; the current slug is display-only
+`provider_slug` metadata. Exact get always addresses the UUID, and `updatedAt`
+is the version token when Mealie supplies it. Saving uses only the already
+frozen discovery document. The create flow installs native Mealie fields plus a
+deterministic attribution block and private `hermes_origin`/`hermes_recipe`
+extras. Frozen tags stay in `hermes_recipe`; the first version does not mutate
+Mealie's shared tag organizer. `link_only` sends only the title, original HTTPS source link,
+attribution/rights metadata and operation metadata—never ingredients, steps or
+notes. A definite rejection before Mealie creates anything is failed. Any lost
+response or failure after possible creation is uncertain, is never retried or
+redirected to `builtin`, and can become confirmed only when a unique marker
+search, origin record, snapshot digest, source identity and normalized content
+all agree. A copied marker or partial stub is not enough.
+
+The sanitized fixture in `tests/fixtures/mealie/v3.24.0.json` records the
+stable v3.24.0 shapes checked against the official current Mealie OpenAPI
+surface without retaining a token, user/household identity, private recipe or
+internal hostname. Optional live coverage runs only when an operator explicitly
+supplies a test connection; it creates one uniquely marked recipe and removes
+only the exact confirmed or reconciled provider UUID.
 
 The hidden prompt reads credential JSON. Add/update probes authentication and
 semantic read capabilities before writing; primary changes and credential
