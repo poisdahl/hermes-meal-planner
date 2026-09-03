@@ -1450,6 +1450,19 @@ class Application:
             raise RecipeLibraryError("recipe library capability probe is unavailable") from exc
 
     @staticmethod
+    def _library_needs_auth(exc: Exception) -> bool:
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, RecipeLibraryError) and str(current).endswith(
+                "needs_auth"
+            ):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    @staticmethod
     def _provider_text(value: Any, field: str, maximum: int, *, required: bool = False) -> str | None:
         if value is None and not required:
             return None
@@ -1506,13 +1519,20 @@ class Application:
     def _external_library_get(self, reference: Mapping[str, str]) -> dict[str, Any]:
         expected_reference = deepcopy(dict(reference))
         library_id = expected_reference["library_id"]
-        capabilities = self._library_capabilities(library_id)
+        try:
+            capabilities = self._library_capabilities(library_id)
+        except RecipeLibraryError as exc:
+            if self._library_needs_auth(exc):
+                raise RecipeLibraryError("recipe library needs_auth") from None
+            raise
         if not capabilities["get"]:
             raise RecipeLibraryError("recipe library get is unsupported or read-only")
         adapter = self.recipe_library_adapters[library_id]
         try:
             raw = adapter.get(deepcopy(expected_reference))
         except Exception as exc:
+            if self._library_needs_auth(exc):
+                raise RecipeLibraryError("recipe library needs_auth") from None
             raise RecipeLibraryError("recipe library get is unavailable") from exc
         if not isinstance(raw, Mapping):
             raise RecipeLibraryError("recipe library get returned invalid data")
@@ -1626,13 +1646,27 @@ class Application:
                 return self._library_operation_response(failed)
             try:
                 capabilities = self._library_capabilities(target)
-            except RecipeLibraryError:
+            except RecipeLibraryError as exc:
                 if operation["status"] == "uncertain":
-                    return self._library_operation_response(operation)
+                    response = self._library_operation_response(operation)
+                    if self._library_needs_auth(exc):
+                        response.update({
+                            "error_code": "needs_auth",
+                            "error": "recipe library needs_auth before reconciliation",
+                        })
+                    return response
                 pending = dict(operation)
                 pending.update({
-                    "error_code": "adapter_unavailable",
-                    "error": "optional recipe library is unavailable before dispatch",
+                    "error_code": (
+                        "needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "adapter_unavailable"
+                    ),
+                    "error": (
+                        "recipe library needs_auth before dispatch"
+                        if self._library_needs_auth(exc)
+                        else "optional recipe library is unavailable before dispatch"
+                    ),
                 })
                 return self._library_operation_response(pending)
             if operation["status"] != "uncertain" and (
@@ -1666,8 +1700,14 @@ class Application:
                     response = self._library_operation_response(confirmed)
                     response["recipe"] = recipe
                     return response
-                except Exception:
-                    return self._library_operation_response(current)
+                except Exception as exc:
+                    response = self._library_operation_response(current)
+                    if self._library_needs_auth(exc):
+                        response.update({
+                            "error_code": "needs_auth",
+                            "error": "recipe library needs_auth before reconciliation",
+                        })
+                    return response
         resume_builtin = operation["status"] == "uncertain" and target == "builtin"
         if not resume_builtin:
             claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
@@ -1725,18 +1765,30 @@ class Application:
             response = self._library_operation_response(confirmed)
             response["recipe"] = recipe
             return response
-        except RecipeLibraryDefiniteError:
+        except RecipeLibraryDefiniteError as exc:
+            if self._library_needs_auth(exc):
+                pending = self.recipes.defer_library_create_for_auth(
+                    operation["operation_id"]
+                )
+                return self._library_operation_response(pending)
             failed = self.recipes.finish_library_create(
                 operation["operation_id"], "failed",
-                error_code="provider_rejected", error="recipe library definitely rejected the create",
+                error_code="provider_rejected",
+                error="recipe library definitely rejected the create",
             )
             return self._library_operation_response(failed)
-        except Exception:
+        except Exception as exc:
             uncertain = self.recipes.finish_library_create(
                 operation["operation_id"], "uncertain",
                 error_code="provider_uncertain", error="recipe library create may have been dispatched; do not retry",
             )
-            return self._library_operation_response(uncertain)
+            response = self._library_operation_response(uncertain)
+            if self._library_needs_auth(exc):
+                response.update({
+                    "error_code": "needs_auth",
+                    "error": "recipe library create may have been dispatched; needs_auth before reconciliation",
+                })
+            return response
 
     def _recipes(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "search")
@@ -1754,9 +1806,13 @@ class Application:
                 try:
                     item["capabilities"] = self._library_capabilities(library_id)
                     item["status"] = "available"
-                except Exception:
+                except Exception as exc:
                     item["capabilities"] = None
-                    item["status"] = "unavailable"
+                    item["status"] = (
+                        "needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "unavailable"
+                    )
                 libraries.append(item)
             return {"primary_recipe_library_id": self.primary_recipe_library_id, "recipe_libraries": libraries}
         if action == "search":
@@ -1864,10 +1920,18 @@ class Application:
                             self._normalize_library_search_item(item, library_id)
                             for item in page["recipes"]
                         )
-                    except Exception:
+                    except Exception as exc:
                         if len(library_ids) == 1:
+                            if self._library_needs_auth(exc):
+                                raise RecipeLibraryError(
+                                    "recipe library needs_auth"
+                                ) from None
                             raise RecipeLibraryError("recipe library search is unavailable")
-                        errors[library_id] = "recipe library search is unavailable"
+                        errors[library_id] = (
+                            "recipe library needs_auth"
+                            if self._library_needs_auth(exc)
+                            else "recipe library search is unavailable"
+                        )
                 result = {"recipes": combined, "library_ids": library_ids, "cursors": cursors}
                 if errors:
                     result["errors"] = errors

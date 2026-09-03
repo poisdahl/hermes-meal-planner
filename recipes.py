@@ -1489,7 +1489,8 @@ class RecipeStore:
                     return self._library_operation(row)
                 timestamp = _now()
                 cursor = connection.execute(
-                    "UPDATE library_operations SET dispatched_at=?, updated_at=? "
+                    "UPDATE library_operations SET dispatched_at=?, error_code=NULL, "
+                    "error_text=NULL, updated_at=? "
                     "WHERE operation_id=? AND status='pending' AND dispatched_at IS NULL",
                     (timestamp, timestamp, operation),
                 )
@@ -1497,6 +1498,39 @@ class RecipeStore:
                     "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
                 ).fetchone()
                 return self._library_operation(row, claimed=cursor.rowcount == 1)
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def defer_library_create_for_auth(self, operation_id: Any) -> dict[str, Any]:
+        """Release a dispatch claim after a definite pre-create auth rejection."""
+        operation = _bounded_text(
+            operation_id, "operation_id", required=True, maximum=80
+        )
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe library operation was not found")
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone()
+                if row is None or row["kind"] != "create":
+                    raise RecipeError("recipe library operation was not found")
+                if row["status"] != "pending":
+                    return self._library_operation(row)
+                timestamp = _now()
+                connection.execute(
+                    "UPDATE library_operations SET dispatched_at=NULL, error_code='needs_auth', "
+                    "error_text='recipe library needs_auth', updated_at=? "
+                    "WHERE operation_id=? AND status='pending'",
+                    (timestamp, operation),
+                )
+                return self._library_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation,),
+                    ).fetchone()
+                )
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 

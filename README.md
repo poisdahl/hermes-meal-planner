@@ -341,10 +341,9 @@ Use a separate private installation and MCP registration for another provider.
 ## Personal recipe-library connections
 
 The built-in bank always exists as exact `library_id="builtin"` and is the
-zero-configuration primary. The Mealie adapter is included; RecipeSage remains
-a separate deliverable. Merely adding either connection never selects it or
-blocks the built-in path. Connections live only in the private config and use
-stable IDs:
+zero-configuration primary. The Mealie and RecipeSage adapters are included.
+Merely adding either connection never selects it or blocks the built-in path.
+Connections live only in the private config and use stable IDs:
 
 ```json
 {
@@ -418,6 +417,81 @@ surface without retaining a token, user/household identity, private recipe or
 internal hostname. Optional live coverage runs only when an operator explicitly
 supplies a test connection; it creates one uniquely marked recipe and removes
 only the exact confirmed or reconciled provider UUID.
+
+For RecipeSage, configure the API origin: `https://api.recipesage.com` for the
+hosted service or, for the official self-host proxy, the site origin such as
+`https://recipes.example` without its `/api` suffix. The adapter verifies the
+OpenAPI document and automatically selects the official direct or `/api`
+prefix. The hosted API is documented for personal, non-commercial use only;
+this integration does not imply broader authorization. Self-hosted use follows
+the configured instance and the RecipeSage license.
+
+At the hidden credential prompt, enter exactly
+`{"token":"<RecipeSage bearer session token>"}`. Obtain or renew that token
+through an explicit local RecipeSage sign-in. Do not provide the RecipeSage
+email/password, Google token or Google authorization code to Meal Planner, MCP,
+the command line or logs; the helper persists only the returned session token
+in the mode-`0600` credential file. A revoked or expired session reports
+`needs_auth` and is never silently replaced. Install a renewed token with the
+same hidden `update-credential` action.
+
+The verified contract is RecipeSage `v4.0.6` on the hosted service and the
+official self-host bundle's `v4.0.3` application/config level `2026-08-16` or
+newer. The self-host build reports `selfhost` rather than its application
+version, so support additionally requires the same exact selected request and
+response schema fingerprint, not merely matching operation names, plus
+successful semantic read probes. Connection testing reads the OpenAPI
+version, validates the bearer session, reads the authenticated-user shape and
+lists at most one private recipe. It reports only `search`, `get`,
+`create_from_discovery` and `reconcile_create`; a configured `read_only`
+connection retains search/get, suppresses create/reconcile and cannot be the
+writable primary. RecipeSage rating is not treated as a favorite. Native
+favorite mutation, conditional update, archive and delete are not reported or
+emulated.
+
+Private list/search uses the current account only. The authenticated `getMe`
+UUID is cached for the connection, and every list, search, exact-get, create
+readback and reconciliation result must carry that same owner UUID. Results
+return immutable recipe UUIDs in `library_recipe_ref`; `updatedAt` is included as a version only when
+RecipeSage supplies it. List paging uses the server offset, while full-text
+search pages the provider's bounded result set locally. Exact get always sends
+the UUID. Saving sends one already frozen discovery document directly to
+`createRecipe`; it never refetches the source or calls RecipeSage clipping or
+Discover. Native recipe fields carry the permitted content and deterministic
+attribution. A versioned block at the start of the private recipe notes carries
+the unguessable operation ID, exact `library_id`, snapshot digest, normalized
+source identity and frozen document needed for semantic readback. Frozen tags
+and fields without a native RecipeSage representation stay in that block; the
+adapter does not mutate the account's label organizer.
+
+For `link_only`, the request contains only the permitted title, original link,
+attribution/rights statement and the required operation metadata—never recipe
+ingredients, steps, notes, classification tags or source snapshot text. A
+definite pre-dispatch rejection is failed. A timeout, lost response or any
+failure after possible create is target-bound `uncertain` and is never retried
+or redirected to `builtin`. Reconciliation requires exactly one private
+full-text marker result whose operation ID, library, digest, source identity
+and normalized native content all match; a copied marker, title/URL match,
+partial metadata or duplicate remains uncertain. Generic v3 journal/mapping
+rules provide same-ref/same-target idempotency and independent explicit
+targets. Menu save performs one exact get and freezes it, so later RecipeSage
+edits, deletion, expiry or outage cannot change the saved menu.
+
+A definite `needs_auth` rejection from `createRecipe` releases only the local
+dispatch claim and leaves the same target-bound operation pending, so an
+explicit token renewal can resume the same frozen save without rediscovery. If
+authentication expires while an already-uncertain operation is being
+reconciled, the operation stays uncertain but reports `needs_auth`; renewal
+allows reconciliation to continue and never repeats the create blindly.
+
+The sanitized fixture in `tests/fixtures/recipesage/v4.0.6.json` records exact
+selected request/response schemas captured from the hosted OpenAPI and the
+official self-host release provenance, with synthetic response values only. It
+contains no session, real email/account ID, private recipe or internal hostname.
+Optional live coverage runs only when an operator explicitly
+supplies a test connection; it creates one uniquely marked temporary recipe and
+removes only the exact confirmed or reconciled UUID. An uncertain cleanup is
+reconciled and never repeated blindly.
 
 The hidden prompt reads credential JSON. Add/update probes authentication and
 semantic read capabilities before writing; primary changes and credential
