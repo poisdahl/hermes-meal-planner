@@ -284,6 +284,8 @@ def _set_primary(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, 
     capabilities = None
     if library_id != "builtin":
         capabilities = _probe(connection, load_library_secret(args.home, library_id))
+        if not capabilities["create_from_discovery"]:
+            raise RecipeLibraryError("connection cannot be primary because it cannot save recipes")
     _confirm(f"set primary {library_id}")
     config["primary_recipe_library_id"] = library_id
     normalized = normalize_library_configuration(config)

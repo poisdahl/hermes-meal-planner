@@ -1473,6 +1473,11 @@ class Application:
             "library_recipe_ref": reference,
             "recipe_key": library_recipe_key(reference),
         }
+        if value.get("provider_slug") is not None:
+            result["provider_slug"] = self._provider_text(
+                value.get("provider_slug"), "recipe library result provider_slug", 300,
+                required=True,
+            )
         tags = value.get("tags")
         if tags is not None:
             if not isinstance(tags, list) or len(tags) > 50:
@@ -1524,6 +1529,11 @@ class Application:
         recipe = normalize_recipe(raw)
         recipe["library_recipe_ref"] = returned
         recipe["recipe_key"] = library_recipe_key(returned)
+        if raw.get("provider_slug") is not None:
+            recipe["provider_slug"] = self._provider_text(
+                raw.get("provider_slug"), "recipe library result provider_slug", 300,
+                required=True,
+            )
         return recipe
 
     @staticmethod
