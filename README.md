@@ -362,7 +362,10 @@ only that call. Provider names are not selectors: if “save in Mealie” matche
 zero or several connections, ask for one exact connection instead of choosing
 by order. Cross-library search requires an explicit list of exact IDs. Its
 continuation cursor is a map keyed by those IDs, so one provider's cursor is
-never sent to another connection.
+never sent to another connection. Treat every returned cursor as opaque and
+return it unchanged; the service binds it to the exact library and preserves
+provider page size plus any partially consumed page while favorite and cooldown
+filters fill a result page.
 
 `base_url` is one credential-free origin. HTTPS is the default; loopback HTTP
 is allowed for local hosting. Any other HTTP origin requires the setup helper's
@@ -391,10 +394,14 @@ hidden credential prompt. The adapter supports Mealie `3.24.0` and newer when
 the probed response schemas remain compatible. Its read-only connection test
 checks `/api/app/about`, authenticated `/api/users/self`, one bounded recipe
 list page and the favorite-read response shape. It reports `search`, `get`,
-`create_from_discovery`, `reconcile_create` and `favorite_read`; it never
-reports update, archive, delete or favorite-write capabilities. A configured
-`read_only` connection retains search/get and favorite reporting but suppresses
-create/reconcile and cannot be selected as a writable primary.
+`create_from_discovery`, `reconcile_create`, `favorite_read`,
+`favorite_write_desired_state` and `favorite_reconcile`. Native favorite writes
+use Mealie's exact recipe UUID add/remove routes, then read the exact native
+state back. Mealie exposes no ETag or favorite revision for these routes, so
+`favorite_conditional_write` is false and `expected_favorite_revision` is
+rejected before dispatch. A configured `read_only` connection retains
+search/get and native favorite reads but reports no create or favorite-write
+capability and cannot be selected as a writable primary.
 
 Mealie search is paginated and returns the immutable provider UUID in the
 namespaced `library_recipe_ref`; the current slug is display-only
@@ -417,6 +424,16 @@ surface without retaining a token, user/household identity, private recipe or
 internal hostname. Optional live coverage runs only when an operator explicitly
 supplies a test connection; it creates one uniquely marked recipe and removes
 only the exact confirmed or reconciled provider UUID.
+
+Mealie search and get include the authenticated account's current native
+`is_favorite`; `favorites_only=true` is accepted because the connection reports
+`favorite_read`. Meal Planner serializes its own desired-state writes for a
+connection, reads before dispatch to avoid a redundant add/remove, and reads
+back afterward. This prevents conflicting Meal Planner calls from racing each
+other, but it does not detect an out-of-band change without a provider
+conditional token. A lost response is never followed by another write: an
+exact authenticated read may confirm the desired state because Mealie reports
+`favorite_reconcile`; otherwise the operation remains `uncertain`.
 
 For RecipeSage, configure the API origin: `https://api.recipesage.com` for the
 hosted service or, for the official self-host proxy, the site origin such as
@@ -446,8 +463,11 @@ lists at most one private recipe. It reports only `search`, `get`,
 `create_from_discovery` and `reconcile_create`; a configured `read_only`
 connection retains search/get, suppresses create/reconcile and cannot be the
 writable primary. RecipeSage rating is not treated as a favorite. Native
-favorite mutation, conditional update, archive and delete are not reported or
-emulated.
+favorite read, desired-state mutation, conditional favorite write and favorite
+reconciliation are all false for the verified v4.0.6 hosted contract. Rating,
+labels, folders and local shadow metadata are never used to emulate that
+missing boolean, so `set_favorite` fails before any RecipeSage dispatch.
+Conditional update, archive and delete are likewise not reported or emulated.
 
 Private list/search uses the current account only. The authenticated `getMe`
 UUID is cached for the connection, and every list, search, exact-get, create
@@ -530,12 +550,15 @@ Built-in recipe favorites are separate local metadata for the exact logical
 `(library_id="builtin", recipe_id)` and never alter recipe content, revisions,
 source, rights or attribution. Search and get return `library_id`,
 `is_favorite` and `favorite_revision`; `favorites_only=true` is an additional
-built-in search filter, so query, archive, cooldown, diet and other eligibility
-rules still apply. Archiving or updating a recipe preserves its mark. An
+filter, so query, archive, cooldown, diet and other eligibility rules still
+apply. Archiving or updating a built-in recipe preserves its mark. An
 archived favorite is visible only with `include_archived=true`, which allows it
 to be inspected or unfavorited. Permanent deletion removes the mark, and a
-later import with a new recipe ID begins unfavorited. External-library copies
-have independent identities and no built-in favorite state. A favorite mark
+later import with a new recipe ID begins unfavorited. External libraries expose
+`is_favorite` and accept `favorites_only` only when that exact connection
+reports `favorite_read`. Each external copy has independent provider-native
+state; favorites are not transferred, synchronized or recreated across
+libraries. A favorite mark
 never means cooked, repeat now, add to cart, or bypass any menu or rights rule.
 Conditional writes compare `expected_favorite_revision` with the current value
 before evaluating the desired state. An already-current desired state is an
@@ -543,6 +566,17 @@ idempotent observation, not a state-changing write, and does not consume or
 increment that revision. Thus competing state-changing writes from one
 revision conflict after the first commit, while a completed no-op leaves a
 later real change with that still-current expected revision valid.
+
+External `set_favorite` uses the exact supplied `library_recipe_ref` and one
+stable idempotency key. It never re-resolves the current primary, toggles, or
+falls back to another library. Read-only and capability-false targets fail
+before mutation. Reusing a key with another target or desired state fails.
+Mealie returns confirmed native state without inventing a favorite revision;
+an external missing recipe returns `external_missing`, and a possibly
+dispatched write without authoritative confirmation remains target-bound
+`uncertain`. Favorite changes never alter an active menu or order snapshot,
+and ordinary weekly planning remains unchanged unless favorites are explicitly
+requested.
 
 Source URLs must be credential-free HTTPS. Query strings and fragments are
 discarded before persistence. Original Oda or MENY recipe text is stored only
@@ -584,12 +618,16 @@ document. Repeating a confirmed save returns the exact originally bound recipe
 ID and revision even after cleanup or a later explicit recipe update.
 
 To favorite one unambiguously selected unsaved discovery, Hermes first saves
-its exact `discovery_ref` to `builtin` with a stable save idempotency key, then
+its exact `discovery_ref` to the resolved destination with a stable save
+idempotency key, then
 calls `set_favorite(true)` on the exact returned `library_recipe_ref` with a
 separate stable favorite key. It asks one short clarification before either
-stage when “this” is ambiguous. If only the save succeeds, Hermes reports
-exactly `saved in builtin; favorite not set`; if the second outcome cannot be
-known, it reports `favorite outcome uncertain`. A retry reuses the same bound
+stage when “this” is ambiguous. If only a built-in save succeeds, Hermes reports
+exactly `saved in builtin; favorite not set`; for an external save it reports
+the exact saved library and that the favorite was not set. If that target has
+no native favorite write, it also says that this library does not support
+favorite mutation; it never falls back. If the second outcome cannot be known,
+it reports `favorite outcome uncertain`. A retry reuses the same bound
 ref and both keys: it never repeats discovery, guesses by name, creates a
 duplicate, deletes the saved recipe or rolls either stage back destructively.
 
@@ -684,14 +722,17 @@ requests, in a safe order, are:
 - “Discover vegetarian dinners,” “search my recipe bank,” “favorite this
   recipe,” “list my favorite recipes,” “plan next week from favorite recipes,”
   “save this family recipe,” “scale that recipe to six portions,” or “archive
-  recipe …”. Favorite planning uses explicit built-in `favorites_only`; search
-  still excludes archived, ineligible or cooling-down recipes unless the user
-  explicitly requests the existing supported override.
+  recipe …”. Favorite planning uses explicit `favorites_only` on the selected
+  exact recipe library; search still excludes archived, ineligible or
+  cooling-down recipes unless the user explicitly requests the existing
+  supported override. External favorite reads and writes run only when that
+  connection advertises the corresponding native capability.
 - “Save this product as a favorite” or “Add this every two weeks,” using an
   exact product returned by search.
 - “List favorite products” uses the local provider-bound product-favorites tool
-  and never changes the cart. Recipe favorites use the separate built-in recipe
-  capability; never store a recipe through the product tool. If
+  and never changes the cart. Recipe favorites use the separate selected
+  recipe-library capability and an exact `library_recipe_ref`; never store a
+  recipe through the product tool. If
   one displayed product and one displayed recipe have the same name and the
   request is genuinely ambiguous, ask one short clarification.
 - “Schedule a weekly Thursday draft,” or explicitly configure a guarded

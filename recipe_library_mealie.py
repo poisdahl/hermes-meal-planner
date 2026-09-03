@@ -18,6 +18,7 @@ from recipe_libraries import (
     RecipeLibraryAdapter,
     RecipeLibraryDefiniteError,
     RecipeLibraryError,
+    RecipeLibraryExternalMissingError,
     RecipeLibraryUncertainError,
     normalize_library_origin,
     reject_authenticated_redirect,
@@ -134,6 +135,8 @@ class MealieAdapter(RecipeLibraryAdapter):
         self._authorization = f"Bearer {token}"
         self._timeout = float(timeout)
         self._opener = opener or build_opener(_NoRedirects())
+        self._favorite_read = False
+        self._favorite_user_id: str | None = None
 
     def _request(
         self,
@@ -235,6 +238,7 @@ class MealieAdapter(RecipeLibraryAdapter):
             user = self._request("GET", "/api/users/self")
             if not isinstance(user, Mapping):
                 raise RecipeLibraryError("Mealie authenticated-user probe is incompatible")
+            favorite_user_id = _provider_id(user.get("id"))
             page = self._request(
                 "GET", "/api/recipes", query=[("page", "1"), ("perPage", "1")]
             )
@@ -242,8 +246,7 @@ class MealieAdapter(RecipeLibraryAdapter):
             favorite_read = True
             try:
                 favorites = self._request("GET", "/api/users/self/favorites")
-                if not isinstance(favorites, Mapping) or not isinstance(favorites.get("ratings"), list):
-                    raise RecipeLibraryError("Mealie favorite probe is incompatible")
+                self._favorite_ids(favorites)
             except _MealieHTTPStatus as exc:
                 if exc.status == 404:
                     favorite_read = False
@@ -264,9 +267,13 @@ class MealieAdapter(RecipeLibraryAdapter):
             for name in CAPABILITY_NAMES
         }
         capabilities["favorite_read"] = favorite_read
+        capabilities["favorite_write_desired_state"] = favorite_read and not self.read_only
+        capabilities["favorite_reconcile"] = favorite_read
         if self.read_only:
             capabilities["create_from_discovery"] = False
             capabilities["reconcile_create"] = False
+        self._favorite_read = favorite_read
+        self._favorite_user_id = favorite_user_id
         return {
             "provider": "mealie",
             "server_version": version,
@@ -367,13 +374,71 @@ class MealieAdapter(RecipeLibraryAdapter):
             result["provider_slug"] = _text(value.get("slug"), "recipe slug", 300)
         return result
 
+    @staticmethod
+    def _favorite_ids(value: Any) -> set[str]:
+        if not isinstance(value, Mapping) or not isinstance(value.get("ratings"), list):
+            raise RecipeLibraryError("Mealie favorite response is incompatible")
+        result: set[str] = set()
+        for rating in value["ratings"]:
+            if not isinstance(rating, Mapping) or rating.get("isFavorite") is not True:
+                raise RecipeLibraryError("Mealie favorite response is incompatible")
+            recipe_id = _provider_id(rating.get("recipeId"))
+            if recipe_id in result:
+                raise RecipeLibraryError("Mealie favorite response is incompatible")
+            result.add(recipe_id)
+        return result
+
+    @staticmethod
+    def _favorite_rating(value: Any, recipe_id: str) -> bool:
+        if (
+            not isinstance(value, Mapping)
+            or _provider_id(value.get("recipeId")) != recipe_id
+            or not isinstance(value.get("isFavorite"), bool)
+        ):
+            raise RecipeLibraryError("Mealie favorite response is incompatible")
+        return value["isFavorite"]
+
+    def _exact_favorite_state(self, recipe_id: str, *, recipe_exists: bool) -> bool:
+        if not self._favorite_read:
+            raise RecipeLibraryDefiniteError("Mealie favorite reads are unsupported")
+        if not recipe_exists:
+            self._get_raw(recipe_id)
+        try:
+            rating = self._request(
+                "GET", f"/api/users/self/ratings/{quote(recipe_id, safe='')}"
+            )
+        except _MealieHTTPStatus as exc:
+            if exc.status == 404:
+                # The rating endpoint uses the same 404 for "unrated" and for a
+                # recipe deleted between the exact recipe read and this call.
+                # Recheck existence before treating the state as native false.
+                self._get_raw(recipe_id)
+                return False
+            if exc.status in {401, 403}:
+                raise RecipeLibraryError("Mealie favorite read needs_auth") from None
+            if exc.status == 429:
+                raise RecipeLibraryError("Mealie favorite read was rate limited") from None
+            raise RecipeLibraryError("Mealie favorite read failed") from None
+        except _MealieTransportFailure:
+            raise RecipeLibraryError("Mealie favorite read is unavailable") from None
+        return self._favorite_rating(rating, recipe_id)
+
     def search(
         self, query: str, filters: Mapping[str, Any], cursor: str | None, limit: int
     ) -> Mapping[str, Any]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
             raise RecipeLibraryError("Mealie search limit is invalid")
+        if not isinstance(filters, Mapping):
+            raise RecipeLibraryError("Mealie search filters are invalid")
+        favorites_only = filters.get("favorites_only", False)
+        if not isinstance(favorites_only, bool):
+            raise RecipeLibraryError("Mealie favorites_only filter is invalid")
+        if favorites_only and not self._favorite_read:
+            raise RecipeLibraryDefiniteError("Mealie favorite reads are unsupported")
+        provider_filters = dict(filters)
+        provider_filters.pop("favorites_only", None)
         page_number = self._cursor(cursor)
-        parameters = self._search_query(query, filters, page_number, limit)
+        parameters = self._search_query(query, provider_filters, page_number, limit)
         try:
             raw = self._request("GET", "/api/recipes", query=parameters)
             items, returned_page, _total, total_pages = self._page(
@@ -382,6 +447,16 @@ class MealieAdapter(RecipeLibraryAdapter):
             if returned_page != page_number:
                 raise RecipeLibraryError("Mealie pagination response is incompatible")
             recipes = [self._summary(item) for item in items]
+            if self._favorite_read:
+                favorite_ids = self._favorite_ids(
+                    self._request("GET", "/api/users/self/favorites")
+                )
+                for recipe in recipes:
+                    recipe["is_favorite"] = (
+                        recipe["library_recipe_ref"]["recipe_id"] in favorite_ids
+                    )
+                if favorites_only:
+                    recipes = [recipe for recipe in recipes if recipe["is_favorite"]]
         except RecipeLibraryError:
             raise
         except _MealieHTTPStatus:
@@ -643,7 +718,15 @@ class MealieAdapter(RecipeLibraryAdapter):
     def _get_raw(self, recipe_id: str) -> Mapping[str, Any]:
         try:
             raw = self._request("GET", f"/api/recipes/{quote(recipe_id, safe='')}")
-        except _MealieHTTPStatus:
+        except _MealieHTTPStatus as exc:
+            if exc.status == 404:
+                raise RecipeLibraryExternalMissingError(
+                    "Mealie exact recipe is externally missing"
+                ) from None
+            if exc.status in {401, 403}:
+                raise RecipeLibraryError("Mealie exact recipe get needs_auth") from None
+            if exc.status == 429:
+                raise RecipeLibraryError("Mealie exact recipe get was rate limited") from None
             raise RecipeLibraryError("Mealie exact recipe get failed") from None
         except _MealieTransportFailure:
             raise RecipeLibraryError("Mealie exact recipe get is unavailable") from None
@@ -684,7 +767,78 @@ class MealieAdapter(RecipeLibraryAdapter):
             raise RecipeLibraryError("Mealie recipe reference names the wrong library")
         recipe_id = _provider_id(reference["recipe_id"])
         raw = self._get_raw(recipe_id)
-        return self._result(raw)
+        result = self._result(raw)
+        if self._favorite_read:
+            result["is_favorite"] = self._exact_favorite_state(
+                recipe_id, recipe_exists=True
+            )
+        return result
+
+    def get_favorite(self, library_recipe_ref: Mapping[str, str]) -> Mapping[str, Any]:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if reference["library_id"] != self.library_id:
+            raise RecipeLibraryError("Mealie recipe reference names the wrong library")
+        recipe_id = _provider_id(reference["recipe_id"])
+        raw = self._get_raw(recipe_id)
+        current = self._exact_favorite_state(recipe_id, recipe_exists=True)
+        return {
+            "library_id": self.library_id,
+            "library_recipe_ref": self._reference(raw),
+            "is_favorite": current,
+        }
+
+    def set_favorite(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        is_favorite: bool,
+        *,
+        expected_favorite_revision: Any = None,
+    ) -> None:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if reference["library_id"] != self.library_id:
+            raise RecipeLibraryDefiniteError(
+                "Mealie recipe reference names the wrong library"
+            )
+        if not isinstance(is_favorite, bool):
+            raise RecipeLibraryDefiniteError("Mealie favorite state is invalid")
+        if expected_favorite_revision is not None:
+            raise RecipeLibraryDefiniteError(
+                "Mealie does not support conditional favorite mutation"
+            )
+        if self.read_only:
+            raise RecipeLibraryDefiniteError("Mealie connection is read-only")
+        if not self._favorite_read or self._favorite_user_id is None:
+            raise RecipeLibraryDefiniteError(
+                "Mealie favorite mutation capability is unverified"
+            )
+        recipe_id = _provider_id(reference["recipe_id"])
+        path = (
+            f"/api/users/{quote(self._favorite_user_id, safe='')}/favorites/"
+            f"{quote(recipe_id, safe='')}"
+        )
+        try:
+            self._request(
+                "POST" if is_favorite else "DELETE", path, expected=(200, 204)
+            )
+        except _MealieHTTPStatus as exc:
+            if exc.status == 404:
+                raise RecipeLibraryExternalMissingError(
+                    "Mealie exact recipe is externally missing"
+                ) from None
+            if 400 <= exc.status < 500 and exc.status != 408:
+                message = (
+                    "Mealie favorite mutation needs_auth"
+                    if exc.status in {401, 403}
+                    else "Mealie rejected favorite mutation"
+                )
+                raise RecipeLibraryDefiniteError(message) from None
+            raise RecipeLibraryUncertainError(
+                "Mealie favorite mutation outcome is uncertain"
+            ) from None
+        except (_MealieTransportFailure, RecipeLibraryError):
+            raise RecipeLibraryUncertainError(
+                "Mealie favorite mutation outcome is uncertain"
+            ) from None
 
     @staticmethod
     def _definite_initial_failure(exc: Exception) -> bool:

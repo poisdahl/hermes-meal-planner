@@ -7,7 +7,7 @@
     "selfhost_verified_version": "v4.0.3",
     "selfhost_release_commit": "d7e81d3a4c7033b96552abc60494a0e17e0cbbbc",
     "selfhost_config_version": "2026-08-16",
-    "captured_at": "2026-09-03T20:32:22Z",
+    "captured_at": "2026-09-03T23:19:44Z",
     "hosted_schema_source": "https://api.recipesage.com/openapi.json",
     "stable_schema_source": "RecipeSage v4.0.3 and v4.0.6 tags plus RecipeSage-selfhost config 2026-08-16",
     "schema_evidence": "Exact selected request and response schemas captured from the official hosted OpenAPI; the official self-host image reports version selfhost, so runtime support additionally requires this same schema fingerprint.",
@@ -17,6 +17,13 @@
   "terms": {
     "hosted_api": "Personal, non-commercial use only; broader rights are not implied.",
     "selfhost": "Use follows the configured instance and RecipeSage license."
+  },
+  "favorite_capabilities": {
+    "favorite_read": false,
+    "favorite_write_desired_state": false,
+    "favorite_conditional_write": false,
+    "favorite_reconcile": false,
+    "evidence": "The verified v4.0.6 hosted OpenAPI has rating and label fields but no native private-recipe boolean favorite read or mutation operation; neither is used as an emulation."
   },
   "endpoints": {
     "openapi": "GET /openapi.json (hosted) or GET /api/openapi.json (official self-host proxy)",

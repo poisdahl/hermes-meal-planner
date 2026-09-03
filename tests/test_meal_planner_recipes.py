@@ -33,6 +33,8 @@ from recipe_libraries import (  # noqa: E402
     RecipeLibraryAdapter,
     RecipeLibraryDefiniteError,
     RecipeLibraryError,
+    RecipeLibraryExternalMissingError,
+    RecipeLibraryFavoriteConflictError,
     RecipeLibraryUncertainError,
     library_recipe_key,
     load_library_secret,
@@ -210,6 +212,11 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         read_only: bool = False,
         create_mode: str = "confirmed",
         reconcile: bool = False,
+        favorite_state: bool | None = None,
+        favorite_set_mode: str = "confirmed",
+        favorite_reconcile: bool = True,
+        favorite_conditional: bool = False,
+        favorite_revision: int | str = 0,
     ):
         self.library_id = library_id
         self.recipe = deepcopy(recipe)
@@ -217,11 +224,18 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         self.read_only = read_only
         self.create_mode = create_mode
         self.reconcile_enabled = reconcile
+        self.favorite_state = favorite_state
+        self.favorite_set_mode = favorite_set_mode
+        self.favorite_reconcile_enabled = favorite_reconcile
+        self.favorite_conditional = favorite_conditional
+        self.favorite_revision = favorite_revision
         self.search_calls = 0
         self.search_cursors = []
         self.get_calls = 0
         self.create_calls = 0
         self.reconcile_calls = 0
+        self.favorite_read_calls = 0
+        self.favorite_write_calls = 0
         self.outbound = None
         self.operation = None
         self.reference = {
@@ -231,7 +245,7 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         }
 
     def capabilities(self):
-        return {
+        capabilities = {
             "provider": self.provider,
             "server_version": "2026.9",
             "read_only": self.read_only,
@@ -243,23 +257,52 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
                 for name in CAPABILITY_NAMES
             },
         }
+        capabilities["favorite_read"] = self.favorite_state is not None
+        capabilities["favorite_write_desired_state"] = (
+            self.favorite_state is not None and not self.read_only
+        )
+        capabilities["favorite_conditional_write"] = (
+            self.favorite_state is not None
+            and self.favorite_conditional
+            and not self.read_only
+        )
+        capabilities["favorite_reconcile"] = (
+            self.favorite_state is not None and self.favorite_reconcile_enabled
+        )
+        return capabilities
 
     def search(self, query, filters, cursor, limit):
         self.search_calls += 1
         self.search_cursors.append(cursor)
-        return {
-            "recipes": [{
+        item = {
                 "name": self.recipe["name"],
                 "tags": self.recipe["tags"],
                 "source": self.recipe["source"],
                 "library_recipe_ref": self.reference,
-            }],
+            }
+        if self.favorite_state is not None:
+            item["is_favorite"] = self.favorite_state
+            if self.favorite_conditional:
+                item["favorite_revision"] = self.favorite_revision
+        recipes = [item] if cursor is None else []
+        if filters.get("favorites_only") and self.favorite_state is not True:
+            recipes = []
+        return {
+            "recipes": recipes,
             "cursor": f"next-{self.library_id}" if cursor is None else None,
         }
 
     def get(self, reference):
         self.get_calls += 1
-        return {**deepcopy(self.recipe), "library_recipe_ref": deepcopy(self.reference)}
+        result = {
+            **deepcopy(self.recipe),
+            "library_recipe_ref": deepcopy(self.reference),
+        }
+        if self.favorite_state is not None:
+            result["is_favorite"] = self.favorite_state
+            if self.favorite_conditional:
+                result["favorite_revision"] = self.favorite_revision
+        return result
 
     def create_from_snapshot(self, snapshot, operation):
         self.create_calls += 1
@@ -280,6 +323,48 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         if not self.reconcile_enabled:
             return None
         return {"library_recipe_ref": deepcopy(self.reference), "recipe": deepcopy(snapshot)}
+
+    def get_favorite(self, reference):
+        self.favorite_read_calls += 1
+        if self.favorite_set_mode == "missing":
+            raise RecipeLibraryExternalMissingError("secret missing detail")
+        if self.favorite_set_mode == "read_unavailable":
+            raise RecipeLibraryError("secret provider read detail")
+        result = {
+            "library_id": self.library_id,
+            "library_recipe_ref": deepcopy(self.reference),
+            "is_favorite": self.favorite_state,
+        }
+        if self.favorite_conditional:
+            result["favorite_revision"] = self.favorite_revision
+        return result
+
+    def set_favorite(
+        self, reference, is_favorite, *, expected_favorite_revision=None
+    ):
+        self.favorite_write_calls += 1
+        if self.favorite_set_mode == "definite":
+            raise RecipeLibraryDefiniteError("secret provider rejection detail")
+        if self.favorite_set_mode == "missing":
+            raise RecipeLibraryExternalMissingError("secret missing detail")
+        if self.favorite_set_mode == "uncertain_before_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        if self.favorite_set_mode == "conditional_conflict":
+            raise RecipeLibraryFavoriteConflictError("favorite revision conflict")
+        if (
+            self.favorite_conditional
+            and expected_favorite_revision is not None
+            and expected_favorite_revision != self.favorite_revision
+        ):
+            raise RecipeLibraryDefiniteError("favorite revision conflict")
+        self.favorite_state = is_favorite
+        if self.favorite_conditional:
+            if isinstance(self.favorite_revision, int):
+                self.favorite_revision += 1
+            else:
+                self.favorite_revision = f"{self.favorite_revision}-next"
+        if self.favorite_set_mode == "uncertain_after_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
 
 
 class RecipeStoreTests(unittest.TestCase):
@@ -2669,12 +2754,20 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertEqual(cross["errors"], {"other-mealie": "recipe library search is unavailable"})
         self.assertNotIn("secret provider failure", canonical(cross))
         self.assertNotIn("base_url", canonical(listed))
-        with self.assertRaisesRegex(HouseholdError, "only for the builtin"):
-            app.handle({
-                "operation": "recipes", "action": "search",
-                "library_ids": ["builtin", "family-mealie"],
-                "favorites_only": True,
-            })
+        favorite_filtered = app.handle({
+            "operation": "recipes", "action": "search",
+            "library_ids": ["builtin", "family-mealie"],
+            "favorites_only": True,
+            "include_ineligible": True,
+        })
+        self.assertEqual(
+            [item["library_recipe_ref"]["library_id"] for item in favorite_filtered["recipes"]],
+            ["builtin"],
+        )
+        self.assertEqual(
+            favorite_filtered["errors"],
+            {"family-mealie": "recipe library search is unavailable"},
+        )
 
     def test_builtin_favorites_filter_without_changing_normal_discovery_or_menu(self):
         favorite = self.save_bank_recipe("Stable favorite", "stable-favorite")
@@ -2765,6 +2858,31 @@ class RecipeFlowTests(unittest.TestCase):
             "expected_favorite_revision": 1, "idempotency_key": "service-unfavorite",
         })
         self.assertEqual((removed["is_favorite"], removed["favorite_revision"]), (False, 2))
+
+    def test_cross_library_builtin_favorites_fill_after_cooldown_filtering(self):
+        older = self.save_bank_recipe("Cross filtered older", "cross-filtered-older")
+        newer = self.save_bank_recipe("Cross filtered newer", "cross-filtered-newer")
+        for recipe, key in (
+            (older, "favorite-cross-older"),
+            (newer, "favorite-cross-newer"),
+        ):
+            self.app.handle({
+                "operation": "recipes", "action": "set_favorite",
+                "library_recipe_ref": recipe["library_recipe_ref"],
+                "is_favorite": True, "idempotency_key": key,
+            })
+        self.app.handle({
+            "operation": "recipes", "action": "mark_cooked",
+            "recipe_id": newer["id"], "week": "2026-W49",
+            "idempotency_key": "cooked-cross-newer",
+        })
+        result = self.app.handle({
+            "operation": "recipes", "action": "search",
+            "library_ids": ["builtin"], "query": "Cross filtered",
+            "favorites_only": True, "week": "2026-W50", "limit": 1,
+        })
+        self.assertEqual([item["id"] for item in result["recipes"]], [older["id"]])
+        self.assertTrue(result["recipes"][0]["usage"]["eligible"])
 
     def test_link_only_favorite_stays_inspectable_but_not_menu_eligible(self):
         link_only = {
@@ -2964,10 +3082,12 @@ class RecipeFlowTests(unittest.TestCase):
             "operation": "recipes", "action": "search",
             "library_ids": ["family-mealie", "other-mealie"],
         })
-        self.assertEqual(page["cursors"], {
-            "family-mealie": "next-family-mealie",
-            "other-mealie": "next-other-mealie",
-        })
+        self.assertEqual(set(page["cursors"]), {"family-mealie", "other-mealie"})
+        self.assertTrue(all(
+            isinstance(cursor, str)
+            and cursor.startswith("library-search:v1:")
+            for cursor in page["cursors"].values()
+        ))
         app.handle({
             "operation": "recipes", "action": "search",
             "library_ids": ["family-mealie", "other-mealie"],
@@ -3011,7 +3131,9 @@ class RecipeFlowTests(unittest.TestCase):
                 },
             ],
         }
-        adapter = SyntheticLibraryAdapter("family-mealie", shared)
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", shared, favorite_state=False
+        )
         app = Application(
             StateStore(Path(self.temp.name) / "independent-favorites", settings),
             self.oda, self.browser, recipe_library_adapters={"family-mealie": adapter},
@@ -3034,18 +3156,499 @@ class RecipeFlowTests(unittest.TestCase):
         by_library = {item["library_recipe_ref"]["library_id"]: item for item in cross}
         self.assertEqual(set(by_library), {"builtin", "family-mealie"})
         self.assertTrue(by_library["builtin"]["is_favorite"])
-        self.assertNotIn("is_favorite", by_library["family-mealie"])
+        self.assertFalse(by_library["family-mealie"]["is_favorite"])
+        with self.assertRaisesRegex(RecipeError, "different content"):
+            app.handle({
+                "operation": "recipes", "action": "set_favorite",
+                "library_recipe_ref": adapter.reference, "is_favorite": False,
+                "idempotency_key": "favorite-shared-builtin",
+            })
         external = app.handle({
             "operation": "recipes", "action": "get",
             "library_recipe_ref": adapter.reference,
         })["recipe"]
-        self.assertNotIn("is_favorite", external)
-        with self.assertRaisesRegex(HouseholdError, "only for the builtin"):
+        self.assertFalse(external["is_favorite"])
+        marked = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference, "is_favorite": True,
+            "idempotency_key": "favorite-shared-external",
+        })
+        self.assertEqual(marked["status"], "confirmed")
+        self.assertTrue(marked["is_favorite"])
+        self.assertEqual(adapter.favorite_write_calls, 1)
+        self.assertTrue(app.recipes.get(builtin["id"])["is_favorite"])
+        with self.assertRaisesRegex(RecipeError, "different content"):
             app.handle({
                 "operation": "recipes", "action": "set_favorite",
-                "library_recipe_ref": adapter.reference, "is_favorite": True,
+                "library_recipe_ref": builtin["library_recipe_ref"],
+                "is_favorite": False,
                 "idempotency_key": "favorite-shared-external",
             })
+
+    def test_external_favorite_capability_false_read_only_and_conditional_reject_before_write(self):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [
+                {
+                    "library_id": "family-recipesage", "provider": "recipesage",
+                    "base_url": "https://sage.example", "read_only": False,
+                },
+                {
+                    "library_id": "readonly-mealie", "provider": "mealie",
+                    "base_url": "https://readonly.example", "read_only": True,
+                },
+                {
+                    "library_id": "family-mealie", "provider": "mealie",
+                    "base_url": "https://recipes.example", "read_only": False,
+                },
+            ],
+        }
+        recipe = full_recipe("Favorite capability gates")
+        recipesage = SyntheticLibraryAdapter(
+            "family-recipesage", recipe, provider="recipesage"
+        )
+        readonly = SyntheticLibraryAdapter(
+            "readonly-mealie", recipe, read_only=True, favorite_state=True
+        )
+        mealie = SyntheticLibraryAdapter(
+            "family-mealie", recipe, favorite_state=False
+        )
+        app = Application(
+            StateStore(Path(self.temp.name) / "favorite-capability-gates", settings),
+            self.oda, self.browser,
+            recipe_library_adapters={
+                "family-recipesage": recipesage,
+                "readonly-mealie": readonly,
+                "family-mealie": mealie,
+            },
+        )
+        unsupported = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": recipesage.reference, "is_favorite": True,
+            "idempotency_key": "recipesage-favorite-unsupported",
+        })
+        self.assertEqual(
+            (unsupported["status"], unsupported["error_code"]),
+            ("failed", "unsupported"),
+        )
+        self.assertEqual(recipesage.favorite_write_calls, 0)
+
+        read = app.handle({
+            "operation": "recipes", "action": "search",
+            "library_id": "readonly-mealie", "favorites_only": True,
+        })
+        self.assertEqual(
+            (read["recipes"][0]["library_id"], read["recipes"][0]["is_favorite"]),
+            ("readonly-mealie", True),
+        )
+        exact = app.handle({
+            "operation": "recipes", "action": "get",
+            "library_recipe_ref": readonly.reference,
+        })["recipe"]
+        self.assertEqual(
+            (exact["library_id"], exact["is_favorite"]),
+            ("readonly-mealie", True),
+        )
+        rejected = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": readonly.reference, "is_favorite": False,
+            "idempotency_key": "readonly-favorite-unsupported",
+        })
+        self.assertEqual((rejected["status"], rejected["error_code"]), ("failed", "unsupported"))
+        self.assertEqual(readonly.favorite_write_calls, 0)
+
+        conditional = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": mealie.reference, "is_favorite": True,
+            "expected_favorite_revision": "etag-v1",
+            "idempotency_key": "mealie-conditional-unsupported",
+        })
+        self.assertEqual(
+            (conditional["status"], conditional["error_code"]),
+            ("failed", "conditional_unsupported"),
+        )
+        self.assertEqual(mealie.favorite_read_calls, 0)
+        self.assertEqual(mealie.favorite_write_calls, 0)
+
+    def test_external_favorite_idempotency_serialization_drift_and_missing(self):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [{
+                "library_id": "family-mealie", "provider": "mealie",
+                "base_url": "https://recipes.example", "read_only": False,
+            }],
+        }
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Serialized favorite"),
+            favorite_state=False,
+        )
+        app = Application(
+            StateStore(Path(self.temp.name) / "favorite-serialization", settings),
+            self.oda, self.browser,
+            recipe_library_adapters={"family-mealie": adapter},
+        )
+        barrier = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def mark(key):
+            try:
+                barrier.wait()
+                results.append(app.handle({
+                    "operation": "recipes", "action": "set_favorite",
+                    "library_recipe_ref": adapter.reference,
+                    "is_favorite": True, "idempotency_key": key,
+                }))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=mark, args=("favorite-concurrent-one",)),
+            threading.Thread(target=mark, args=("favorite-concurrent-two",)),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual({result["status"] for result in results}, {"confirmed"})
+        self.assertEqual(adapter.favorite_write_calls, 1)
+        self.assertEqual(sum(result.get("idempotent", False) for result in results), 1)
+
+        repeated = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference,
+            "is_favorite": True, "idempotency_key": "favorite-concurrent-one",
+        })
+        self.assertEqual(repeated, next(
+            result for result in results
+            if result["operation_id"] == repeated["operation_id"]
+        ))
+        with self.assertRaisesRegex(RecipeError, "another library operation"):
+            app.handle({
+                "operation": "recipes", "action": "set_favorite",
+                "library_recipe_ref": adapter.reference,
+                "is_favorite": False, "idempotency_key": "favorite-concurrent-one",
+            })
+
+        adapter.favorite_state = False
+        drifted = app.handle({
+            "operation": "recipes", "action": "get",
+            "library_recipe_ref": adapter.reference,
+        })["recipe"]
+        self.assertFalse(drifted["is_favorite"])
+
+        adapter.favorite_set_mode = "missing"
+        missing = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference,
+            "is_favorite": True, "idempotency_key": "favorite-now-missing",
+        })
+        self.assertEqual((missing["status"], missing["error_code"]), ("failed", "external_missing"))
+
+    def test_external_favorite_search_applies_cooldown_and_fills_filtered_page(self):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [{
+                "library_id": "family-mealie", "provider": "mealie",
+                "base_url": "https://recipes.example", "read_only": True,
+            }],
+        }
+
+        class PagedFavoriteAdapter(SyntheticLibraryAdapter):
+            def __init__(self):
+                super().__init__(
+                    "family-mealie", full_recipe("Paged favorite"),
+                    read_only=True, favorite_state=True,
+                )
+                self.references = [
+                    {**self.reference, "recipe_id": "blocked-favorite"},
+                    {**self.reference, "recipe_id": "eligible-favorite-one"},
+                    {**self.reference, "recipe_id": "eligible-favorite-two"},
+                    {**self.reference, "recipe_id": "eligible-favorite-three"},
+                ]
+                self.search_limits = []
+
+            def search(self, query, filters, cursor, limit):
+                self.search_calls += 1
+                self.search_cursors.append(cursor)
+                self.search_limits.append(limit)
+                page = 1 if cursor is None else int(cursor.removeprefix("page:"))
+                start = (page - 1) * limit
+                references = self.references[start : start + limit]
+                return {
+                    "recipes": [{
+                        "name": f"Favorite {reference['recipe_id']}",
+                        "tags": self.recipe["tags"],
+                        "source": self.recipe["source"],
+                        "library_recipe_ref": reference,
+                        "is_favorite": True,
+                    } for reference in references],
+                    "cursor": (
+                        f"page:{page + 1}"
+                        if start + len(references) < len(self.references)
+                        else None
+                    ),
+                }
+
+        adapter = PagedFavoriteAdapter()
+        app = Application(
+            StateStore(Path(self.temp.name) / "favorite-search-cooldown", settings),
+            self.oda, self.browser,
+            recipe_library_adapters={"family-mealie": adapter},
+        )
+        app.handle({
+            "operation": "recipes", "action": "mark_cooked",
+            "recipe_key": library_recipe_key(adapter.references[0]),
+            "week": "2026-W49", "idempotency_key": "cooked-blocked-external",
+        })
+        result = app.handle({
+            "operation": "recipes", "action": "search",
+            "library_id": "family-mealie", "favorites_only": True,
+            "week": "2026-W50", "limit": 2,
+        })
+        self.assertEqual(
+            [item["library_recipe_ref"]["recipe_id"] for item in result["recipes"]],
+            ["eligible-favorite-one", "eligible-favorite-two"],
+        )
+        self.assertTrue(all(item["usage"]["eligible"] for item in result["recipes"]))
+        self.assertEqual(adapter.search_cursors, [None, "page:2"])
+        self.assertEqual(adapter.search_limits, [2, 2])
+        self.assertIsNotNone(result["cursors"]["family-mealie"])
+
+        continued = app.handle({
+            "operation": "recipes", "action": "search",
+            "library_id": "family-mealie", "favorites_only": True,
+            "week": "2026-W50", "limit": 2,
+            "cursor": result["cursors"]["family-mealie"],
+        })
+        self.assertEqual(
+            [item["library_recipe_ref"]["recipe_id"] for item in continued["recipes"]],
+            ["eligible-favorite-three"],
+        )
+        self.assertEqual(adapter.search_cursors, [None, "page:2", "page:2"])
+        self.assertEqual(adapter.search_limits, [2, 2, 2])
+        self.assertIsNone(continued["cursors"]["family-mealie"])
+
+        adapter.search_cursors.clear()
+        adapter.search_limits.clear()
+        blocked = app.handle({
+            "operation": "recipes", "action": "search",
+            "library_id": "family-mealie", "favorites_only": True,
+            "include_ineligible": True, "week": "2026-W50", "limit": 2,
+        })
+        self.assertEqual(
+            blocked["recipes"][0]["library_recipe_ref"]["recipe_id"],
+            "blocked-favorite",
+        )
+        self.assertFalse(blocked["recipes"][0]["usage"]["eligible"])
+        self.assertEqual(adapter.search_cursors, [None])
+        self.assertEqual(adapter.search_limits, [2])
+        self.assertIsNotNone(blocked["cursors"]["family-mealie"])
+
+    def test_external_favorite_lost_response_reconciles_without_repeating_write(self):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [{
+                "library_id": "family-mealie", "provider": "mealie",
+                "base_url": "https://recipes.example", "read_only": False,
+            }],
+        }
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Reconciled favorite"),
+            favorite_state=False, favorite_set_mode="uncertain_after_state",
+        )
+        app = Application(
+            StateStore(Path(self.temp.name) / "favorite-reconcile", settings),
+            self.oda, self.browser,
+            recipe_library_adapters={"family-mealie": adapter},
+        )
+        reconciled = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference,
+            "is_favorite": True, "idempotency_key": "favorite-lost-success",
+        })
+        self.assertEqual(reconciled["status"], "confirmed")
+        self.assertTrue(reconciled["is_favorite"])
+        self.assertTrue(reconciled["reconciled"])
+        self.assertEqual(adapter.favorite_write_calls, 1)
+        repeated = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference,
+            "is_favorite": True, "idempotency_key": "favorite-lost-success",
+        })
+        self.assertEqual(repeated, reconciled)
+        self.assertEqual(adapter.favorite_write_calls, 1)
+
+        unresolved = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Unresolved favorite"),
+            favorite_state=False, favorite_set_mode="uncertain_before_state",
+        )
+        app.recipe_library_adapters["family-mealie"] = unresolved
+        uncertain = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": unresolved.reference,
+            "is_favorite": True, "idempotency_key": "favorite-lost-unresolved",
+        })
+        self.assertEqual(uncertain["status"], "uncertain")
+        retried = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": unresolved.reference,
+            "is_favorite": True, "idempotency_key": "favorite-lost-unresolved",
+        })
+        self.assertEqual(retried["status"], "uncertain")
+        self.assertEqual(unresolved.favorite_write_calls, 1)
+        second_app = Application(
+            StateStore(Path(self.temp.name) / "favorite-reconcile", settings),
+            self.oda, self.browser,
+            recipe_library_adapters={"family-mealie": unresolved},
+        )
+        with self.assertRaisesRegex(RecipeError, "pending or uncertain"):
+            second_app.handle({
+                "operation": "recipes", "action": "set_favorite",
+                "library_recipe_ref": unresolved.reference,
+                "is_favorite": True,
+                "idempotency_key": "favorite-lost-unresolved-new-key",
+            })
+        self.assertEqual(unresolved.favorite_write_calls, 1)
+
+    def test_conditional_external_favorite_has_one_winner_for_one_provider_revision(self):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [{
+                "library_id": "conditional-library", "provider": "mealie",
+                "base_url": "https://conditional.example", "read_only": False,
+            }],
+        }
+        adapter = SyntheticLibraryAdapter(
+            "conditional-library", full_recipe("Conditional favorite"),
+            favorite_state=False, favorite_conditional=True, favorite_revision=4,
+        )
+        app = Application(
+            StateStore(Path(self.temp.name) / "conditional-favorite", settings),
+            self.oda, self.browser,
+            recipe_library_adapters={"conditional-library": adapter},
+        )
+        winner = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference, "is_favorite": True,
+            "expected_favorite_revision": 4,
+            "idempotency_key": "conditional-favorite-winner",
+        })
+        self.assertEqual(winner["status"], "confirmed")
+        self.assertEqual(winner["favorite_revision"], 5)
+        conflict = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference, "is_favorite": False,
+            "expected_favorite_revision": 4,
+            "idempotency_key": "conditional-favorite-conflict",
+        })
+        self.assertEqual(
+            (conflict["status"], conflict["error_code"]),
+            ("failed", "favorite_conflict"),
+        )
+        self.assertEqual(adapter.favorite_write_calls, 1)
+
+        adapter.favorite_set_mode = "conditional_conflict"
+        late_conflict = app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": adapter.reference, "is_favorite": False,
+            "expected_favorite_revision": 5,
+            "idempotency_key": "conditional-favorite-late-conflict",
+        })
+        self.assertEqual(
+            (late_conflict["status"], late_conflict["error_code"]),
+            ("failed", "favorite_conflict"),
+        )
+        self.assertEqual(adapter.favorite_write_calls, 2)
+
+    def test_save_then_external_favorite_stays_on_returned_target_after_restart_and_primary_change(self):
+        directory = Path(self.temp.name) / "favorite-bound-after-restart"
+        base_libraries = [
+            {
+                "library_id": "family-mealie", "provider": "mealie",
+                "base_url": "https://recipes.example", "read_only": False,
+            },
+            {
+                "library_id": "other-mealie", "provider": "mealie",
+                "base_url": "https://other.example", "read_only": False,
+            },
+        ]
+        first = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Bound favorite"), favorite_state=False
+        )
+        second = SyntheticLibraryAdapter(
+            "other-mealie", full_recipe("Bound favorite"), favorite_state=False
+        )
+        first_app = Application(
+            StateStore(directory, {
+                **CONFIG,
+                "primary_recipe_library_id": "family-mealie",
+                "recipe_libraries": base_libraries,
+            }),
+            self.oda, self.browser,
+            recipe_library_adapters={
+                "family-mealie": first, "other-mealie": second,
+            },
+        )
+        discovery = first_app.recipes.persist_discovery(
+            external_recipe("themealdb", "Bound favorite", "bound-favorite")
+        )
+        saved = first_app.handle({
+            "operation": "recipes", "action": "save",
+            "discovery_ref": discovery["discovery_ref"],
+            "idempotency_key": "save-bound-favorite",
+        })
+        self.assertEqual(saved["library_id"], "family-mealie")
+        saved_other = first_app.handle({
+            "operation": "recipes", "action": "save",
+            "library_id": "other-mealie",
+            "discovery_ref": discovery["discovery_ref"],
+            "idempotency_key": "save-bound-favorite-other",
+        })
+        self.assertEqual(saved_other["library_id"], "other-mealie")
+
+        restarted = Application(
+            StateStore(directory, {
+                **CONFIG,
+                "primary_recipe_library_id": "other-mealie",
+                "recipe_libraries": base_libraries,
+            }),
+            self.oda, self.browser,
+            recipe_library_adapters={
+                "family-mealie": first, "other-mealie": second,
+            },
+        )
+        marked = restarted.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": saved["library_recipe_ref"],
+            "is_favorite": True,
+            "idempotency_key": "favorite-bound-after-restart",
+        })
+        self.assertEqual(marked["library_id"], "family-mealie")
+        self.assertTrue(marked["is_favorite"])
+        self.assertEqual(first.favorite_write_calls, 1)
+        self.assertEqual(second.favorite_write_calls, 0)
+        self.assertFalse(second.favorite_state)
+        with self.assertRaisesRegex(RecipeError, "another library operation"):
+            restarted.handle({
+                "operation": "recipes", "action": "set_favorite",
+                "library_recipe_ref": saved_other["library_recipe_ref"],
+                "is_favorite": False,
+                "idempotency_key": "favorite-bound-after-restart",
+            })
+        self.assertEqual(second.favorite_write_calls, 0)
+        first_favorites = restarted.handle({
+            "operation": "recipes", "action": "search",
+            "library_id": "family-mealie", "favorites_only": True,
+        })
+        second_favorites = restarted.handle({
+            "operation": "recipes", "action": "search",
+            "library_id": "other-mealie", "favorites_only": True,
+        })
+        self.assertEqual(len(first_favorites["recipes"]), 1)
+        self.assertEqual(second_favorites["recipes"], [])
 
     def test_corrupt_builtin_bank_does_not_block_healthy_external_read_paths(self):
         directory = Path(self.temp.name) / "corrupt-builtin-external"
@@ -4545,6 +5148,14 @@ class MealieAdapterTests(unittest.TestCase):
         adapter = MealieAdapter(connection or self.connection, self.credential, opener=opener)
         return adapter, opener
 
+    def capability_responses(self):
+        return (
+            (200, self.fixture["app_about"]),
+            (200, self.fixture["authenticated_user"]),
+            (200, self.fixture["recipe_page"]),
+            (200, self.fixture["favorites"]),
+        )
+
     @staticmethod
     def operation(*, operation_id="libop:v1:abcdefghijklmnop"):
         return {
@@ -4606,6 +5217,13 @@ class MealieAdapterTests(unittest.TestCase):
             set(self.fixture["create"]["finalize_response"]),
             set(self.fixture["recipe_get"]),
         )
+        self.assertEqual(self.fixture["favorite_write"]["add_status"], 200)
+        self.assertEqual(self.fixture["favorite_write"]["remove_status"], 200)
+        self.assertIsNone(self.fixture["favorite_write"]["conditional_revision"])
+        self.assertEqual(
+            self.fixture["endpoints"]["favorite_exact_read"],
+            "GET /api/users/self/ratings/{immutable-recipe-id}",
+        )
         adapter, opener = self.adapter(
             (200, self.fixture["app_about"]),
             (200, self.fixture["authenticated_user"]),
@@ -4614,12 +5232,14 @@ class MealieAdapterTests(unittest.TestCase):
         )
         capabilities = adapter.capabilities()
         self.assertEqual(capabilities["server_version"], "v3.24.0")
-        for name in ("search", "get", "create_from_discovery", "reconcile_create", "favorite_read"):
+        for name in (
+            "search", "get", "create_from_discovery", "reconcile_create",
+            "favorite_read", "favorite_write_desired_state", "favorite_reconcile",
+        ):
             self.assertTrue(capabilities[name])
         for name in (
             "conditional_update", "archive_desired_state", "delete",
-            "favorite_write_desired_state", "favorite_conditional_write",
-            "reconcile_archive", "reconcile_delete", "favorite_reconcile",
+            "favorite_conditional_write", "reconcile_archive", "reconcile_delete",
         ):
             self.assertFalse(capabilities[name])
         self.assertEqual([request.method for request, _timeout in opener.requests], ["GET"] * 4)
@@ -4636,8 +5256,12 @@ class MealieAdapterTests(unittest.TestCase):
         checked = library_module.verified_capabilities(adapter, read_only)
         self.assertTrue(checked["search"])
         self.assertTrue(checked["get"])
+        self.assertTrue(checked["favorite_read"])
+        self.assertTrue(checked["favorite_reconcile"])
         self.assertFalse(checked["create_from_discovery"])
         self.assertFalse(checked["reconcile_create"])
+        self.assertFalse(checked["favorite_write_desired_state"])
+        self.assertFalse(checked["favorite_conditional_write"])
 
     def test_incompatible_version_authentication_and_redirects_fail_without_following(self):
         old = {**self.fixture["app_about"], "version": "v3.23.1"}
@@ -4665,6 +5289,102 @@ class MealieAdapterTests(unittest.TestCase):
             adapter.capabilities()
         self.assertEqual(len(opener.requests), 1)
         self.assertNotIn("attacker.invalid", opener.requests[0][0].full_url)
+
+    def test_native_favorite_search_get_desired_write_and_readback_shapes(self):
+        false_rating = {**self.fixture["favorite_exact"], "isFavorite": False}
+        adapter, opener = self.adapter(
+            *self.capability_responses(),
+            (200, self.fixture["recipe_page"]),
+            (200, self.fixture["favorites"]),
+            (200, self.fixture["recipe_get"]),
+            (200, self.fixture["favorite_exact"]),
+            (200, None),
+            (200, None),
+            (200, self.fixture["recipe_get"]),
+            (200, false_rating),
+        )
+        capabilities = adapter.capabilities()
+        self.assertTrue(capabilities["favorite_read"])
+        self.assertTrue(capabilities["favorite_write_desired_state"])
+        self.assertFalse(capabilities["favorite_conditional_write"])
+        self.assertTrue(capabilities["favorite_reconcile"])
+
+        page = adapter.search("vegetable", {"favorites_only": True}, None, 1)
+        self.assertEqual(len(page["recipes"]), 1)
+        self.assertTrue(page["recipes"][0]["is_favorite"])
+        reference = page["recipes"][0]["library_recipe_ref"]
+        recipe = adapter.get(reference)
+        self.assertTrue(recipe["is_favorite"])
+
+        adapter.set_favorite(reference, True)
+        adapter.set_favorite(reference, False)
+        observed = adapter.get_favorite(reference)
+        self.assertFalse(observed["is_favorite"])
+        self.assertNotIn("favorite_revision", observed)
+
+        favorite_requests = [
+            request for request, _timeout in opener.requests
+            if "/favorites/" in request.full_url
+        ]
+        self.assertEqual(
+            [request.method for request in favorite_requests], ["POST", "DELETE"]
+        )
+        for request in favorite_requests:
+            self.assertIn(self.fixture["authenticated_user"]["id"], request.full_url)
+            self.assertIn(self.recipe_id, request.full_url)
+            self.assertNotIn("fixture-vegetable-soup", request.full_url)
+
+    def test_native_favorite_missing_false_and_mutation_failure_classification(self):
+        missing_rating = HTTPError(
+            f"https://recipes.example/api/users/self/ratings/{self.recipe_id}",
+            404, "not rated", {}, None,
+        )
+        adapter, _ = self.adapter(
+            *self.capability_responses(),
+            (200, self.fixture["recipe_get"]),
+            missing_rating,
+            (200, self.fixture["recipe_get"]),
+        )
+        adapter.capabilities()
+        current = adapter.get_favorite({
+            "library_id": "family-mealie", "recipe_id": self.recipe_id,
+        })
+        self.assertFalse(current["is_favorite"])
+
+        disappeared = HTTPError(
+            f"https://recipes.example/api/recipes/{self.recipe_id}",
+            404, "missing", {}, None,
+        )
+        adapter, _ = self.adapter(
+            *self.capability_responses(),
+            (200, self.fixture["recipe_get"]),
+            missing_rating,
+            disappeared,
+        )
+        adapter.capabilities()
+        with self.assertRaises(RecipeLibraryExternalMissingError):
+            adapter.get_favorite({
+                "library_id": "family-mealie", "recipe_id": self.recipe_id,
+            })
+
+        for response, exception in (
+            (
+                HTTPError("https://recipes.example/api/users/x/favorites/y", 422, "bad", {}, None),
+                RecipeLibraryDefiniteError,
+            ),
+            (
+                HTTPError("https://recipes.example/api/users/x/favorites/y", 404, "missing", {}, None),
+                RecipeLibraryExternalMissingError,
+            ),
+            (URLError("timeout"), RecipeLibraryUncertainError),
+        ):
+            with self.subTest(exception=exception.__name__):
+                adapter, _ = self.adapter(*self.capability_responses(), response)
+                adapter.capabilities()
+                with self.assertRaises(exception):
+                    adapter.set_favorite({
+                        "library_id": "family-mealie", "recipe_id": self.recipe_id,
+                    }, True)
 
     def test_paginated_search_and_exact_get_use_uuid_identity_and_display_only_slug(self):
         next_page = deepcopy(self.fixture["recipe_page"])
@@ -4947,6 +5667,7 @@ class MealieAdapterTests(unittest.TestCase):
             (201, "fixture-created"), stub_response, patch_response,
             *capability_responses,
             exact_get_response,
+            (200, self.fixture["favorite_exact"]),
         )
         settings = {
             **CONFIG,
@@ -5140,6 +5861,13 @@ class RecipeSageAdapterTests(unittest.TestCase):
             MINIMUM_RECIPESAGE_VERSION_TEXT,
         )
         self.assertEqual(metadata["hosted_verified_version"], HOSTED_VERIFIED_VERSION)
+        favorite_capabilities = self.fixture["favorite_capabilities"]
+        for name in (
+            "favorite_read", "favorite_write_desired_state",
+            "favorite_conditional_write", "favorite_reconcile",
+        ):
+            self.assertFalse(favorite_capabilities[name])
+        self.assertIn("no native private-recipe boolean favorite", favorite_capabilities["evidence"])
         for forbidden in (
             "fixture-session-token-never-serialized",
             "@example.com",

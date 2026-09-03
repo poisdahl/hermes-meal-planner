@@ -87,6 +87,23 @@ def _bounded_text(value: Any, field: str, *, required: bool = False, maximum: in
     return result or None
 
 
+def _favorite_revision(value: Any, field: str) -> int | str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise RecipeError(f"{field} must be a non-negative integer or exact text")
+    if isinstance(value, int):
+        if value < 0:
+            raise RecipeError(f"{field} must be a non-negative integer or exact text")
+        return value
+    if isinstance(value, str):
+        checked = _bounded_text(value, field, required=True, maximum=300)
+        if checked != value:
+            raise RecipeError(f"{field} must be exact text")
+        return checked
+    raise RecipeError(f"{field} must be a non-negative integer or exact text")
+
+
 def _finite_positive(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise RecipeError(f"{field} must be a positive finite number")
@@ -1210,6 +1227,92 @@ class RecipeStore:
         }
         return result
 
+    @staticmethod
+    def _favorite_operation(
+        row: sqlite3.Row, *, created: bool = False, claimed: bool = False
+    ) -> dict[str, Any]:
+        try:
+            request_metadata = json.loads(row["request_metadata"])
+            if (
+                not isinstance(request_metadata, Mapping)
+                or set(request_metadata) - {"is_favorite", "expected_favorite_revision"}
+                or not isinstance(request_metadata.get("is_favorite"), bool)
+            ):
+                raise RecipeError("recipe library journal is unavailable")
+            expected = _favorite_revision(
+                request_metadata.get("expected_favorite_revision"),
+                "expected_favorite_revision",
+            )
+            reference = validate_library_recipe_ref({
+                "library_id": row["library_id"],
+                "recipe_id": row["target_recipe_id"],
+                "version": row["provider_version"],
+            })
+            favorite_result = None
+            if row["result_metadata"]:
+                raw_result = json.loads(row["result_metadata"])
+                if (
+                    not isinstance(raw_result, Mapping)
+                    or set(raw_result) - {
+                        "library_id", "library_recipe_ref", "is_favorite",
+                        "favorite_revision", "idempotent", "reconciled",
+                    }
+                    or raw_result.get("library_id") != row["library_id"]
+                    or not isinstance(raw_result.get("is_favorite"), bool)
+                ):
+                    raise RecipeError("recipe library journal is unavailable")
+                returned = validate_library_recipe_ref(
+                    raw_result.get("library_recipe_ref")
+                )
+                if (
+                    returned["library_id"] != row["library_id"]
+                    or returned["recipe_id"] != row["target_recipe_id"]
+                ):
+                    raise RecipeError("recipe library journal is unavailable")
+                favorite_result = dict(raw_result)
+                favorite_result["library_recipe_ref"] = returned
+                if "favorite_revision" in favorite_result:
+                    favorite_result["favorite_revision"] = _favorite_revision(
+                        favorite_result["favorite_revision"], "favorite_revision"
+                    )
+                for name in ("idempotent", "reconciled"):
+                    if name in favorite_result and not isinstance(
+                        favorite_result[name], bool
+                    ):
+                        raise RecipeError("recipe library journal is unavailable")
+            if row["status"] == "confirmed" and favorite_result is None:
+                raise RecipeError("recipe library journal is unavailable")
+        except (json.JSONDecodeError, TypeError, RecipeLibraryError) as exc:
+            raise RecipeError("recipe library journal is unavailable") from exc
+        return {
+            "operation_id": row["operation_id"],
+            "kind": row["kind"],
+            "library_id": row["library_id"],
+            "target_recipe_id": row["target_recipe_id"],
+            "request_digest": row["request_digest"],
+            "idempotency_key": row["idempotency_key"],
+            "requested_is_favorite": request_metadata["is_favorite"],
+            "expected_favorite_revision": expected,
+            "status": row["status"],
+            "library_recipe_ref": reference,
+            "result": favorite_result,
+            "error_code": row["error_code"],
+            "error": row["error_text"],
+            "dispatched_at": row["dispatched_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "created": created,
+            "claimed": claimed,
+        }
+
+    @classmethod
+    def _operation(
+        cls, row: sqlite3.Row, *, created: bool = False, claimed: bool = False
+    ) -> dict[str, Any]:
+        if row["kind"] == "favorite":
+            return cls._favorite_operation(row, created=created, claimed=claimed)
+        return cls._library_operation(row, created=created, claimed=claimed)
+
     def _cleanup_library_data(self, connection: sqlite3.Connection) -> None:
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=FAILED_LIBRARY_OPERATION_TTL_DAYS)
@@ -1376,6 +1479,110 @@ class RecipeStore:
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
+    def begin_library_favorite(
+        self,
+        library_recipe_ref: Any,
+        is_favorite: Any,
+        *,
+        expected_favorite_revision: Any = None,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        try:
+            reference = validate_library_recipe_ref(library_recipe_ref)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        if reference["library_id"] == "builtin":
+            raise RecipeError("external favorite journal requires an external library")
+        if not isinstance(is_favorite, bool):
+            raise RecipeError("is_favorite must be true or false")
+        expected = _favorite_revision(
+            expected_favorite_revision, "expected_favorite_revision"
+        )
+        key = self._idempotency_key(idempotency_key)
+        if key is None:
+            raise RecipeError("idempotency_key is required")
+        request_metadata = {"is_favorite": is_favorite}
+        if expected is not None:
+            request_metadata["expected_favorite_revision"] = expected
+        request_digest = _hash({
+            "kind": "favorite",
+            "library_id": reference["library_id"],
+            "recipe_id": reference["recipe_id"],
+            **request_metadata,
+        })
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM library_connection_controls WHERE library_id=?",
+                    (reference["library_id"],),
+                ).fetchone() is not None:
+                    raise RecipeError("recipe library connection is disabled")
+                if connection.execute(
+                    "SELECT 1 FROM idempotency WHERE key=?", (key,)
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "idempotency key was already used with different content"
+                    )
+                keyed = connection.execute(
+                    "SELECT * FROM library_operations WHERE idempotency_key=?",
+                    (key,),
+                ).fetchall()
+                if keyed:
+                    if len(keyed) != 1:
+                        raise RecipeError(
+                            "idempotency key was already used with different content"
+                        )
+                    keyed = keyed[0]
+                    if (
+                        keyed["kind"] != "favorite"
+                        or keyed["library_id"] != reference["library_id"]
+                        or keyed["target_recipe_id"] != reference["recipe_id"]
+                        or keyed["request_digest"] != request_digest
+                    ):
+                        raise RecipeError(
+                            "idempotency key was already used for another library operation"
+                        )
+                    return self._favorite_operation(keyed)
+                self._cleanup_library_data(connection)
+                active = connection.execute(
+                    "SELECT 1 FROM library_operations WHERE kind='favorite' "
+                    "AND library_id=? AND target_recipe_id=? "
+                    "AND status IN ('pending','uncertain') LIMIT 1",
+                    (reference["library_id"], reference["recipe_id"]),
+                ).fetchone()
+                if active is not None:
+                    raise RecipeError(
+                        "another favorite operation for this exact external recipe is "
+                        "pending or uncertain; retry its original idempotency key"
+                    )
+                if connection.execute(
+                    "SELECT COUNT(*) FROM library_operations"
+                ).fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
+                    raise RecipeError("recipe library operation journal is full")
+                operation_id = f"libop:v1:{secrets.token_urlsafe(18)}"
+                timestamp = _now()
+                connection.execute("""INSERT INTO library_operations(
+                    operation_id, kind, library_id, discovery_ref, target_recipe_id,
+                    request_digest, request_metadata, idempotency_key, status,
+                    source_identity, snapshot_digest, result_metadata,
+                    provider_recipe_id, provider_version, error_code, error_text,
+                    dispatched_at, created_at, updated_at
+                ) VALUES(?, 'favorite', ?, NULL, ?, ?, ?, ?, 'pending',
+                    NULL, NULL, NULL, ?, ?, NULL, NULL, NULL, ?, ?)""", (
+                    operation_id, reference["library_id"], reference["recipe_id"],
+                    request_digest, _canonical(request_metadata), key,
+                    reference["recipe_id"], reference.get("version"), timestamp,
+                    timestamp,
+                ))
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                return self._favorite_operation(row, created=True)
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
     def disable_library_connection(self, library_id: Any) -> None:
         try:
             library = validate_library_id(library_id, allow_builtin=False)
@@ -1466,7 +1673,7 @@ class RecipeStore:
                 ).fetchone()
                 if row is None:
                     raise RecipeError("recipe library operation was not found")
-                result = self._library_operation(row)
+                result = self._operation(row)
                 if row["discovery_ref"] is not None and row["status"] in ACTIVE_DISCOVERY_BINDING_STATUSES:
                     result["snapshot"] = self._resolved_snapshot(connection, row["discovery_ref"])["recipe"]
                 return result
@@ -1486,7 +1693,7 @@ class RecipeStore:
                 if row is None:
                     raise RecipeError("recipe library operation was not found")
                 if row["status"] != "pending" or row["dispatched_at"] is not None:
-                    return self._library_operation(row)
+                    return self._operation(row)
                 timestamp = _now()
                 cursor = connection.execute(
                     "UPDATE library_operations SET dispatched_at=?, error_code=NULL, "
@@ -1497,7 +1704,7 @@ class RecipeStore:
                 row = connection.execute(
                     "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
                 ).fetchone()
-                return self._library_operation(row, claimed=cursor.rowcount == 1)
+                return self._operation(row, claimed=cursor.rowcount == 1)
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
@@ -1535,7 +1742,7 @@ class RecipeStore:
             raise RecipeError("recipe bank is unavailable") from exc
 
     def recover_library_operations(self) -> None:
-        """Turn possibly dispatched creates from an earlier service process uncertain."""
+        """Turn possibly dispatched provider writes from an earlier process uncertain."""
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -1605,6 +1812,107 @@ class RecipeStore:
                 self._cleanup_discoveries(connection)
                 return self._library_operation(connection.execute(
                     "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone())
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def finish_library_favorite(
+        self,
+        operation_id: Any,
+        status: Any,
+        *,
+        result: Any = None,
+        error_code: Any = None,
+        error: Any = None,
+    ) -> dict[str, Any]:
+        operation = _bounded_text(
+            operation_id, "operation_id", required=True, maximum=80
+        )
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe library operation was not found")
+        if status not in {"confirmed", "failed", "uncertain"}:
+            raise RecipeError("recipe library operation status is invalid")
+        favorite_result = None
+        if result is not None:
+            if not isinstance(result, Mapping):
+                raise RecipeError("recipe library favorite result is invalid")
+            allowed = {
+                "library_id", "library_recipe_ref", "is_favorite",
+                "favorite_revision", "idempotent", "reconciled",
+            }
+            if set(result) - allowed or not isinstance(result.get("is_favorite"), bool):
+                raise RecipeError("recipe library favorite result is invalid")
+            try:
+                reference = validate_library_recipe_ref(
+                    result.get("library_recipe_ref")
+                )
+            except RecipeLibraryError as exc:
+                raise RecipeError(str(exc)) from exc
+            favorite_result = {
+                "library_id": reference["library_id"],
+                "library_recipe_ref": reference,
+                "is_favorite": result["is_favorite"],
+            }
+            if result.get("library_id") != reference["library_id"]:
+                raise RecipeError("recipe library favorite result is invalid")
+            if "favorite_revision" in result:
+                favorite_result["favorite_revision"] = _favorite_revision(
+                    result["favorite_revision"], "favorite_revision"
+                )
+            for name in ("idempotent", "reconciled"):
+                if name in result:
+                    if not isinstance(result[name], bool):
+                        raise RecipeError("recipe library favorite result is invalid")
+                    favorite_result[name] = result[name]
+        if (status == "confirmed") != (favorite_result is not None):
+            raise RecipeError(
+                "confirmed recipe library favorite requires exactly one result"
+            )
+        code = _bounded_text(
+            error_code, "recipe library error_code", maximum=80
+        )
+        if code is not None and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code) is None:
+            raise RecipeError("recipe library error_code is invalid")
+        error_text = _bounded_text(error, "recipe library error", maximum=500)
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?",
+                    (operation,),
+                ).fetchone()
+                if row is None or row["kind"] != "favorite":
+                    raise RecipeError("recipe library operation was not found")
+                if row["status"] in {"confirmed", "failed"}:
+                    return self._favorite_operation(row)
+                if favorite_result is not None:
+                    reference = favorite_result["library_recipe_ref"]
+                    if (
+                        reference["library_id"] != row["library_id"]
+                        or reference["recipe_id"] != row["target_recipe_id"]
+                        or favorite_result["is_favorite"]
+                        != bool(json.loads(row["request_metadata"])["is_favorite"])
+                    ):
+                        raise RecipeError(
+                            "recipe library favorite result does not match the bound target"
+                        )
+                timestamp = _now()
+                connection.execute("""UPDATE library_operations SET
+                    status=?, result_metadata=?, provider_version=?, error_code=?,
+                    error_text=?, updated_at=? WHERE operation_id=?""", (
+                    status,
+                    _canonical(favorite_result) if favorite_result is not None else None,
+                    (
+                        favorite_result["library_recipe_ref"].get("version")
+                        if favorite_result is not None
+                        else row["provider_version"]
+                    ),
+                    code, error_text, timestamp, operation,
+                ))
+                self._cleanup_library_data(connection)
+                return self._favorite_operation(connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?",
+                    (operation,),
                 ).fetchone())
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
@@ -2021,6 +2329,13 @@ class RecipeStore:
                 ).fetchone()
                 if recipe is None:
                     raise RecipeError("recipe was not found")
+                if connection.execute(
+                    "SELECT 1 FROM library_operations WHERE idempotency_key=? LIMIT 1",
+                    (key,),
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "idempotency key was already used with different content"
+                    )
                 if existing := self._idem(connection, key, "set_favorite", request_hash):
                     existing.pop("created", None)
                     return existing
