@@ -369,6 +369,14 @@ round-robin balanced and conservatively deduplicated by exact source identity
 or exact normalized name-and-ingredient content. No arbitrary recipe URL is
 fetched.
 
+Every external discovery result also carries an opaque `discovery_ref` for its
+frozen, household-local document. Tell Hermes to “save this recipe” while that
+exact result is selected; it passes the ref to `recipes save`, which stores the
+snapshot in the built-in library without fetching the source again. A
+`discovery_ref` is not a stored recipe `recipe_ref`: the latter is the built-in
+recipe ID and revision used in a menu. Unbound discovery snapshots expire after
+30 days and are bounded locally; a confirmed built-in save remains available.
+
 TheMealDB uses its official V1 API with the public/private-use test key `1` by
 default; a private key can be supplied only through `THEMEALDB_API_KEY`. Review
 TheMealDB's current terms before using this integration in a public app.

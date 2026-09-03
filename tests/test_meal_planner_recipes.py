@@ -95,6 +95,9 @@ class RecipeStoreTests(unittest.TestCase):
         repeated = self.store.save(full_recipe(external_id="fisk-1"), idempotency_key="save-1")
         self.assertEqual(saved["id"], repeated["id"])
         self.assertTrue(repeated["idempotent"])
+        existing = self.store.save(external_recipe("themealdb", "Existing soup", "existing"))
+        existing_ref = self.store.persist_discovery(external_recipe("themealdb", "Existing soup", "existing"))["discovery_ref"]
+        self.assertEqual(self.store.save_discovery(existing_ref)["id"], existing["id"])
         with closing(sqlite3.connect(self.path)) as connection:
             self.assertIn("recipes_fingerprint", {row[1] for row in connection.execute("PRAGMA index_list(recipes)")})
         self.assertEqual(self.store.search("fisk")[0]["recipe_key"], f"bank:{saved['id']}")
@@ -127,6 +130,15 @@ class RecipeStoreTests(unittest.TestCase):
         self.assertEqual(duplicate["duplicate"], "source_key")
         with self.assertRaisesRegex(RecipeError, "different recipe revision"):
             self.store.save(full_recipe("Endret", external_id="same"))
+
+    def test_discovery_reference_saves_the_frozen_document_once(self):
+        ref = self.store.persist_discovery(external_recipe("themealdb", "Frozen soup", "frozen"))["discovery_ref"]
+        self.assertEqual(self.store.persist_discovery(external_recipe("themealdb", "Frozen soup", "frozen"))["discovery_ref"], ref)
+        self.assertEqual(self.store.resolve_discovery(ref)["recipe"]["name"], "Frozen soup")
+        saved = self.store.save_discovery(ref, idempotency_key="save-frozen")
+        repeated = self.store.save_discovery(ref, idempotency_key="save-frozen")
+        self.assertEqual(saved["id"], repeated["id"])
+        self.assertTrue(repeated["idempotent"])
 
     def test_content_duplicate_warns_without_merging(self):
         first = self.store.save(full_recipe())

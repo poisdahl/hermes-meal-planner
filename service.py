@@ -1354,6 +1354,11 @@ class Application:
                     continue
                 seen.update(identities)
                 recipe["discovery_source"] = source
+                if source == "internal":
+                    recipe["recipe_ref"] = {"id": recipe["id"], "revision": recipe["revision"]}
+                    recipe["already_saved"] = "builtin"
+                else:
+                    recipe.update(self.recipes.persist_discovery(recipe))
                 results.append(recipe)
                 if len(results) == total_limit:
                     break
@@ -1411,10 +1416,19 @@ class Application:
             if request.get("week"):
                 result["usage"] = self._usage_summary(self.store.read(), result["recipe_key"], validate_week(request["week"]))
             return {"recipe": result}
+        if action == "resolve":
+            return self.recipes.resolve_discovery(request.get("discovery_ref"))
         if action == "save":
-            value = normalize_recipe(request.get("recipe"))
+            has_recipe = request.get("recipe") is not None
+            has_ref = request.get("discovery_ref") is not None
+            if has_recipe == has_ref:
+                raise HouseholdError("recipes save requires exactly one of recipe or discovery_ref")
             key = request.get("idempotency_key")
-            return {"recipe": self.recipes.save(value, status=str(request.get("status") or "active"), idempotency_key=key)}
+            status = str(request.get("status") or "active")
+            if has_ref:
+                return {"recipe": self.recipes.save_discovery(request.get("discovery_ref"), status=status, idempotency_key=key)}
+            value = normalize_recipe(request.get("recipe"))
+            return {"recipe": self.recipes.save(value, status=status, idempotency_key=key)}
         if action == "update":
             value = normalize_recipe(request.get("recipe"))
             recipe_id = str(request.get("recipe_id") or "")
