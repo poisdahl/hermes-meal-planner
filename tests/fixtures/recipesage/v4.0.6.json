@@ -1,0 +1,357 @@
+{
+  "fixture": {
+    "product": "RecipeSage",
+    "minimum_supported_version": "4.0.3",
+    "hosted_verified_version": "v4.0.6",
+    "hosted_release_commit": "e3d4213d49842a70e6a16527e7ea19063937210d",
+    "selfhost_verified_version": "v4.0.3",
+    "selfhost_release_commit": "d7e81d3a4c7033b96552abc60494a0e17e0cbbbc",
+    "selfhost_config_version": "2026-08-16",
+    "captured_at": "2026-09-03T20:32:22Z",
+    "hosted_schema_source": "https://api.recipesage.com/openapi.json",
+    "stable_schema_source": "RecipeSage v4.0.3 and v4.0.6 tags plus RecipeSage-selfhost config 2026-08-16",
+    "schema_evidence": "Exact selected request and response schemas captured from the official hosted OpenAPI; the official self-host image reports version selfhost, so runtime support additionally requires this same schema fingerprint.",
+    "authenticated_probe": "Every configured connection validates its bearer session, captures getMe.id, and verifies an account-owned private list item before capabilities are reported. The opt-in live contract creates, reads back, marker-searches, and removes one uniquely identified temporary recipe.",
+    "sanitization": "OpenAPI schemas contain no account data. Representative response bodies use synthetic non-account UUIDs and content; no bearer token, real email, private recipe, real user identifier, internal hostname, or other account data is retained."
+  },
+  "terms": {
+    "hosted_api": "Personal, non-commercial use only; broader rights are not implied.",
+    "selfhost": "Use follows the configured instance and RecipeSage license."
+  },
+  "endpoints": {
+    "openapi": "GET /openapi.json (hosted) or GET /api/openapi.json (official self-host proxy)",
+    "validate_session": "GET /compat/v2/users/validateSession",
+    "authenticated_user": "GET /compat/v2/users/getMe",
+    "recipe_list": "POST /compat/v2/recipes/getRecipes",
+    "recipe_search": "POST /compat/v2/recipes/searchRecipes",
+    "recipe_get": "GET /compat/v2/recipes/getRecipe?id={immutable-uuid}",
+    "recipe_lookup_by_url": "GET /compat/v2/recipes/getRecipesByUrl?url={exact-url}",
+    "recipe_create": "POST /compat/v2/recipes/createRecipe"
+  },
+  "openapi": {
+    "openapi": "3.1.0",
+    "info": {
+      "title": "RecipeSage API",
+      "version": "v4.0.6"
+    },
+    "paths": {
+      "/compat/v2/users/validateSession": {
+        "get": {
+          "operationId": "users-validateSession",
+          "security": [{"Authorization": []}],
+          "responses": {"200": {"content": {"application/json": {"schema": {"type": "string"}}}}}
+        }
+      },
+      "/compat/v2/users/getMe": {
+        "get": {
+          "operationId": "users-getMe",
+          "security": [{"Authorization": []}],
+          "responses": {"200": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "format": "uuid"}},
+            "required": ["id"]
+          }}}}}
+        }
+      },
+      "/compat/v2/recipes/getRecipes": {
+        "post": {
+          "operationId": "recipes-getRecipes",
+          "security": [],
+          "requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+              "folder": {"type": "string", "enum": ["main", "inbox"]},
+              "orderBy": {"type": "string", "enum": ["title", "createdAt", "updatedAt", "lastMadeAt"]},
+              "orderDirection": {"type": "string", "enum": ["asc", "desc"]},
+              "offset": {"type": "number", "minimum": 0},
+              "limit": {"type": "number", "minimum": 1, "maximum": 200},
+              "labels": {"type": "array", "items": {"type": "string"}},
+              "labelIntersection": {"type": "boolean"},
+              "ratings": {"type": "array", "items": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 5}, {"type": "null"}]}}
+            },
+            "required": ["folder", "orderBy", "orderDirection", "offset", "limit"]
+          }}}},
+          "responses": {"200": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+              "recipes": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                  "id": {"type": "string", "format": "uuid"},
+                  "userId": {"type": "string", "format": "uuid"},
+                  "title": {"type": "string"},
+                  "url": {"type": "string"},
+                  "updatedAt": {"type": "string"},
+                  "recipeLabels": {"type": "array"},
+                  "recipeImages": {"type": "array"}
+                },
+                "required": ["id", "userId", "title", "url", "updatedAt", "recipeLabels", "recipeImages"]
+              }},
+              "totalCount": {"type": "integer"}
+            },
+            "required": ["recipes", "totalCount"]
+          }}}}}
+        }
+      },
+      "/compat/v2/recipes/searchRecipes": {
+        "post": {
+          "operationId": "recipes-searchRecipes",
+          "security": [],
+          "requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+              "searchTerm": {"type": "string", "minLength": 1, "maxLength": 255},
+              "folder": {"type": "string", "enum": ["main", "inbox"]},
+              "labels": {"type": "array", "items": {"type": "string"}},
+              "labelIntersection": {"type": "boolean"},
+              "ratings": {"type": "array", "items": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 5}, {"type": "null"}]}}
+            },
+            "required": ["searchTerm", "folder"]
+          }}}},
+          "responses": {"200": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+              "recipes": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                  "id": {"type": "string", "format": "uuid"},
+                  "userId": {"type": "string", "format": "uuid"},
+                  "title": {"type": "string"},
+                  "url": {"type": "string"},
+                  "updatedAt": {"type": "string"},
+                  "recipeLabels": {"type": "array"},
+                  "recipeImages": {"type": "array"}
+                },
+                "required": ["id", "userId", "title", "url", "updatedAt", "recipeLabels", "recipeImages"]
+              }},
+              "totalCount": {"type": "integer"}
+            },
+            "required": ["recipes", "totalCount"]
+          }}}}}
+        }
+      },
+      "/compat/v2/recipes/getRecipe": {
+        "get": {
+          "operationId": "recipes-getRecipe",
+          "security": [{"Authorization": []}],
+          "parameters": [{"name": "id", "in": "query", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+          "responses": {"200": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+              "id": {"type": "string", "format": "uuid"},
+              "userId": {"type": "string", "format": "uuid"},
+              "title": {"type": "string"},
+              "description": {"type": "string"},
+              "yield": {"type": "string"},
+              "activeTime": {"type": "string"},
+              "totalTime": {"type": "string"},
+              "source": {"type": "string"},
+              "url": {"type": "string"},
+              "folder": {"type": "string"},
+              "ingredients": {"type": "string"},
+              "instructions": {"type": "string"},
+              "notes": {"type": "string"},
+              "updatedAt": {"type": "string"},
+              "rating": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+              "recipeLabels": {"type": "array"},
+              "recipeImages": {"type": "array"}
+            },
+            "required": ["id", "userId", "title", "description", "yield", "activeTime", "totalTime", "source", "url", "folder", "ingredients", "instructions", "notes", "updatedAt", "rating", "recipeLabels", "recipeImages"]
+          }}}}}
+        }
+      },
+      "/compat/v2/recipes/getRecipesByUrl": {
+        "get": {
+          "operationId": "recipes-getRecipesByUrl",
+          "security": [{"Authorization": []}],
+          "parameters": [{"name": "url", "in": "query", "required": true, "schema": {"type": "string"}}],
+          "responses": {"200": {"content": {"application/json": {"schema": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {"type": "string", "format": "uuid"},
+                "userId": {"type": "string", "format": "uuid"},
+                "title": {"type": "string"},
+                "url": {"type": "string"},
+                "updatedAt": {"type": "string"},
+                "recipeLabels": {"type": "array"},
+                "recipeImages": {"type": "array"}
+              },
+              "required": ["id", "userId", "title", "url", "updatedAt", "recipeLabels", "recipeImages"]
+            }
+          }}}}}
+        }
+      },
+      "/compat/v2/recipes/createRecipe": {
+        "post": {
+          "operationId": "recipes-createRecipe",
+          "security": [{"Authorization": []}],
+          "requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {
+              "title": {"type": "string", "minLength": 1, "maxLength": 254},
+              "description": {"type": "string"},
+              "yield": {"type": "string"},
+              "activeTime": {"type": "string"},
+              "totalTime": {"type": "string"},
+              "source": {"type": "string"},
+              "url": {"type": "string"},
+              "notes": {"type": "string"},
+              "ingredients": {"type": "string"},
+              "instructions": {"type": "string"},
+              "rating": {"anyOf": [{"type": "number", "minimum": 1, "maximum": 5}, {"type": "null"}]},
+              "folder": {"anyOf": [{"type": "string", "const": "main"}, {"type": "string", "const": "inbox"}]},
+              "labelIds": {"type": "array", "items": {"type": "string", "format": "uuid", "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"}},
+              "imageIds": {"type": "array", "items": {"type": "string", "format": "uuid", "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"}}
+            },
+            "required": ["title", "description", "yield", "activeTime", "totalTime", "source", "url", "notes", "ingredients", "instructions", "rating", "folder", "labelIds", "imageIds"]
+          }}}},
+          "responses": {"200": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "format": "uuid"}},
+            "required": ["id"]
+          }}}}}
+        }
+      }
+    },
+    "components": {
+      "securitySchemes": {
+        "Authorization": {"type": "http", "scheme": "bearer"}
+      }
+    }
+  },
+  "validate_session": "Valid",
+  "authenticated_user": {
+    "id": "22222222-2222-4222-8222-222222222222"
+  },
+  "recipe_page": {
+    "recipes": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "userId": "22222222-2222-4222-8222-222222222222",
+        "fromUserId": null,
+        "title": "Fixture vegetable soup",
+        "description": "A synthetic public fixture recipe.",
+        "yield": "4 servings",
+        "activeTime": "PT10M",
+        "totalTime": "PT30M",
+        "source": "Fixture Kitchen",
+        "url": "https://recipes.example/fixture-soup",
+        "folder": "main",
+        "createdAt": "2026-08-24T12:00:00.000Z",
+        "updatedAt": "2026-08-24T12:00:00.000Z",
+        "lastMadeAt": null,
+        "rating": null,
+        "recipeLabels": [
+          {"label": {"title": "fixture"}}
+        ],
+        "recipeImages": [],
+        "fromUser": null,
+        "user": {
+          "id": "22222222-2222-4222-8222-222222222222",
+          "name": "Synthetic Fixture User",
+          "handle": null,
+          "enableProfile": false,
+          "profileImages": []
+        }
+      }
+    ],
+    "totalCount": 1
+  },
+  "recipe_get": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "userId": "22222222-2222-4222-8222-222222222222",
+    "fromUserId": null,
+    "title": "Fixture vegetable soup",
+    "description": "A synthetic public fixture recipe.",
+    "yield": "4 servings",
+    "activeTime": "PT10M",
+    "totalTime": "PT30M",
+    "source": "Fixture Kitchen",
+    "url": "https://recipes.example/fixture-soup",
+    "folder": "main",
+    "ingredients": "2 carrots\n1 litre stock",
+    "instructions": "Chop the carrots.\nSimmer until tender.",
+    "notes": "A synthetic note.",
+    "createdAt": "2026-08-24T12:00:00.000Z",
+    "updatedAt": "2026-08-24T12:00:00.000Z",
+    "lastMadeAt": null,
+    "rating": null,
+    "nutritionServingSize": null,
+    "nutritionCalories": null,
+    "nutritionTotalFat": null,
+    "nutritionSaturatedFat": null,
+    "nutritionTransFat": null,
+    "nutritionPolyunsaturatedFat": null,
+    "nutritionMonounsaturatedFat": null,
+    "nutritionCholesterol": null,
+    "nutritionSodium": null,
+    "nutritionTotalCarbs": null,
+    "nutritionDietaryFiber": null,
+    "nutritionTotalSugars": null,
+    "nutritionAddedSugars": null,
+    "nutritionProtein": null,
+    "nutritionVitaminD": null,
+    "nutritionCalcium": null,
+    "nutritionIron": null,
+    "nutritionPotassium": null,
+    "nutritionOtherDetails": null,
+    "recipeLabels": [
+      {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "labelId": "44444444-4444-4444-8444-444444444444",
+        "recipeId": "11111111-1111-4111-8111-111111111111",
+        "createdAt": "2026-08-24T12:00:00.000Z",
+        "updatedAt": "2026-08-24T12:00:00.000Z",
+        "label": {"title": "fixture"}
+      }
+    ],
+    "recipeImages": [],
+    "recipeLinks": [],
+    "fromUser": null,
+    "user": {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "name": "Synthetic Fixture User",
+      "handle": null,
+      "enableProfile": false,
+      "profileImages": []
+    }
+  },
+  "create": {
+    "required_request_fields": [
+      "title",
+      "description",
+      "yield",
+      "activeTime",
+      "totalTime",
+      "source",
+      "url",
+      "notes",
+      "ingredients",
+      "instructions",
+      "rating",
+      "folder",
+      "labelIds",
+      "imageIds"
+    ],
+    "response": {
+      "id": "11111111-1111-4111-8111-111111111111"
+    }
+  },
+  "errors": {
+    "openapi_documented_statuses": {
+      "validate_session": [400, 401, 403, 404, 500],
+      "authenticated_user": [400, 401, 403, 404, 500],
+      "recipe_list": [400, 401, 500],
+      "recipe_search": [400, 500],
+      "recipe_get": [400, 401, 403, 404, 500],
+      "recipe_create": [400, 401, 403, 500]
+    },
+    "adapter_policy": {
+      "needs_auth": [401, 403],
+      "definite_pre_create_rejection": "other 4xx except 408, including 429",
+      "uncertain_create": [408, 500, 502, 503, 504, "transport failure", "invalid accepted response"]
+    }
+  }
+}

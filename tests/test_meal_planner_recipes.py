@@ -50,6 +50,14 @@ from recipe_library_mealie import (  # noqa: E402
     RECIPE_EXTRA,
     MealieAdapter,
 )
+from recipe_library_recipesage import (  # noqa: E402
+    HOSTED_VERIFIED_VERSION,
+    METADATA_BEGIN,
+    METADATA_END,
+    MINIMUM_RECIPESAGE_VERSION_TEXT,
+    RecipeSageAdapter,
+    _RecipeSageHTTPStatus,
+)
 import recipe_sources as source_module  # noqa: E402
 from recipe_sources import RecipeSourceError, TheMealDBSource, WikibooksSource  # noqa: E402
 from service import (  # noqa: E402
@@ -5064,6 +5072,887 @@ class MealieLiveContractTest(unittest.TestCase):
             if confirmed is not None:
                 recipe_id = confirmed["library_recipe_ref"]["recipe_id"]
                 adapter._request("DELETE", f"/api/recipes/{recipe_id}", expected=(200, 204))
+
+
+class RecipeSageAdapterTests(unittest.TestCase):
+    recipe_id = "11111111-1111-4111-8111-111111111111"
+
+    def setUp(self):
+        path = Path(__file__).parent / "fixtures" / "recipesage" / "v4.0.6.json"
+        self.fixture_text = path.read_text(encoding="utf-8")
+        self.fixture = json.loads(self.fixture_text)
+        self.connection = {
+            "library_id": "family-recipesage",
+            "provider": "recipesage",
+            "base_url": "https://recipes.example",
+            "read_only": False,
+        }
+        self.credential = {"token": "fixture-session-token-never-serialized"}
+
+    def adapter(self, *responses, connection=None, primed=True):
+        opener = _FakeMealieOpener(*responses)
+        adapter = RecipeSageAdapter(
+            connection or self.connection,
+            self.credential,
+            opener=opener,
+        )
+        if primed:
+            adapter._api_prefix = ""
+            adapter._server_version = HOSTED_VERIFIED_VERSION
+            adapter._user_id = self.fixture["authenticated_user"]["id"]
+        return adapter, opener
+
+    @staticmethod
+    def operation(*, operation_id="libop:v1:abcdefghijklmnop"):
+        return {
+            "operation_id": operation_id,
+            "kind": "create",
+            "library_id": "family-recipesage",
+            "snapshot_digest": "a" * 64,
+            "source_identity": "familien:fixture-recipe",
+            "status": "pending",
+        }
+
+    def created_recipe(self, adapter, snapshot, operation, **overrides):
+        payload, _document = adapter._native_payload(snapshot, operation)
+        raw = deepcopy(self.fixture["recipe_get"])
+        raw.update({key: value for key, value in payload.items() if key not in {"labelIds", "imageIds"}})
+        raw.update({
+            "id": self.recipe_id,
+            "updatedAt": "2026-09-03T20:45:00.000Z",
+            "recipeLabels": [],
+            "recipeImages": [],
+        })
+        raw.update(overrides)
+        return raw
+
+    def capability_responses(self):
+        return (
+            (200, self.fixture["validate_session"]),
+            (200, self.fixture["authenticated_user"]),
+            (200, self.fixture["recipe_page"]),
+        )
+
+    def test_sanitized_fixture_and_read_only_probe_match_hosted_contract(self):
+        metadata = self.fixture["fixture"]
+        self.assertEqual(
+            metadata["minimum_supported_version"],
+            MINIMUM_RECIPESAGE_VERSION_TEXT,
+        )
+        self.assertEqual(metadata["hosted_verified_version"], HOSTED_VERIFIED_VERSION)
+        for forbidden in (
+            "fixture-session-token-never-serialized",
+            "@example.com",
+            "internal.local",
+            "/Users/",
+            "/opt/",
+        ):
+            self.assertNotIn(forbidden, self.fixture_text)
+        self.assertEqual(
+            set(self.fixture["create"]["required_request_fields"]),
+            {
+                "title", "description", "yield", "activeTime", "totalTime",
+                "source", "url", "notes", "ingredients", "instructions",
+                "rating", "folder", "labelIds", "imageIds",
+            },
+        )
+        adapter, opener = self.adapter(
+            (200, self.fixture["openapi"]),
+            *self.capability_responses(),
+            primed=False,
+        )
+        capabilities = adapter.capabilities()
+        self.assertEqual(capabilities["server_version"], HOSTED_VERIFIED_VERSION)
+        for name in ("search", "get", "create_from_discovery", "reconcile_create"):
+            self.assertTrue(capabilities[name])
+        for name in (
+            "conditional_update", "archive_desired_state", "delete", "favorite_read",
+            "favorite_write_desired_state", "favorite_conditional_write",
+            "reconcile_archive", "reconcile_delete", "favorite_reconcile",
+        ):
+            self.assertFalse(capabilities[name])
+        self.assertEqual(
+            [request.method for request, _timeout in opener.requests],
+            ["GET", "GET", "GET", "POST"],
+        )
+        self.assertNotIn("Authorization", opener.requests[0][0].headers)
+        self.assertTrue(
+            all(
+                request.headers["Authorization"]
+                == "Bearer fixture-session-token-never-serialized"
+                for request, _timeout in opener.requests[1:]
+            )
+        )
+
+        read_only = {**self.connection, "read_only": True}
+        adapter, _ = self.adapter(*self.capability_responses(), connection=read_only)
+        checked = library_module.verified_capabilities(adapter, read_only)
+        self.assertTrue(checked["search"])
+        self.assertTrue(checked["get"])
+        self.assertFalse(checked["create_from_discovery"])
+        self.assertFalse(checked["reconcile_create"])
+
+    def test_versions_selfhost_prefix_authentication_and_redirects(self):
+        old = deepcopy(self.fixture["openapi"])
+        old["info"]["version"] = "v4.0.2"
+        adapter, opener = self.adapter((200, old), primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "4.0.3 or newer"):
+            adapter.capabilities()
+        self.assertEqual(len(opener.requests), 1)
+
+        selfhost = deepcopy(self.fixture["openapi"])
+        selfhost["info"]["version"] = "selfhost"
+        missing = HTTPError(
+            "https://recipes.example/openapi.json", 404, "not found", {}, None
+        )
+        adapter, opener = self.adapter(
+            missing,
+            (200, selfhost),
+            *self.capability_responses(),
+            primed=False,
+        )
+        capabilities = adapter.capabilities()
+        self.assertEqual(capabilities["server_version"], "selfhost")
+        self.assertTrue(opener.requests[1][0].full_url.endswith("/api/openapi.json"))
+        self.assertTrue(
+            all("/api/compat/v2/" in request.full_url for request, _ in opener.requests[2:])
+        )
+
+        incompatible = deepcopy(self.fixture["openapi"])
+        incompatible["info"]["version"] = "selfhost"
+        del incompatible["paths"]["/compat/v2/recipes/createRecipe"]["post"][
+            "requestBody"
+        ]["content"]["application/json"]["schema"]["properties"]["notes"]
+        adapter, _ = self.adapter((200, incompatible), primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "contract is incompatible"):
+            adapter.capabilities()
+
+        for name, replacement in (
+            ("title", {"type": "string", "minLength": 1, "maxLength": 1}),
+            ("rating", {"type": "string"}),
+            ("folder", {"type": "integer"}),
+            ("labelIds", {"type": "array", "items": {"type": "string"}}),
+        ):
+            with self.subTest(incompatible_create_field=name):
+                incompatible = deepcopy(self.fixture["openapi"])
+                incompatible["info"]["version"] = "selfhost"
+                create_schema = incompatible["paths"][
+                    "/compat/v2/recipes/createRecipe"
+                ]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                create_schema["properties"][name] = replacement
+                adapter, _ = self.adapter((200, incompatible), primed=False)
+                with self.assertRaisesRegex(
+                    RecipeLibraryError, "contract is incompatible"
+                ):
+                    adapter.capabilities()
+
+        incompatible = deepcopy(self.fixture["openapi"])
+        incompatible["info"]["version"] = "selfhost"
+        create_schema = incompatible["paths"]["/compat/v2/recipes/createRecipe"][
+            "post"
+        ]["requestBody"]["content"]["application/json"]["schema"]
+        create_schema["required"].append("csrfToken")
+        adapter, _ = self.adapter((200, incompatible), primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "contract is incompatible"):
+            adapter.capabilities()
+
+        incompatible = deepcopy(self.fixture["openapi"])
+        incompatible["info"]["version"] = "selfhost"
+        list_schema = incompatible["paths"]["/compat/v2/recipes/getRecipes"][
+            "post"
+        ]["requestBody"]["content"]["application/json"]["schema"]
+        list_schema["properties"]["offset"]["maximum"] = 100
+        adapter, _ = self.adapter((200, incompatible), primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "contract is incompatible"):
+            adapter.capabilities()
+
+        incompatible = deepcopy(self.fixture["openapi"])
+        incompatible["info"]["version"] = "selfhost"
+        search_schema = incompatible["paths"][
+            "/compat/v2/recipes/searchRecipes"
+        ]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        search_schema["properties"]["labels"]["maxItems"] = 1
+        adapter, _ = self.adapter((200, incompatible), primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "contract is incompatible"):
+            adapter.capabilities()
+
+        incompatible = deepcopy(self.fixture["openapi"])
+        incompatible["info"]["version"] = "selfhost"
+        search_schema = incompatible["paths"][
+            "/compat/v2/recipes/searchRecipes"
+        ]["post"]["requestBody"]["content"]["application/json"]["schema"]
+        search_schema["required"].append("tenantId")
+        adapter, _ = self.adapter((200, incompatible), primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "contract is incompatible"):
+            adapter.capabilities()
+
+        incompatible = deepcopy(self.fixture["openapi"])
+        incompatible["info"]["version"] = "selfhost"
+        create_schema = incompatible["paths"]["/compat/v2/recipes/createRecipe"][
+            "post"
+        ]["requestBody"]["content"]["application/json"]["schema"]
+        create_schema["properties"]["labelIds"]["minItems"] = 1
+        adapter, _ = self.adapter((200, incompatible), primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "contract is incompatible"):
+            adapter.capabilities()
+
+        unauthorized = HTTPError(
+            "https://recipes.example/compat/v2/users/validateSession",
+            401,
+            "private account detail",
+            {},
+            None,
+        )
+        adapter, _ = self.adapter(
+            (200, self.fixture["openapi"]), unauthorized, primed=False
+        )
+        with self.assertRaisesRegex(RecipeLibraryError, "needs_auth"):
+            adapter.capabilities()
+
+        redirect = HTTPError(
+            "https://recipes.example/openapi.json",
+            302,
+            "redirect",
+            {"Location": "https://attacker.invalid/openapi.json"},
+            None,
+        )
+        adapter, opener = self.adapter(redirect, primed=False)
+        with self.assertRaisesRegex(RecipeLibraryError, "redirects"):
+            adapter.capabilities()
+        self.assertEqual(len(opener.requests), 1)
+        self.assertNotIn("attacker.invalid", opener.requests[0][0].full_url)
+
+    def test_paginated_private_list_search_and_exact_uuid_get(self):
+        first_page = deepcopy(self.fixture["recipe_page"])
+        first_page["totalCount"] = 2
+        adapter, opener = self.adapter((200, first_page))
+        page = adapter.search("", {"labels": ["fixture"]}, None, 1)
+        self.assertEqual(page["cursor"], "offset:1")
+        summary = page["recipes"][0]
+        self.assertEqual(summary["library_recipe_ref"], {
+            "library_id": "family-recipesage",
+            "recipe_id": self.recipe_id,
+            "version": "2026-08-24T12:00:00.000Z",
+        })
+        request_body = json.loads(opener.requests[0][0].data)
+        self.assertEqual(request_body["offset"], 0)
+        self.assertEqual(request_body["limit"], 1)
+        self.assertEqual(request_body["labels"], ["fixture"])
+        self.assertNotIn("userIds", request_body)
+
+        second = deepcopy(self.fixture["recipe_page"]["recipes"][0])
+        second["id"] = "99999999-9999-4999-8999-999999999999"
+        second["title"] = "Second fixture"
+        search_result = {"recipes": [first_page["recipes"][0], second], "totalCount": 2}
+        adapter, opener = self.adapter((200, search_result))
+        found = adapter.search("vegetable", {}, None, 1)
+        self.assertEqual(found["cursor"], "offset:1")
+        search_body = json.loads(opener.requests[0][0].data)
+        self.assertEqual(search_body["searchTerm"], "vegetable")
+        self.assertNotIn("offset", search_body)
+        self.assertNotIn("userIds", search_body)
+
+        many = []
+        for index in range(101):
+            item = deepcopy(first_page["recipes"][0])
+            item["id"] = f"00000000-0000-4000-8000-{index + 1:012x}"
+            item["title"] = f"Fixture result {index + 1}"
+            many.append(item)
+        adapter, _ = self.adapter((200, {"recipes": many, "totalCount": 101}))
+        large_page = adapter.search("fixture", {}, None, 50)
+        self.assertEqual(len(large_page["recipes"]), 50)
+        self.assertEqual(large_page["cursor"], "offset:50")
+
+        adapter, _ = self.adapter((200, {"recipes": [], "totalCount": 100}))
+        with self.assertRaisesRegex(RecipeLibraryError, "page is incompatible"):
+            adapter.search("", {}, "offset:50", 10)
+
+        adapter, opener = self.adapter((200, self.fixture["recipe_get"]))
+        recipe = adapter.get(summary["library_recipe_ref"])
+        self.assertEqual(recipe["name"], "Fixture vegetable soup")
+        self.assertEqual(recipe["ingredients"][0]["raw"], "2 carrots")
+        self.assertIn(f"id={self.recipe_id}", opener.requests[0][0].full_url)
+        self.assertNotIn("Fixture+vegetable+soup", opener.requests[0][0].full_url)
+
+        foreign = deepcopy(self.fixture["recipe_get"])
+        foreign["userId"] = "88888888-8888-4888-8888-888888888888"
+        adapter, _ = self.adapter((200, foreign))
+        with self.assertRaisesRegex(RecipeLibraryError, "different account"):
+            adapter.get(summary["library_recipe_ref"])
+
+    def test_full_create_maps_one_request_and_round_trips_frozen_document(self):
+        snapshot = normalize_recipe(
+            full_recipe("Fixture family soup", external_id="fixture-recipe")
+        )
+        operation = self.operation()
+        probe, _ = self.adapter()
+        raw = self.created_recipe(probe, snapshot, operation)
+        adapter, opener = self.adapter(
+            (200, self.fixture["create"]["response"]),
+            (200, raw),
+        )
+        result = adapter.create_from_snapshot(snapshot, operation)
+        self.assertEqual(result["library_recipe_ref"]["recipe_id"], self.recipe_id)
+        self.assertEqual(result["recipe"], {**snapshot, "library_recipe_ref": result["library_recipe_ref"]})
+        self.assertEqual(
+            [request.method for request, _ in opener.requests], ["POST", "GET"]
+        )
+        create_body = json.loads(opener.requests[0][0].data)
+        self.assertEqual(
+            set(create_body), set(self.fixture["create"]["required_request_fields"])
+        )
+        self.assertEqual(create_body["ingredients"], "400 g torsk\nsalt etter smak")
+        self.assertEqual(create_body["instructions"], "Stek fisken forsiktig.\nServer.")
+        self.assertIn("Hermes attribution", create_body["description"])
+        self.assertIn("Credit: Familieoppskrift", create_body["description"])
+        metadata = adapter._metadata(create_body["notes"])
+        self.assertEqual(metadata[0], {
+            "library_id": "family-recipesage",
+            "operation_id": operation["operation_id"],
+            "snapshot_digest": operation["snapshot_digest"],
+            "source_identity": operation["source_identity"],
+        })
+        self.assertEqual(metadata[2], snapshot)
+        self.assertTrue(create_body["notes"].startswith(METADATA_BEGIN))
+
+    def test_link_only_create_transmits_only_permitted_content_and_metadata(self):
+        secret_text = "PRIVATE FULL RECIPE TEXT MUST NOT LEAVE"
+        snapshot = normalize_recipe({
+            "name": "Link only fixture",
+            "language": "zz-PRIVATE",
+            "tags": ["PRIVATE CLASSIFICATION"],
+            "source": {
+                "kind": "publisher",
+                "publisher": "Fixture Publisher",
+                "title": "Link only fixture",
+                "author": "Fixture Author",
+                "url": "https://publisher.example/fixture",
+                "external_id": "PRIVATE SOURCE ID",
+                "relationship": "original",
+            },
+            "rights": {
+                "storage": "link_only",
+                "credit": "Fixture Publisher",
+                "license": "CC BY",
+            },
+            "notes": secret_text,
+            "external_snapshot": {
+                "fetched_at": "2026-09-03T12:00:00+00:00",
+                "content_hash": "b" * 64,
+                "source_revision_id": "PRIVATE SOURCE REVISION",
+                "permanent_url": "https://publisher.example/fixture",
+                "changes": "PRIVATE SNAPSHOT METADATA",
+            },
+        })
+        operation = self.operation(operation_id="libop:v1:qrstuvwxyzABCDEF")
+        probe, _ = self.adapter()
+        raw = self.created_recipe(probe, snapshot, operation)
+        adapter, opener = self.adapter(
+            (200, self.fixture["create"]["response"]), (200, raw)
+        )
+        result = adapter.create_from_snapshot(snapshot, operation)
+        self.assertEqual(result["recipe"]["rights"]["storage"], "link_only")
+        self.assertEqual(result["recipe"]["external_snapshot"], snapshot["external_snapshot"])
+        body = json.loads(opener.requests[0][0].data)
+        self.assertEqual(body["ingredients"], "")
+        self.assertEqual(body["instructions"], "")
+        self.assertEqual(body["url"], snapshot["source"]["url"])
+        serialized = json.dumps(body)
+        for private_value in (
+            secret_text,
+            "PRIVATE CLASSIFICATION",
+            "zz-PRIVATE",
+            "PRIVATE SOURCE ID",
+            "PRIVATE SOURCE REVISION",
+            "PRIVATE SNAPSHOT METADATA",
+        ):
+            self.assertNotIn(private_value, serialized)
+        metadata = adapter._metadata(body["notes"])
+        self.assertEqual(set(metadata[1]), {"name", "source", "rights"})
+        self.assertNotIn("external_id", metadata[1]["source"])
+
+    def test_reconciliation_requires_unique_marker_origin_digest_source_and_content(self):
+        snapshot = normalize_recipe(
+            full_recipe("Reconcile fixture", external_id="fixture-recipe")
+        )
+        operation = self.operation()
+        probe, _ = self.adapter()
+        raw = self.created_recipe(probe, snapshot, operation)
+        summary = {
+            key: raw[key]
+            for key in (
+                "id", "userId", "title", "description", "yield", "activeTime", "totalTime",
+                "source", "url", "folder", "updatedAt", "rating", "recipeLabels",
+                "recipeImages",
+            )
+        }
+        page = {"recipes": [summary], "totalCount": 1}
+        adapter, _ = self.adapter((200, page), (200, raw))
+        reconciled = adapter.reconcile_create(snapshot, operation)
+        self.assertEqual(reconciled["library_recipe_ref"]["recipe_id"], self.recipe_id)
+
+        for field, value in (
+            ("operation_id", "libop:v1:0000000000000000"),
+            ("library_id", "other-recipesage"),
+            ("snapshot_digest", "b" * 64),
+            ("source_identity", "familien:other-recipe"),
+        ):
+            with self.subTest(origin_mismatch=field):
+                collision = deepcopy(raw)
+                metadata = probe._metadata(collision["notes"])
+                bad_origin = deepcopy(metadata[0])
+                bad_origin[field] = value
+                marker = hashlib.sha256(bad_origin["operation_id"].encode()).hexdigest()
+                stored = metadata[1]
+                encoded = json.dumps(
+                    {"marker": marker, "origin": bad_origin, "recipe": stored},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                collision["notes"] = f"{METADATA_BEGIN}\n{encoded}\n{METADATA_END}"
+                bad_adapter, _ = self.adapter((200, page), (200, collision))
+                self.assertIsNone(bad_adapter.reconcile_create(snapshot, operation))
+
+        content_collision = deepcopy(raw)
+        content_collision["ingredients"] = "different content"
+        adapter, _ = self.adapter((200, page), (200, content_collision))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+
+        marker_only = deepcopy(raw)
+        marker_only["notes"] = raw["notes"].splitlines()[1]
+        adapter, _ = self.adapter((200, page), (200, marker_only))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+
+        duplicate_page = {"recipes": [summary, summary], "totalCount": 2}
+        adapter, opener = self.adapter((200, duplicate_page))
+        self.assertIsNone(adapter.reconcile_create(snapshot, operation))
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_real_adapter_save_is_idempotent_and_menu_stays_frozen_during_outage(self):
+        snapshot = normalize_recipe(
+            full_recipe("RecipeSage menu fixture", external_id="fixture-recipe")
+        )
+        created = {}
+
+        def create_response(request):
+            create_body = json.loads(request.data)
+            created["raw"] = deepcopy(self.fixture["recipe_get"])
+            created["raw"].update({
+                key: value
+                for key, value in create_body.items()
+                if key not in {"labelIds", "imageIds"}
+            })
+            created["raw"].update({
+                "id": self.recipe_id,
+                "updatedAt": "2026-09-03T20:50:00.000Z",
+                "recipeLabels": [],
+                "recipeImages": [],
+            })
+            return 200, self.fixture["create"]["response"]
+
+        def exact_get(_request):
+            return 200, created["raw"]
+
+        adapter, opener = self.adapter(
+            *self.capability_responses(),
+            create_response,
+            exact_get,
+            *self.capability_responses(),
+            exact_get,
+        )
+        settings = {
+            **CONFIG,
+            "primary_recipe_library_id": "family-recipesage",
+            "recipe_libraries": [self.connection],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory), settings)
+            app = Application(
+                store,
+                FakeOda(),
+                FakeBrowser(),
+                recipe_library_adapters={"family-recipesage": adapter},
+            )
+            with store.locked() as state:
+                state["setup"]["status"] = "complete"
+            discovery_ref = app.recipes.persist_discovery(snapshot)["discovery_ref"]
+            saved = app.handle({
+                "operation": "recipes",
+                "action": "save",
+                "discovery_ref": discovery_ref,
+            })
+            repeated = app.handle({
+                "operation": "recipes",
+                "action": "save",
+                "discovery_ref": discovery_ref,
+            })
+            self.assertEqual(saved["status"], "confirmed")
+            self.assertEqual(repeated["library_recipe_ref"], saved["library_recipe_ref"])
+            self.assertEqual(
+                len([
+                    request
+                    for request, _ in opener.requests
+                    if request.method == "POST"
+                    and request.full_url.endswith("/createRecipe")
+                ]),
+                1,
+            )
+            menu = app.handle({
+                "operation": "menu",
+                "action": "save",
+                "menu": {
+                    "week": "2026-W40",
+                    "dishes": [{"library_recipe_ref": saved["library_recipe_ref"]}],
+                    "salads": [],
+                },
+            })["menu"]
+            self.assertEqual(menu["dishes"][0]["name"], snapshot["name"])
+            opener.responses = [URLError("provider outage")]
+            self.assertEqual(app.handle({"operation": "menu", "action": "get"})["menu"], menu)
+            self.assertEqual(len(opener.responses), 1)
+
+    def test_create_failures_tokens_and_provider_errors_are_safely_classified(self):
+        snapshot = normalize_recipe(
+            full_recipe("Failure fixture", external_id="fixture-recipe")
+        )
+        operation = self.operation()
+        for status in (400, 401, 403, 409, 422, 429):
+            with self.subTest(definite_status=status):
+                rejected = HTTPError(
+                    "https://recipes.example/compat/v2/recipes/createRecipe",
+                    status,
+                    "private provider detail",
+                    {},
+                    None,
+                )
+                adapter, _ = self.adapter(rejected)
+                with self.assertRaises(RecipeLibraryDefiniteError) as raised:
+                    adapter.create_from_snapshot(snapshot, operation)
+                if status in {401, 403}:
+                    self.assertIn("needs_auth", str(raised.exception))
+                self.assertNotIn("private provider detail", str(raised.exception))
+
+        adapter, _ = self.adapter(URLError("timeout"))
+        with self.assertRaises(RecipeLibraryUncertainError):
+            adapter.create_from_snapshot(snapshot, operation)
+
+        adapter, _ = self.adapter(
+            (200, self.fixture["create"]["response"]),
+            HTTPError(
+                f"https://recipes.example/compat/v2/recipes/getRecipe?id={self.recipe_id}",
+                500,
+                "private recipe payload",
+                {},
+                None,
+            ),
+        )
+        with self.assertRaises(RecipeLibraryUncertainError) as raised:
+            adapter.create_from_snapshot(snapshot, operation)
+        self.assertNotIn("private recipe payload", str(raised.exception))
+
+        with self.assertRaisesRegex(RecipeLibraryError, "only token"):
+            RecipeSageAdapter(
+                self.connection, {"token": "value", "password": "must-not-persist"}
+            )
+
+        def revoked_session():
+            return HTTPError(
+                "https://recipes.example/compat/v2/users/validateSession",
+                401,
+                "private account detail",
+                {},
+                None,
+            )
+
+        adapter, opener = self.adapter()
+        settings = {
+            **CONFIG,
+            "primary_recipe_library_id": "family-recipesage",
+            "recipe_libraries": [self.connection],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory), settings)
+            app = Application(
+                store,
+                FakeOda(),
+                FakeBrowser(),
+                recipe_library_adapters={"family-recipesage": adapter},
+            )
+            opener.responses = [revoked_session()]
+            libraries = app.handle(
+                {"operation": "recipes", "action": "libraries"}
+            )
+            by_id = {
+                item["library_id"]: item for item in libraries["recipe_libraries"]
+            }
+            self.assertEqual(by_id["family-recipesage"]["status"], "needs_auth")
+
+            opener.responses = [revoked_session()]
+            with self.assertRaisesRegex(RecipeLibraryError, "needs_auth"):
+                app.handle({"operation": "recipes", "action": "search"})
+
+            opener.responses = [revoked_session()]
+            with self.assertRaisesRegex(RecipeLibraryError, "needs_auth"):
+                app.handle(
+                    {
+                        "operation": "recipes",
+                        "action": "get",
+                        "library_recipe_ref": {
+                            "library_id": "family-recipesage",
+                            "recipe_id": self.recipe_id,
+                        },
+                    }
+                )
+
+            discovery_ref = app.recipes.persist_discovery(snapshot)["discovery_ref"]
+            opener.responses = [revoked_session()]
+            saved = app.handle(
+                {
+                    "operation": "recipes",
+                    "action": "save",
+                    "discovery_ref": discovery_ref,
+                }
+            )
+            self.assertEqual(saved["status"], "pending")
+            self.assertEqual(saved["error_code"], "needs_auth")
+
+        adapter, opener = self.adapter()
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory), settings)
+            app = Application(
+                store,
+                FakeOda(),
+                FakeBrowser(),
+                recipe_library_adapters={"family-recipesage": adapter},
+            )
+            discovery_ref = app.recipes.persist_discovery(snapshot)["discovery_ref"]
+            opener.responses = [
+                *self.capability_responses(),
+                HTTPError(
+                    "https://recipes.example/compat/v2/recipes/createRecipe",
+                    401,
+                    "revoked after probe",
+                    {},
+                    None,
+                ),
+            ]
+            first = app.handle(
+                {
+                    "operation": "recipes",
+                    "action": "save",
+                    "discovery_ref": discovery_ref,
+                }
+            )
+            self.assertEqual(first["status"], "pending")
+            self.assertEqual(first["error_code"], "needs_auth")
+
+            operation = app.recipes.library_operation_snapshot(first["operation_id"])
+            raw = self.created_recipe(adapter, snapshot, operation)
+            opener.responses = [
+                *self.capability_responses(),
+                (200, self.fixture["create"]["response"]),
+                (200, raw),
+            ]
+            renewed = app.handle(
+                {
+                    "operation": "recipes",
+                    "action": "save",
+                    "discovery_ref": discovery_ref,
+                }
+            )
+            self.assertEqual(renewed["status"], "confirmed")
+            self.assertEqual(renewed["operation_id"], first["operation_id"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory), settings)
+            app = Application(store, FakeOda(), FakeBrowser())
+            discovery_ref = app.recipes.persist_discovery(snapshot)["discovery_ref"]
+            operation = app.recipes.begin_library_create(
+                discovery_ref, "family-recipesage"
+            )
+            app.recipes.claim_library_dispatch(operation["operation_id"])
+            deferred = app.recipes.defer_library_create_for_auth(
+                operation["operation_id"]
+            )
+            self.assertEqual(deferred["error_code"], "needs_auth")
+            reclaimed = app.recipes.claim_library_dispatch(
+                operation["operation_id"]
+            )
+            self.assertIsNone(reclaimed["error_code"])
+            app.recipes.recover_library_operations()
+            recovered = app.recipes.library_operation_snapshot(
+                operation["operation_id"]
+            )
+            self.assertEqual(recovered["status"], "uncertain")
+            self.assertIsNone(recovered["error_code"])
+
+        adapter, opener = self.adapter()
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(Path(directory), settings)
+            app = Application(
+                store,
+                FakeOda(),
+                FakeBrowser(),
+                recipe_library_adapters={"family-recipesage": adapter},
+            )
+            discovery_ref = app.recipes.persist_discovery(snapshot)["discovery_ref"]
+            opener.responses = [
+                *self.capability_responses(),
+                (200, self.fixture["create"]["response"]),
+                HTTPError(
+                    "https://recipes.example/compat/v2/recipes/getRecipe",
+                    401,
+                    "readback session revoked",
+                    {},
+                    None,
+                ),
+            ]
+            uncertain = app.handle(
+                {
+                    "operation": "recipes",
+                    "action": "save",
+                    "discovery_ref": discovery_ref,
+                }
+            )
+            self.assertEqual(uncertain["status"], "uncertain")
+            self.assertEqual(uncertain["error_code"], "needs_auth")
+
+            opener.responses = [revoked_session()]
+            expired = app.handle(
+                {
+                    "operation": "recipes",
+                    "action": "save",
+                    "discovery_ref": discovery_ref,
+                }
+            )
+            self.assertEqual(expired["status"], "uncertain")
+            self.assertEqual(expired["error_code"], "needs_auth")
+
+            operation = app.recipes.library_operation_snapshot(
+                uncertain["operation_id"]
+            )
+            raw = self.created_recipe(adapter, snapshot, operation)
+            summary = {
+                key: raw[key]
+                for key in (
+                    "id",
+                    "userId",
+                    "title",
+                    "description",
+                    "yield",
+                    "activeTime",
+                    "totalTime",
+                    "source",
+                    "url",
+                    "folder",
+                    "updatedAt",
+                    "rating",
+                    "recipeLabels",
+                    "recipeImages",
+                )
+            }
+            opener.responses = [
+                *self.capability_responses(),
+                (200, {"recipes": [summary], "totalCount": 1}),
+                (200, raw),
+            ]
+            reconciled = app.handle(
+                {
+                    "operation": "recipes",
+                    "action": "save",
+                    "discovery_ref": discovery_ref,
+                }
+            )
+            self.assertEqual(reconciled["status"], "confirmed")
+            self.assertEqual(reconciled["operation_id"], uncertain["operation_id"])
+
+
+@unittest.skipUnless(
+    os.environ.get("HERMES_RECIPESAGE_LIVE_TEST") == "1",
+    "explicit RecipeSage live-test connection not supplied",
+)
+class RecipeSageLiveContractTest(unittest.TestCase):
+    def test_one_uniquely_marked_recipe_is_removed_only_after_exact_confirmation(self):
+        base_url = os.environ["HERMES_RECIPESAGE_TEST_BASE_URL"]
+        token = os.environ["HERMES_RECIPESAGE_TEST_TOKEN"]
+        connection = {
+            "library_id": "live-recipesage",
+            "provider": "recipesage",
+            "base_url": base_url,
+            "read_only": False,
+            "allow_insecure_http": base_url.startswith("http://"),
+        }
+        adapter = RecipeSageAdapter(connection, {"token": token})
+        adapter.capabilities()
+        unique = hashlib.sha256(os.urandom(32)).hexdigest()
+        snapshot = normalize_recipe({
+            **full_recipe(f"Hermes live fixture {unique}", external_id=unique),
+            "source": {
+                "kind": "test",
+                "publisher": "Hermes live contract test",
+                "title": f"Hermes live fixture {unique}",
+                "external_id": unique,
+                "relationship": "generated",
+            },
+        })
+        operation = {
+            "operation_id": f"libop:v1:{unique[:24]}",
+            "kind": "create",
+            "library_id": "live-recipesage",
+            "snapshot_digest": hashlib.sha256(canonical(snapshot).encode()).hexdigest(),
+            "source_identity": f"hermes-live:{unique}",
+            "status": "pending",
+        }
+        confirmed = None
+        try:
+            try:
+                confirmed = adapter.create_from_snapshot(snapshot, operation)
+            except RecipeLibraryUncertainError:
+                confirmed = adapter.reconcile_create(snapshot, operation)
+                if confirmed is None:
+                    self.fail(
+                        "RecipeSage live create is uncertain and requires inspection; create was not repeated"
+                    )
+            self.assertEqual(
+                adapter.get(confirmed["library_recipe_ref"])["name"], snapshot["name"]
+            )
+            reconciled = adapter.reconcile_create(snapshot, operation)
+            self.assertIsNotNone(reconciled)
+            self.assertEqual(
+                reconciled["library_recipe_ref"], confirmed["library_recipe_ref"]
+            )
+        finally:
+            if confirmed is not None:
+                recipe_id = confirmed["library_recipe_ref"]["recipe_id"]
+                try:
+                    adapter._request(
+                        "POST",
+                        adapter._api_path("/recipes/deleteRecipe"),
+                        body={"id": recipe_id},
+                    )
+                except Exception:
+                    try:
+                        adapter._request(
+                            "GET",
+                            adapter._api_path("/recipes/getRecipe"),
+                            query=[("id", recipe_id)],
+                        )
+                    except _RecipeSageHTTPStatus as lookup_error:
+                        if lookup_error.status != 404:
+                            self.fail(
+                                "RecipeSage cleanup is uncertain; inspect confirmed recipe "
+                                f"{recipe_id} manually and do not repeat delete"
+                            )
+                    except Exception:
+                        self.fail(
+                            "RecipeSage cleanup is uncertain; inspect confirmed recipe "
+                            f"{recipe_id} manually and do not repeat delete"
+                        )
+                    else:
+                        self.fail(
+                            "RecipeSage cleanup delete failed and the confirmed recipe still "
+                            f"exists as {recipe_id}; delete was not repeated"
+                        )
 
 
 if __name__ == "__main__":
