@@ -60,6 +60,14 @@ class RecipeLibraryUncertainError(RecipeLibraryError):
     """A request may have reached the provider and must not be retried blindly."""
 
 
+class RecipeLibraryExternalMissingError(RecipeLibraryDefiniteError):
+    """The exact provider recipe no longer exists or is no longer accessible."""
+
+
+class RecipeLibraryFavoriteConflictError(RecipeLibraryDefiniteError):
+    """A provider-side conditional favorite write lost a revision race."""
+
+
 def _exact_text(value: Any, field: str, maximum: int, *, required: bool = True) -> str | None:
     if value is None and not required:
         return None
@@ -312,6 +320,18 @@ class RecipeLibraryAdapter(ABC):
 
     def reconcile_create(self, snapshot: Mapping[str, Any], operation: Mapping[str, Any]) -> Mapping[str, Any] | None:
         raise RecipeLibraryDefiniteError("recipe library create reconciliation is unsupported")
+
+    def get_favorite(self, library_recipe_ref: Mapping[str, str]) -> Mapping[str, Any]:
+        raise RecipeLibraryDefiniteError("recipe library favorite reads are unsupported")
+
+    def set_favorite(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        is_favorite: bool,
+        *,
+        expected_favorite_revision: Any = None,
+    ) -> None:
+        raise RecipeLibraryDefiniteError("recipe library favorite mutation is unsupported")
 
 
 def verified_capabilities(adapter: RecipeLibraryAdapter, connection: Mapping[str, Any]) -> dict[str, Any]:

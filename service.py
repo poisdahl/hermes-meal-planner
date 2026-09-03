@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from copy import deepcopy
@@ -56,6 +57,8 @@ from recipe_libraries import (
     RecipeLibraryAdapter,
     RecipeLibraryDefiniteError,
     RecipeLibraryError,
+    RecipeLibraryExternalMissingError,
+    RecipeLibraryFavoriteConflictError,
     library_recipe_key,
     library_recipe_key_aliases,
     load_library_secret,
@@ -82,6 +85,8 @@ CANCELLATION_OPERATION_TIMEOUT = 105
 MENY_CHECKOUT_OPERATION_TIMEOUT = 600
 MENY_VIPPS_EXPIRY_BUFFER = timedelta(minutes=11)
 SCHEDULE_OCCURRENCE_LEASE = timedelta(minutes=5)
+MAX_EXTERNAL_FAVORITE_SEARCH_PAGES = 10
+LIBRARY_SEARCH_CURSOR_PREFIX = "library-search:v1:"
 EMAIL_CLAIM_LEASE = timedelta(minutes=5)
 EMAIL_AUTOMATION_PROTOCOL = 3
 UNRESOLVED_CHECKOUT_STATUSES = {"clicking", "uncertain", "awaiting_user_payment"}
@@ -779,6 +784,8 @@ class Application:
         }
         self.primary_recipe_library_id = library_configuration["primary_recipe_library_id"]
         self.recipe_library_adapters = dict(recipe_library_adapters or {})
+        self.recipe_favorite_locks: dict[tuple[str, str], threading.Lock] = {}
+        self.recipe_favorite_locks_guard = threading.Lock()
         self.oda = provider_client
         self.provider = str(store.config.get("provider") or "oda").casefold()
         self.email_provider_clients = {**dict(email_provider_clients or {}), self.provider: provider_client}
@@ -1475,7 +1482,106 @@ class Application:
             raise RecipeLibraryError(f"{field} is invalid")
         return result or None
 
-    def _normalize_library_search_item(self, value: Any, library_id: str) -> dict[str, Any]:
+    @staticmethod
+    def _external_favorite_revision(value: Any) -> int | str:
+        if isinstance(value, bool):
+            raise RecipeLibraryError("provider favorite revision is invalid")
+        if isinstance(value, int):
+            if value < 0:
+                raise RecipeLibraryError("provider favorite revision is invalid")
+            return value
+        if isinstance(value, str):
+            checked = Application._provider_text(
+                value, "provider favorite revision", 300, required=True
+            )
+            if checked != value:
+                raise RecipeLibraryError("provider favorite revision must be exact text")
+            return checked
+        raise RecipeLibraryError("provider favorite revision is invalid")
+
+    @classmethod
+    def _decode_library_search_cursor(
+        cls, value: str | None, library_id: str, requested_limit: int
+    ) -> tuple[str | None, int, int]:
+        if value is None:
+            return None, requested_limit, 0
+        if not value.startswith(LIBRARY_SEARCH_CURSOR_PREFIX):
+            return (
+                cls._provider_text(
+                    value, "recipe library provider cursor", 500, required=True
+                ),
+                requested_limit,
+                0,
+            )
+        encoded = value.removeprefix(LIBRARY_SEARCH_CURSOR_PREFIX)
+        try:
+            padding = "=" * (-len(encoded) % 4)
+            decoded = base64.b64decode(
+                encoded + padding, altchars=b"-_", validate=True
+            )
+            payload = json.loads(decoded.decode("utf-8"))
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RecipeLibraryError("recipe library cursor is invalid") from exc
+        if not isinstance(payload, Mapping) or set(payload) != {
+            "v", "l", "c", "n", "s"
+        }:
+            raise RecipeLibraryError("recipe library cursor is invalid")
+        provider_limit = payload["n"]
+        skip = payload["s"]
+        if (
+            payload["v"] != 1
+            or payload["l"] != library_id
+            or isinstance(provider_limit, bool)
+            or not isinstance(provider_limit, int)
+            or not 1 <= provider_limit <= 50
+            or isinstance(skip, bool)
+            or not isinstance(skip, int)
+            or not 0 <= skip <= provider_limit
+        ):
+            raise RecipeLibraryError("recipe library cursor is invalid")
+        provider_cursor = payload["c"]
+        if provider_cursor is not None:
+            provider_cursor = cls._provider_text(
+                provider_cursor,
+                "recipe library provider cursor",
+                500,
+                required=True,
+            )
+        if provider_cursor is None and skip == 0:
+            raise RecipeLibraryError("recipe library cursor is invalid")
+        return provider_cursor, provider_limit, skip
+
+    @staticmethod
+    def _encode_library_search_cursor(
+        library_id: str,
+        provider_cursor: str | None,
+        provider_limit: int,
+        skip: int = 0,
+    ) -> str | None:
+        if provider_cursor is None and skip == 0:
+            return None
+        payload = json.dumps(
+            {
+                "v": 1,
+                "l": library_id,
+                "c": provider_cursor,
+                "n": provider_limit,
+                "s": skip,
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        encoded = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        result = f"{LIBRARY_SEARCH_CURSOR_PREFIX}{encoded}"
+        if len(result) > 1_024:
+            raise RecipeLibraryError("recipe library cursor is too large")
+        return result
+
+    def _normalize_library_search_item(
+        self, value: Any, library_id: str, *, favorite_read: bool = False
+    ) -> dict[str, Any]:
         if not isinstance(value, Mapping):
             raise RecipeLibraryError("recipe library search returned an invalid item")
         reference = validate_library_recipe_ref(value.get("library_recipe_ref"))
@@ -1483,6 +1589,7 @@ class Application:
             raise RecipeLibraryError("recipe library search returned the wrong library identity")
         result: dict[str, Any] = {
             "name": self._provider_text(value.get("name"), "recipe library result name", 300, required=True),
+            "library_id": reference["library_id"],
             "library_recipe_ref": reference,
             "recipe_key": library_recipe_key(reference),
         }
@@ -1514,7 +1621,51 @@ class Application:
             if source.get("url") is not None:
                 normalized_source["url"] = normalize_source_url(source.get("url"))
             result["source"] = normalized_source
+        if favorite_read:
+            if not isinstance(value.get("is_favorite"), bool):
+                raise RecipeLibraryError(
+                    "recipe library result favorite state is invalid"
+                )
+            result["is_favorite"] = value["is_favorite"]
+            if value.get("favorite_revision") is not None:
+                result["favorite_revision"] = self._external_favorite_revision(
+                    value["favorite_revision"]
+                )
         return result
+
+    def _normalize_external_favorite(
+        self, value: Any, expected_reference: Mapping[str, str]
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or not isinstance(
+            value.get("is_favorite"), bool
+        ):
+            raise RecipeLibraryError("recipe library favorite read returned invalid data")
+        reference = validate_library_recipe_ref(value.get("library_recipe_ref"))
+        if (
+            reference["library_id"] != expected_reference["library_id"]
+            or reference["recipe_id"] != expected_reference["recipe_id"]
+            or value.get("library_id") != expected_reference["library_id"]
+        ):
+            raise RecipeLibraryError(
+                "recipe library favorite read returned the wrong identity"
+            )
+        result = {
+            "library_id": reference["library_id"],
+            "library_recipe_ref": reference,
+            "is_favorite": value["is_favorite"],
+        }
+        if value.get("favorite_revision") is not None:
+            result["favorite_revision"] = self._external_favorite_revision(
+                value["favorite_revision"]
+            )
+        return result
+
+    def _recipe_favorite_lock(
+        self, reference: Mapping[str, str]
+    ) -> threading.Lock:
+        key = (reference["library_id"], reference["recipe_id"])
+        with self.recipe_favorite_locks_guard:
+            return self.recipe_favorite_locks.setdefault(key, threading.Lock())
 
     def _external_library_get(self, reference: Mapping[str, str]) -> dict[str, Any]:
         expected_reference = deepcopy(dict(reference))
@@ -1547,8 +1698,19 @@ class Application:
         ):
             raise RecipeLibraryError("recipe library get returned a missing or stale identity")
         recipe = normalize_recipe(raw)
+        recipe["library_id"] = returned["library_id"]
         recipe["library_recipe_ref"] = returned
         recipe["recipe_key"] = library_recipe_key(returned)
+        if capabilities["favorite_read"]:
+            if not isinstance(raw.get("is_favorite"), bool):
+                raise RecipeLibraryError(
+                    "recipe library get returned invalid favorite state"
+                )
+            recipe["is_favorite"] = raw["is_favorite"]
+            if raw.get("favorite_revision") is not None:
+                recipe["favorite_revision"] = self._external_favorite_revision(
+                    raw["favorite_revision"]
+                )
         if raw.get("provider_slug") is not None:
             recipe["provider_slug"] = self._provider_text(
                 raw.get("provider_slug"), "recipe library result provider_slug", 300,
@@ -1611,6 +1773,265 @@ class Application:
         if operation.get("error") is not None:
             result["error"] = operation["error"]
         return result
+
+    @staticmethod
+    def _favorite_operation_response(operation: Mapping[str, Any]) -> dict[str, Any]:
+        result = {
+            "library_id": operation.get("library_id"),
+            "status": operation.get("status"),
+            "operation_id": operation.get("operation_id"),
+            "library_recipe_ref": deepcopy(operation.get("library_recipe_ref")),
+            "requested_is_favorite": operation.get("requested_is_favorite"),
+        }
+        if operation.get("result") is not None:
+            result.update(deepcopy(operation["result"]))
+        if operation.get("error_code") is not None:
+            result["error_code"] = operation["error_code"]
+        if operation.get("error") is not None:
+            result["error"] = operation["error"]
+        return result
+
+    def _read_external_favorite(
+        self,
+        adapter: RecipeLibraryAdapter,
+        reference: Mapping[str, str],
+    ) -> dict[str, Any]:
+        raw = adapter.get_favorite(deepcopy(dict(reference)))
+        return self._normalize_external_favorite(raw, reference)
+
+    def _finish_external_favorite_missing(
+        self, operation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        failed = self.recipes.finish_library_favorite(
+            operation["operation_id"],
+            "failed",
+            error_code="external_missing",
+            error="the exact external recipe is missing",
+        )
+        return self._favorite_operation_response(failed)
+
+    def _reconcile_external_favorite(
+        self,
+        operation: Mapping[str, Any],
+        adapter: RecipeLibraryAdapter,
+        capabilities: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not capabilities["favorite_reconcile"]:
+            return self._favorite_operation_response(operation)
+        try:
+            current = self._read_external_favorite(
+                adapter, operation["library_recipe_ref"]
+            )
+        except RecipeLibraryExternalMissingError:
+            return self._finish_external_favorite_missing(operation)
+        except Exception as exc:
+            response = self._favorite_operation_response(operation)
+            if self._library_needs_auth(exc):
+                response.update({
+                    "error_code": "needs_auth",
+                    "error": "recipe library needs_auth before favorite reconciliation",
+                })
+            return response
+        if current["is_favorite"] != operation["requested_is_favorite"]:
+            return self._favorite_operation_response(operation)
+        current["reconciled"] = True
+        confirmed = self.recipes.finish_library_favorite(
+            operation["operation_id"], "confirmed", result=current
+        )
+        return self._favorite_operation_response(confirmed)
+
+    def _set_external_favorite(
+        self,
+        reference: Mapping[str, str],
+        is_favorite: Any,
+        *,
+        expected_favorite_revision: Any,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        library_id = reference["library_id"]
+        if library_id not in self.recipe_libraries:
+            raise RecipeLibraryError(
+                "library_recipe_ref names an unconfigured recipe library"
+            )
+        with self._recipe_favorite_lock(reference):
+            if not self._recipe_operations_recovered:
+                self.recipes.recover_library_operations()
+                self._recipe_operations_recovered = True
+            operation = self.recipes.begin_library_favorite(
+                reference,
+                is_favorite,
+                expected_favorite_revision=expected_favorite_revision,
+                idempotency_key=idempotency_key,
+            )
+            if operation["status"] in {"confirmed", "failed"}:
+                return self._favorite_operation_response(operation)
+            adapter = self.recipe_library_adapters.get(library_id)
+            if adapter is None:
+                response = self._favorite_operation_response(operation)
+                response.update({
+                    "error_code": "adapter_unavailable",
+                    "error": "optional recipe library is unavailable before dispatch",
+                })
+                return response
+            try:
+                capabilities = self._library_capabilities(library_id)
+            except Exception as exc:
+                response = self._favorite_operation_response(operation)
+                response.update({
+                    "error_code": (
+                        "needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "adapter_unavailable"
+                    ),
+                    "error": (
+                        "recipe library needs_auth before favorite dispatch or reconciliation"
+                        if self._library_needs_auth(exc)
+                        else "optional recipe library is unavailable before favorite dispatch or reconciliation"
+                    ),
+                })
+                return response
+            if operation["status"] == "uncertain":
+                return self._reconcile_external_favorite(
+                    operation, adapter, capabilities
+                )
+            if not (
+                capabilities["favorite_read"]
+                and capabilities["favorite_write_desired_state"]
+            ):
+                failed = self.recipes.finish_library_favorite(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="unsupported",
+                    error="this recipe library does not support native favorite mutation",
+                )
+                return self._favorite_operation_response(failed)
+            if (
+                operation.get("expected_favorite_revision") is not None
+                and not capabilities["favorite_conditional_write"]
+            ):
+                failed = self.recipes.finish_library_favorite(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="conditional_unsupported",
+                    error="this recipe library does not support conditional favorite mutation",
+                )
+                return self._favorite_operation_response(failed)
+            try:
+                current = self._read_external_favorite(adapter, reference)
+            except RecipeLibraryExternalMissingError:
+                return self._finish_external_favorite_missing(operation)
+            except Exception as exc:
+                response = self._favorite_operation_response(operation)
+                response.update({
+                    "error_code": (
+                        "needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "read_unavailable"
+                    ),
+                    "error": (
+                        "recipe library needs_auth before favorite dispatch"
+                        if self._library_needs_auth(exc)
+                        else "native favorite state is unavailable before dispatch"
+                    ),
+                })
+                return response
+            if operation.get("expected_favorite_revision") is not None:
+                if "favorite_revision" not in current:
+                    failed = self.recipes.finish_library_favorite(
+                        operation["operation_id"],
+                        "failed",
+                        error_code="conditional_unavailable",
+                        error="provider did not return its advertised favorite revision",
+                    )
+                    return self._favorite_operation_response(failed)
+                if (
+                    current["favorite_revision"]
+                    != operation["expected_favorite_revision"]
+                ):
+                    failed = self.recipes.finish_library_favorite(
+                        operation["operation_id"],
+                        "failed",
+                        error_code="favorite_conflict",
+                        error="favorite revision conflict",
+                    )
+                    return self._favorite_operation_response(failed)
+            if current["is_favorite"] == operation["requested_is_favorite"]:
+                current["idempotent"] = True
+                confirmed = self.recipes.finish_library_favorite(
+                    operation["operation_id"], "confirmed", result=current
+                )
+                return self._favorite_operation_response(confirmed)
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            if not claimed.get("claimed"):
+                return self._favorite_operation_response(claimed)
+            try:
+                adapter.set_favorite(
+                    deepcopy(dict(reference)),
+                    operation["requested_is_favorite"],
+                    expected_favorite_revision=operation.get(
+                        "expected_favorite_revision"
+                    ),
+                )
+            except RecipeLibraryFavoriteConflictError:
+                failed = self.recipes.finish_library_favorite(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="favorite_conflict",
+                    error="favorite revision conflict",
+                )
+                return self._favorite_operation_response(failed)
+            except RecipeLibraryExternalMissingError:
+                return self._finish_external_favorite_missing(claimed)
+            except RecipeLibraryDefiniteError as exc:
+                failed = self.recipes.finish_library_favorite(
+                    operation["operation_id"],
+                    "failed",
+                    error_code=(
+                        "needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "provider_rejected"
+                    ),
+                    error=(
+                        "recipe library favorite mutation needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "recipe library definitely rejected favorite mutation"
+                    ),
+                )
+                return self._favorite_operation_response(failed)
+            except Exception:
+                uncertain = self.recipes.finish_library_favorite(
+                    operation["operation_id"],
+                    "uncertain",
+                    error_code="provider_uncertain",
+                    error="recipe library favorite mutation may have been dispatched; do not retry",
+                )
+                return self._reconcile_external_favorite(
+                    uncertain, adapter, capabilities
+                )
+            try:
+                confirmed_state = self._read_external_favorite(adapter, reference)
+            except RecipeLibraryExternalMissingError:
+                return self._finish_external_favorite_missing(claimed)
+            except Exception:
+                uncertain = self.recipes.finish_library_favorite(
+                    operation["operation_id"],
+                    "uncertain",
+                    error_code="provider_uncertain",
+                    error="favorite write was sent but native readback is unavailable",
+                )
+                return self._favorite_operation_response(uncertain)
+            if confirmed_state["is_favorite"] != operation["requested_is_favorite"]:
+                uncertain = self.recipes.finish_library_favorite(
+                    operation["operation_id"],
+                    "uncertain",
+                    error_code="provider_uncertain",
+                    error="favorite write was sent but native readback did not confirm it",
+                )
+                return self._favorite_operation_response(uncertain)
+            confirmed = self.recipes.finish_library_favorite(
+                operation["operation_id"], "confirmed", result=confirmed_state
+            )
+            return self._favorite_operation_response(confirmed)
 
     def _save_discovery_to_library(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not self._recipe_operations_recovered:
@@ -1831,8 +2252,6 @@ class Application:
             favorites_only = request.get("favorites_only", False)
             if not isinstance(favorites_only, bool):
                 raise RecipeLibraryError("favorites_only must be true or false")
-            if favorites_only and library_ids != ["builtin"]:
-                raise RecipeLibraryError("favorites_only is supported only for the builtin recipe library")
             if requested_ids is None and library_ids == ["builtin"] and request.get("cursor") is not None:
                 raise RecipeLibraryError("built-in recipe search has no continuation cursor")
             if requested_ids is not None or library_ids != ["builtin"]:
@@ -1861,14 +2280,14 @@ class Application:
                         for key, value in raw_cursor.items():
                             cursor_by_library[key] = (
                                 None if value is None else
-                                self._provider_text(value, "recipe library cursor", 500, required=True)
+                                self._provider_text(value, "recipe library cursor", 1_024, required=True)
                             )
                 else:
                     if isinstance(raw_cursor, Mapping):
                         raise RecipeLibraryError("single-library cursor must be exact text")
                     cursor_by_library[library_ids[0]] = (
                         None if raw_cursor is None else
-                        self._provider_text(raw_cursor, "recipe library cursor", 500, required=True)
+                        self._provider_text(raw_cursor, "recipe library cursor", 1_024, required=True)
                     )
                 if cursor_by_library.get("builtin") is not None:
                     raise RecipeLibraryError("built-in recipe search has no continuation cursor")
@@ -1881,45 +2300,147 @@ class Application:
                         if library_id == "builtin":
                             state = self.store.read()
                             week = validate_week(request.get("week") or self._household_today(state).strftime("%G-W%V"))
-                            rows = self.recipes.search(
-                                query, limit=limit,
-                                include_archived=request.get("include_archived") is True,
-                                favorites_only=favorites_only,
-                            )
-                            for row in rows:
-                                summary = self._usage_summary(state, row["recipe_key"], week)
-                                if request.get("include_ineligible") is not True and not summary["eligible"]:
-                                    continue
-                                item = {
-                                    key: deepcopy(row.get(key))
-                                    for key in (
-                                        "id", "revision", "status", "name", "language", "tags",
-                                        "source", "rights", "portions", "library_id", "is_favorite",
-                                        "favorite_revision",
+                            include_ineligible = request.get("include_ineligible") is True
+                            offset = 0
+                            page_limit = limit
+                            accepted = []
+                            while True:
+                                rows = self.recipes.search(
+                                    query, limit=page_limit, offset=offset,
+                                    include_archived=request.get("include_archived") is True,
+                                    favorites_only=favorites_only,
+                                )
+                                offset += len(rows)
+                                for row in rows:
+                                    summary = self._usage_summary(
+                                        state, row["recipe_key"], week
                                     )
-                                }
-                                item["library_recipe_ref"] = deepcopy(row["library_recipe_ref"])
-                                item["recipe_key"] = library_recipe_key(row["library_recipe_ref"])
-                                item["usage"] = summary
-                                combined.append(item)
+                                    if not include_ineligible and not summary["eligible"]:
+                                        continue
+                                    item = {
+                                        key: deepcopy(row.get(key))
+                                        for key in (
+                                            "id", "revision", "status", "name", "language", "tags",
+                                            "source", "rights", "portions", "library_id", "is_favorite",
+                                            "favorite_revision",
+                                        )
+                                    }
+                                    item["library_recipe_ref"] = deepcopy(row["library_recipe_ref"])
+                                    item["recipe_key"] = library_recipe_key(row["library_recipe_ref"])
+                                    item["usage"] = summary
+                                    accepted.append(item)
+                                    if len(accepted) == limit:
+                                        break
+                                if (
+                                    len(accepted) == limit
+                                    or len(rows) < page_limit
+                                    or include_ineligible
+                                ):
+                                    break
+                                page_limit = 50
+                            combined.extend(accepted)
                             cursors[library_id] = None
                             continue
                         capabilities = self._library_capabilities(library_id)
                         if not capabilities["search"]:
                             raise RecipeLibraryError("recipe library search is unsupported")
-                        page = self.recipe_library_adapters[library_id].search(
-                            query, dict(filters), cursor_by_library.get(library_id), limit
+                        if favorites_only and not capabilities["favorite_read"]:
+                            raise RecipeLibraryError(
+                                "favorites_only is unsupported for this recipe library"
+                            )
+                        provider_filters = dict(filters)
+                        if favorites_only:
+                            provider_filters["favorites_only"] = True
+                        state = self.store.read()
+                        week = validate_week(
+                            request.get("week")
+                            or self._household_today(state).strftime("%G-W%V")
                         )
-                        if not isinstance(page, Mapping) or not isinstance(page.get("recipes"), list) or len(page["recipes"]) > limit:
-                            raise RecipeLibraryError("recipe library search returned invalid data")
-                        next_cursor = page.get("cursor")
-                        if next_cursor is not None:
-                            next_cursor = self._provider_text(next_cursor, "recipe library cursor", 500, required=True)
-                        cursors[library_id] = next_cursor
-                        combined.extend(
-                            self._normalize_library_search_item(item, library_id)
-                            for item in page["recipes"]
+                        provider_cursor, provider_limit, provider_skip = (
+                            self._decode_library_search_cursor(
+                                cursor_by_library.get(library_id), library_id, limit
+                            )
                         )
+                        seen_positions = set()
+                        accepted = []
+                        result_cursor = None
+                        completed = False
+                        page_budget = (
+                            MAX_EXTERNAL_FAVORITE_SEARCH_PAGES
+                            if favorites_only else 1
+                        )
+                        for _page_number in range(page_budget):
+                            position = (provider_cursor, provider_skip)
+                            if position in seen_positions:
+                                raise RecipeLibraryError(
+                                    "recipe library search returned a repeated cursor"
+                                )
+                            seen_positions.add(position)
+                            page_cursor = provider_cursor
+                            page = self.recipe_library_adapters[library_id].search(
+                                query, provider_filters, page_cursor, provider_limit
+                            )
+                            if (
+                                not isinstance(page, Mapping)
+                                or not isinstance(page.get("recipes"), list)
+                                or len(page["recipes"]) > provider_limit
+                                or provider_skip > len(page["recipes"])
+                            ):
+                                raise RecipeLibraryError(
+                                    "recipe library search returned invalid data"
+                                )
+                            next_cursor = page.get("cursor")
+                            if next_cursor is not None:
+                                next_cursor = self._provider_text(
+                                    next_cursor,
+                                    "recipe library provider cursor",
+                                    500,
+                                    required=True,
+                                )
+                                if next_cursor == page_cursor:
+                                    raise RecipeLibraryError(
+                                        "recipe library search returned a repeated cursor"
+                                    )
+                            for raw_index in range(provider_skip, len(page["recipes"])):
+                                raw_item = page["recipes"][raw_index]
+                                item = self._normalize_library_search_item(
+                                    raw_item,
+                                    library_id,
+                                    favorite_read=capabilities["favorite_read"],
+                                )
+                                item["usage"] = self._usage_summary(
+                                    state, item["recipe_key"], week
+                                )
+                                if (
+                                    request.get("include_ineligible") is not True
+                                    and not item["usage"]["eligible"]
+                                ):
+                                    continue
+                                accepted.append(item)
+                                if len(accepted) == limit:
+                                    consumed = raw_index + 1
+                                    result_cursor = self._encode_library_search_cursor(
+                                        library_id,
+                                        page_cursor if consumed < len(page["recipes"]) else next_cursor,
+                                        provider_limit,
+                                        consumed if consumed < len(page["recipes"]) else 0,
+                                    )
+                                    completed = True
+                                    break
+                            if completed:
+                                break
+                            if next_cursor is None:
+                                completed = True
+                                result_cursor = None
+                                break
+                            provider_cursor = next_cursor
+                            provider_skip = 0
+                        if not completed:
+                            result_cursor = self._encode_library_search_cursor(
+                                library_id, provider_cursor, provider_limit
+                            )
+                        cursors[library_id] = result_cursor
+                        combined.extend(accepted)
                     except Exception as exc:
                         if len(library_ids) == 1:
                             if self._library_needs_auth(exc):
@@ -2003,10 +2524,19 @@ class Application:
                 raise RecipeLibraryError("set_favorite requires only one exact library_recipe_ref identity")
             if request.get("library_id") is not None and request["library_id"] != reference["library_id"]:
                 raise RecipeLibraryError("library_recipe_ref does not match library_id")
-            return self.recipes.set_favorite(
+            if reference["library_id"] == "builtin":
+                return self.recipes.set_favorite(
+                    reference,
+                    request.get("is_favorite"),
+                    expected_favorite_revision=request.get("expected_favorite_revision"),
+                    idempotency_key=request.get("idempotency_key"),
+                )
+            return self._set_external_favorite(
                 reference,
                 request.get("is_favorite"),
-                expected_favorite_revision=request.get("expected_favorite_revision"),
+                expected_favorite_revision=request.get(
+                    "expected_favorite_revision"
+                ),
                 idempotency_key=request.get("idempotency_key"),
             )
         if action == "resolve":

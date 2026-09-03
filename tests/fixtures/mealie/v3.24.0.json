@@ -4,7 +4,7 @@
     "minimum_supported_version": "3.24.0",
     "stable_release": "v3.24.0",
     "stable_release_commit": "2c04da733f88836f788234a4bf1127599fbc1294",
-    "captured_at": "2026-09-03T19:05:40Z",
+    "captured_at": "2026-09-03T23:19:44Z",
     "stable_schema_source": "Mealie v3.24.0 tag schemas and routes",
     "runtime_schema_source": "https://demo.mealie.io/openapi.json",
     "runtime_reported_version": "nightly",
@@ -18,7 +18,10 @@
     "recipe_create": "POST /api/recipes",
     "recipe_create_stub": "GET /api/recipes/{created-slug}",
     "recipe_create_finalize": "PATCH /api/recipes/{immutable-id}",
-    "favorite_read": "GET /api/users/self/favorites"
+    "favorite_read": "GET /api/users/self/favorites",
+    "favorite_exact_read": "GET /api/users/self/ratings/{immutable-recipe-id}",
+    "favorite_add": "POST /api/users/{authenticated-user-id}/favorites/{immutable-recipe-id}",
+    "favorite_remove": "DELETE /api/users/{authenticated-user-id}/favorites/{immutable-recipe-id}"
   },
   "app_about": {
     "production": true,
@@ -300,5 +303,16 @@
       "rating": null,
       "isFavorite": true
     }]
+  },
+  "favorite_exact": {
+    "recipeId": "11111111-1111-4111-8111-111111111111",
+    "rating": null,
+    "isFavorite": true
+  },
+  "favorite_write": {
+    "add_status": 200,
+    "remove_status": 200,
+    "conditional_revision": null,
+    "evidence": "Mealie v3.24.0 routes and integration tests use exact add/remove endpoints and read back native UserRatingSummary state; no ETag or favorite revision is exposed."
   }
 }
