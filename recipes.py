@@ -15,11 +15,18 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
+import tempfile
 from typing import Any, Iterable, Mapping
 import unicodedata
 from urllib.parse import urlsplit, urlunsplit
 
 from core import HouseholdError
+from recipe_libraries import (
+    RecipeLibraryError,
+    validate_library_id,
+    validate_library_recipe_ref,
+)
 
 
 MAX_RECIPE_BYTES = 256 * 1024
@@ -30,6 +37,9 @@ MAX_UNBOUND_DISCOVERY_SNAPSHOTS = 2_000
 MAX_UNBOUND_DISCOVERY_BYTES = 64 * 1024 * 1024
 FAILED_DISCOVERY_BINDING_TTL_DAYS = 30
 MAX_FAILED_DISCOVERY_BINDINGS = 2_000
+MAX_LIBRARY_OPERATIONS = 10_000
+MAX_LIBRARY_MAPPINGS = 10_000
+FAILED_LIBRARY_OPERATION_TTL_DAYS = 90
 ACTIVE_DISCOVERY_BINDING_STATUSES = {"pending", "uncertain"}
 DISCOVERY_DESTINATION_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,62}")
 VALID_RELATIONSHIPS = {"original", "adapted", "inspired_by", "generated", "user_supplied", "unknown"}
@@ -38,6 +48,7 @@ RESTRICTED_FULL_HOSTS = {"meny.no", "www.meny.no", "oda.com", "www.oda.com"}
 SERVER_FIELDS = {
     "id", "revision", "status", "created_at", "updated_at", "created_via",
     "recipe_key", "content_fingerprint", "content_hash", "shopping_requirements",
+    "library_recipe_ref",
 }
 
 
@@ -536,6 +547,65 @@ class RecipeStore:
         if cursor.rowcount != 1:
             raise RecipeError("recipe bank migration could not advance schema version")
 
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        connection.execute("""CREATE TABLE library_operations (
+            operation_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(kind IN ('create','conditional_update','archive','delete','favorite','label','migration')),
+            library_id TEXT NOT NULL,
+            discovery_ref TEXT,
+            target_recipe_id TEXT,
+            request_digest TEXT NOT NULL,
+            request_metadata TEXT,
+            idempotency_key TEXT,
+            status TEXT NOT NULL CHECK(status IN ('pending','confirmed','failed','uncertain')),
+            source_identity TEXT,
+            snapshot_digest TEXT,
+            result_metadata TEXT,
+            provider_recipe_id TEXT,
+            provider_version TEXT,
+            error_code TEXT,
+            error_text TEXT,
+            dispatched_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        connection.execute(
+            "CREATE UNIQUE INDEX library_operations_discovery "
+            "ON library_operations(library_id, discovery_ref, kind) WHERE discovery_ref IS NOT NULL"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX library_operations_idempotency "
+            "ON library_operations(library_id, idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        connection.execute(
+            "CREATE INDEX library_operations_status ON library_operations(status, updated_at)"
+        )
+        connection.execute(
+            "CREATE INDEX library_operations_source ON library_operations(library_id, source_identity, snapshot_digest)"
+        )
+        connection.execute("""CREATE TABLE library_mappings (
+            library_id TEXT NOT NULL,
+            source_identity TEXT NOT NULL,
+            snapshot_digest TEXT NOT NULL,
+            recipe_id TEXT NOT NULL,
+            version TEXT,
+            operation_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(library_id, source_identity, snapshot_digest),
+            UNIQUE(library_id, recipe_id),
+            FOREIGN KEY(operation_id) REFERENCES library_operations(operation_id)
+        )""")
+        connection.execute("""CREATE TABLE library_connection_controls (
+            library_id TEXT PRIMARY KEY,
+            disabled_at TEXT NOT NULL
+        )""")
+        cursor = connection.execute(
+            "UPDATE metadata SET value='3' WHERE key='schema_version' AND value='2'"
+        )
+        if cursor.rowcount != 1:
+            raise RecipeError("recipe bank migration could not advance schema version")
+
     def _schema(self, connection: sqlite3.Connection) -> None:
         metadata = self._metadata(connection)
         if metadata is None:
@@ -553,7 +623,7 @@ class RecipeStore:
                 "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
             )
             version = "1"
-        if version not in {"1", "2"}:
+        if version not in {"1", "2", "3"}:
             raise RecipeError("recipe bank schema is newer than this meal planner")
         row = connection.execute("SELECT value FROM metadata WHERE key='household'").fetchone()
         if row is None:
@@ -567,6 +637,9 @@ class RecipeStore:
             )
         if version == "1":
             self._migrate_v1_to_v2(connection)
+            version = "2"
+        if version == "2":
+            self._migrate_v2_to_v3(connection)
         namespace = connection.execute(
             "SELECT value FROM metadata WHERE key='discovery_namespace'"
         ).fetchone()
@@ -581,6 +654,22 @@ class RecipeStore:
             ("recipes", "id"),
             ("revisions", "recipe_id, revision"),
             ("idempotency", "key"),
+        ):
+            digest.update(table.encode())
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
+                digest.update(_canonical(list(row)).encode())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _v2_digest(connection: sqlite3.Connection) -> str:
+        digest = hashlib.sha256()
+        for table, order in (
+            ("metadata", "key"),
+            ("recipes", "id"),
+            ("revisions", "recipe_id, revision"),
+            ("idempotency", "key"),
+            ("discovery_snapshots", "discovery_ref"),
+            ("discovery_bindings", "destination, discovery_ref"),
         ):
             digest.update(table.encode())
             for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
@@ -645,6 +734,80 @@ class RecipeStore:
                 backup.unlink()
             raise
 
+    def _validate_v2_backup(self, backup: Path, current: sqlite3.Connection) -> None:
+        try:
+            backup_status = backup.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RecipeError("existing recipe v2 backup is invalid") from exc
+        if not stat.S_ISREG(backup_status.st_mode):
+            raise RecipeError("existing recipe v2 backup is invalid")
+        try:
+            live_status = self.path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+        if (backup_status.st_dev, backup_status.st_ino) == (live_status.st_dev, live_status.st_ino):
+            raise RecipeError("existing recipe v2 backup is invalid")
+        try:
+            source = sqlite3.connect(
+                f"{backup.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            try:
+                if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise RecipeError("existing recipe v2 backup is invalid")
+                metadata = dict(source.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('household', 'schema_version')"
+                ).fetchall())
+                if metadata != {"household": self.household, "schema_version": "2"}:
+                    raise RecipeError("existing recipe v2 backup is invalid")
+                if self._v2_digest(source) != self._v2_digest(current):
+                    raise RecipeError("existing recipe v2 backup is stale")
+            finally:
+                source.close()
+        except sqlite3.Error as exc:
+            raise RecipeError("existing recipe v2 backup is invalid") from exc
+        if backup_status.st_mode & 0o777 != 0o600:
+            raise RecipeError("existing recipe v2 backup is not private")
+
+    def _backup_v2(self, connection: sqlite3.Connection) -> None:
+        backup = self.path.with_name("recipes-v2.backup.sqlite3")
+        try:
+            backup.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            self._validate_v2_backup(backup, connection)
+            return
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".recipes-v2.backup.", suffix=".sqlite3", dir=backup.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.close(descriptor)
+            source = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            destination = sqlite3.connect(str(temporary), timeout=2.0)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+            os.chmod(temporary, 0o600)
+            self._validate_v2_backup(temporary, connection)
+            with temporary.open("rb") as copied:
+                os.fsync(copied.fileno())
+            try:
+                os.link(temporary, backup, follow_symlinks=False)
+            except FileExistsError:
+                self._validate_v2_backup(backup, connection)
+            directory_descriptor = os.open(backup.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def _connect(self, target: str | None = None) -> sqlite3.Connection:
         if target is None:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -656,12 +819,13 @@ class RecipeStore:
         try:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA busy_timeout=2000")
+            connection.execute("PRAGMA foreign_keys=ON")
             connection.execute("BEGIN IMMEDIATE")
             metadata = self._metadata(connection)
             if metadata is not None:
                 if metadata.get("household") not in {None, self.household}:
                     raise RecipeError("recipe bank belongs to a different household")
-                if metadata.get("schema_version") not in {None, "1", "2"}:
+                if metadata.get("schema_version") not in {None, "1", "2", "3"}:
                     raise RecipeError("recipe bank schema is newer than this meal planner")
             recipes_exist = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recipes'"
@@ -676,7 +840,23 @@ class RecipeStore:
             )
             if nonempty_v1:
                 self._backup_v1(connection)
+            nonempty_v2 = (
+                target is None
+                and existed
+                and metadata is not None
+                and metadata.get("schema_version") == "2"
+                and any(
+                    connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                    for table in (
+                        "recipes", "revisions", "idempotency",
+                        "discovery_snapshots", "discovery_bindings",
+                    )
+                )
+            )
+            if nonempty_v2:
+                self._backup_v2(connection)
             self._schema(connection)
+            self._cleanup_library_data(connection)
             self._cleanup_discoveries(connection)
             connection.commit()
             return connection
@@ -713,6 +893,9 @@ class RecipeStore:
             "created_at": row["created_at"], "updated_at": row["updated_at"],
             "created_via": row["created_via"],
             "content_fingerprint": row["content_fingerprint"], "recipe_key": f"bank:{row['id']}",
+            "library_recipe_ref": {
+                "library_id": "builtin", "recipe_id": row["id"], "version": str(row["revision"]),
+            },
         })
         if created is not None:
             result["created"] = created
@@ -799,8 +982,10 @@ class RecipeStore:
             "SELECT * FROM discovery_snapshots WHERE discovery_ref=?", (ref,)
         ).fetchone()
         active_pin = connection.execute(
-            "SELECT 1 FROM discovery_bindings WHERE discovery_ref=? AND status IN ('pending','uncertain') LIMIT 1",
-            (ref,),
+            "SELECT 1 FROM discovery_bindings WHERE discovery_ref=? AND status IN ('pending','uncertain') "
+            "UNION ALL SELECT 1 FROM library_operations WHERE discovery_ref=? "
+            "AND status IN ('pending','uncertain') LIMIT 1",
+            (ref, ref),
         ).fetchone()
         if row is None or (row["expires_at"] <= _now() and active_pin is None):
             raise RecipeError("discovery reference was not found")
@@ -819,6 +1004,359 @@ class RecipeStore:
             "attribution_digest": row["attribution_digest"],
             "expires_at": row["expires_at"],
         }
+
+    @staticmethod
+    def _library_operation(row: sqlite3.Row, *, created: bool = False, claimed: bool = False) -> dict[str, Any]:
+        reference = None
+        try:
+            request_metadata = json.loads(row["request_metadata"]) if row["request_metadata"] else {}
+            if not isinstance(request_metadata, Mapping) or request_metadata.get("status") not in {"active", "draft"}:
+                raise RecipeError("recipe library journal is unavailable")
+            if row["result_metadata"]:
+                reference = validate_library_recipe_ref(json.loads(row["result_metadata"]))
+        except (json.JSONDecodeError, TypeError, RecipeLibraryError) as exc:
+            raise RecipeError("recipe library journal is unavailable") from exc
+        result = {
+            "operation_id": row["operation_id"],
+            "kind": row["kind"],
+            "library_id": row["library_id"],
+            "discovery_ref": row["discovery_ref"],
+            "target_recipe_id": row["target_recipe_id"],
+            "request_digest": row["request_digest"],
+            "idempotency_key": row["idempotency_key"],
+            "requested_status": request_metadata["status"],
+            "status": row["status"],
+            "source_identity": row["source_identity"],
+            "snapshot_digest": row["snapshot_digest"],
+            "library_recipe_ref": reference,
+            "error_code": row["error_code"],
+            "error": row["error_text"],
+            "dispatched_at": row["dispatched_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "created": created,
+            "claimed": claimed,
+        }
+        return result
+
+    def _cleanup_library_data(self, connection: sqlite3.Connection) -> None:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=FAILED_LIBRARY_OPERATION_TTL_DAYS)
+        ).isoformat()
+        connection.execute(
+            "DELETE FROM library_operations WHERE status='failed' AND updated_at <= ?",
+            (cutoff,),
+        )
+
+    def begin_library_create(
+        self,
+        discovery_ref: Any,
+        library_id: Any,
+        *,
+        status: Any = "active",
+        idempotency_key: Any = None,
+    ) -> dict[str, Any]:
+        ref = _bounded_text(discovery_ref, "discovery_ref", required=True, maximum=200)
+        try:
+            library = validate_library_id(library_id)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        if status not in {"active", "draft"}:
+            raise RecipeError("recipe status must be active or draft")
+        key = self._idempotency_key(idempotency_key)
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                ref = self._discovery_ref(connection, ref)
+                if connection.execute(
+                    "SELECT 1 FROM library_connection_controls WHERE library_id=?", (library,)
+                ).fetchone() is not None:
+                    raise RecipeError("recipe library connection is disabled")
+                existing = connection.execute(
+                    "SELECT * FROM library_operations WHERE library_id=? AND discovery_ref=? AND kind='create'",
+                    (library, ref),
+                ).fetchone()
+                if existing is not None:
+                    return self._library_operation(existing)
+                resolved = self._resolved_snapshot(connection, ref)
+                snapshot = connection.execute(
+                    "SELECT snapshot_key, source_identity FROM discovery_snapshots WHERE discovery_ref=?",
+                    (ref,),
+                ).fetchone()
+                if snapshot is None:
+                    raise RecipeError("discovery reference was not found")
+                mapped = connection.execute(
+                    "SELECT operation_id FROM library_mappings WHERE library_id=? "
+                    "AND source_identity=? AND snapshot_digest=?",
+                    (library, snapshot["source_identity"], snapshot["snapshot_key"]),
+                ).fetchone()
+                if mapped is not None:
+                    prior = connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (mapped["operation_id"],),
+                    ).fetchone()
+                    if prior is None or prior["status"] != "confirmed":
+                        raise RecipeError("recipe library journal is unavailable")
+                    if key is not None and connection.execute(
+                        "SELECT 1 FROM library_operations WHERE library_id=? AND idempotency_key=?",
+                        (library, key),
+                    ).fetchone() is not None:
+                        raise RecipeError("idempotency key was already used for another library operation")
+                    self._cleanup_library_data(connection)
+                    if connection.execute("SELECT COUNT(*) FROM library_operations").fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
+                        raise RecipeError("recipe library operation journal is full")
+                    operation_id = f"libop:v1:{secrets.token_urlsafe(18)}"
+                    timestamp = _now()
+                    connection.execute("""INSERT INTO library_operations(
+                        operation_id, kind, library_id, discovery_ref, target_recipe_id,
+                        request_digest, request_metadata, idempotency_key, status, source_identity, snapshot_digest,
+                        result_metadata, provider_recipe_id, provider_version, error_code, error_text,
+                        dispatched_at, created_at, updated_at
+                    ) VALUES(?, 'create', ?, ?, NULL, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)""", (
+                        operation_id, library, ref, prior["request_digest"], prior["request_metadata"], key,
+                        snapshot["source_identity"], snapshot["snapshot_key"], prior["result_metadata"],
+                        prior["provider_recipe_id"], prior["provider_version"], prior["dispatched_at"],
+                        timestamp, timestamp,
+                    ))
+                    return self._library_operation(connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?", (operation_id,)
+                    ).fetchone())
+                request_digest = _hash({
+                    "kind": "create",
+                    "library_id": library,
+                    "snapshot_digest": snapshot["snapshot_key"],
+                    "status": status,
+                })
+                if key is not None:
+                    reused = connection.execute(
+                        "SELECT 1 FROM library_operations WHERE library_id=? AND idempotency_key=?",
+                        (library, key),
+                    ).fetchone()
+                    if reused is not None:
+                        raise RecipeError("idempotency key was already used for another library operation")
+                conflict = connection.execute(
+                    "SELECT 1 FROM library_operations WHERE library_id=? AND source_identity=? "
+                    "AND snapshot_digest != ? AND status IN ('pending','confirmed','uncertain') LIMIT 1",
+                    (library, snapshot["source_identity"], snapshot["snapshot_key"]),
+                ).fetchone()
+                if library != "builtin" and conflict is not None:
+                    raise RecipeError("source identity has different content in the selected recipe library")
+                self._cleanup_library_data(connection)
+                if connection.execute("SELECT COUNT(*) FROM library_operations").fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
+                    raise RecipeError("recipe library operation journal is full")
+                reserved_mappings = connection.execute(
+                    "SELECT COUNT(*) FROM library_mappings"
+                ).fetchone()[0] + connection.execute(
+                    "SELECT COUNT(*) FROM library_operations WHERE kind='create' "
+                    "AND status IN ('pending','uncertain')"
+                ).fetchone()[0]
+                if reserved_mappings >= MAX_LIBRARY_MAPPINGS:
+                    raise RecipeError("recipe library mapping journal is full")
+                operation_id = f"libop:v1:{secrets.token_urlsafe(18)}"
+                timestamp = _now()
+                connection.execute("""INSERT INTO library_operations(
+                    operation_id, kind, library_id, discovery_ref, target_recipe_id,
+                    request_digest, request_metadata, idempotency_key, status, source_identity, snapshot_digest,
+                    result_metadata, provider_recipe_id, provider_version, error_code, error_text,
+                    dispatched_at, created_at, updated_at
+                ) VALUES(?, 'create', ?, ?, NULL, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)""", (
+                    operation_id, library, ref, request_digest, _canonical({"status": status}), key,
+                    snapshot["source_identity"], snapshot["snapshot_key"], timestamp, timestamp,
+                ))
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation_id,)
+                ).fetchone()
+                result = self._library_operation(row, created=True)
+                result["snapshot"] = resolved["recipe"]
+                return result
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def disable_library_connection(self, library_id: Any) -> None:
+        try:
+            library = validate_library_id(library_id, allow_builtin=False)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                active = connection.execute(
+                    "SELECT 1 FROM library_operations WHERE library_id=? "
+                    "AND status IN ('pending','uncertain') LIMIT 1",
+                    (library,),
+                ).fetchone()
+                if active is not None:
+                    raise RecipeError(
+                        "resolve pending or uncertain operations before removing this connection"
+                    )
+                connection.execute(
+                    "INSERT INTO library_connection_controls(library_id, disabled_at) VALUES(?,?) "
+                    "ON CONFLICT(library_id) DO UPDATE SET disabled_at=excluded.disabled_at",
+                    (library, _now()),
+                )
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def enable_library_connection(self, library_id: Any) -> None:
+        try:
+            library = validate_library_id(library_id, allow_builtin=False)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM library_connection_controls WHERE library_id=?", (library,)
+                )
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def bound_library_for_discovery(self, discovery_ref: Any, *, idempotency_key: Any = None) -> str | None:
+        ref = _bounded_text(discovery_ref, "discovery_ref", required=True, maximum=200)
+        key = self._idempotency_key(idempotency_key)
+        try:
+            with self._connection() as connection:
+                ref = self._discovery_ref(connection, ref)
+                if key is not None:
+                    rows = connection.execute(
+                        "SELECT library_id FROM library_operations WHERE discovery_ref=? "
+                        "AND kind='create' AND idempotency_key=?",
+                        (ref, key),
+                    ).fetchall()
+                    if len(rows) > 1:
+                        raise RecipeError("discovery save has multiple bound targets; exact library_id is required")
+                    if rows:
+                        return rows[0]["library_id"]
+                rows = connection.execute(
+                    "SELECT library_id FROM library_operations WHERE discovery_ref=? "
+                    "AND kind='create' ORDER BY library_id",
+                    (ref,),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise RecipeError("discovery save has multiple bound targets; exact library_id is required")
+                return rows[0]["library_id"] if rows else None
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def library_operation_snapshot(self, operation_id: Any) -> dict[str, Any]:
+        operation = _bounded_text(operation_id, "operation_id", required=True, maximum=80)
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe library operation was not found")
+        try:
+            with self._connection() as connection:
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone()
+                if row is None:
+                    raise RecipeError("recipe library operation was not found")
+                result = self._library_operation(row)
+                if row["discovery_ref"] is not None and row["status"] in ACTIVE_DISCOVERY_BINDING_STATUSES:
+                    result["snapshot"] = self._resolved_snapshot(connection, row["discovery_ref"])["recipe"]
+                return result
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def claim_library_dispatch(self, operation_id: Any) -> dict[str, Any]:
+        operation = _bounded_text(operation_id, "operation_id", required=True, maximum=80)
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe library operation was not found")
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone()
+                if row is None:
+                    raise RecipeError("recipe library operation was not found")
+                if row["status"] != "pending" or row["dispatched_at"] is not None:
+                    return self._library_operation(row)
+                timestamp = _now()
+                cursor = connection.execute(
+                    "UPDATE library_operations SET dispatched_at=?, updated_at=? "
+                    "WHERE operation_id=? AND status='pending' AND dispatched_at IS NULL",
+                    (timestamp, timestamp, operation),
+                )
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone()
+                return self._library_operation(row, claimed=cursor.rowcount == 1)
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def recover_library_operations(self) -> None:
+        """Turn possibly dispatched creates from an earlier service process uncertain."""
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                timestamp = _now()
+                connection.execute(
+                    "UPDATE library_operations SET status='uncertain', updated_at=? "
+                    "WHERE status='pending' AND dispatched_at IS NOT NULL",
+                    (timestamp,),
+                )
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def finish_library_create(
+        self,
+        operation_id: Any,
+        status: Any,
+        *,
+        library_recipe_ref: Any = None,
+        error_code: Any = None,
+        error: Any = None,
+    ) -> dict[str, Any]:
+        operation = _bounded_text(operation_id, "operation_id", required=True, maximum=80)
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe library operation was not found")
+        if status not in {"confirmed", "failed", "uncertain"}:
+            raise RecipeError("recipe library operation status is invalid")
+        try:
+            reference = None if library_recipe_ref is None else validate_library_recipe_ref(library_recipe_ref)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        if (status == "confirmed") != (reference is not None):
+            raise RecipeError("confirmed recipe library operation requires exactly one library_recipe_ref")
+        code = _bounded_text(error_code, "recipe library error_code", maximum=80)
+        if code is not None and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code) is None:
+            raise RecipeError("recipe library error_code is invalid")
+        error_text = _bounded_text(error, "recipe library error", maximum=500)
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone()
+                if row is None or row["kind"] != "create":
+                    raise RecipeError("recipe library operation was not found")
+                if row["status"] in {"confirmed", "failed"}:
+                    return self._library_operation(row)
+                if reference is not None and reference["library_id"] != row["library_id"]:
+                    raise RecipeError("library_recipe_ref does not match the bound library")
+                timestamp = _now()
+                if reference is not None:
+                    connection.execute("""INSERT INTO library_mappings(
+                        library_id, source_identity, snapshot_digest, recipe_id, version,
+                        operation_id, created_at, updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?)""", (
+                        row["library_id"], row["source_identity"], row["snapshot_digest"],
+                        reference["recipe_id"], reference.get("version"), operation, timestamp, timestamp,
+                    ))
+                connection.execute("""UPDATE library_operations SET
+                    status=?, result_metadata=?, provider_recipe_id=?, provider_version=?,
+                    error_code=?, error_text=?, updated_at=? WHERE operation_id=?""", (
+                        status, _canonical(reference) if reference is not None else None,
+                        reference["recipe_id"] if reference is not None else None,
+                        reference.get("version") if reference is not None else None,
+                        code, error_text, timestamp, operation,
+                    ))
+                self._cleanup_library_data(connection)
+                self._cleanup_discoveries(connection)
+                return self._library_operation(connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone())
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
 
     def _cleanup_discoveries(self, connection: sqlite3.Connection) -> None:
         current = _now()
@@ -845,6 +1383,10 @@ class RecipeStore:
                 SELECT 1 FROM discovery_bindings
                 WHERE discovery_bindings.discovery_ref = discovery_snapshots.discovery_ref
                   AND discovery_bindings.status IN ('pending', 'uncertain')
+            ) AND NOT EXISTS (
+                SELECT 1 FROM library_operations
+                WHERE library_operations.discovery_ref = discovery_snapshots.discovery_ref
+                  AND library_operations.status IN ('pending', 'uncertain')
             )
         """, (current,))
         rows = connection.execute("""
@@ -853,6 +1395,10 @@ class RecipeStore:
                 SELECT 1 FROM discovery_bindings
                 WHERE discovery_bindings.discovery_ref = discovery_snapshots.discovery_ref
                   AND discovery_bindings.status IN ('pending', 'uncertain')
+            ) AND NOT EXISTS (
+                SELECT 1 FROM library_operations
+                WHERE library_operations.discovery_ref = discovery_snapshots.discovery_ref
+                  AND library_operations.status IN ('pending', 'uncertain')
             )
             ORDER BY expires_at, discovery_ref
         """).fetchall()
@@ -1003,6 +1549,11 @@ class RecipeStore:
             "created_via": current["created_via"],
             "content_fingerprint": content_fingerprint(result),
             "recipe_key": f"bank:{current['id']}",
+            "library_recipe_ref": {
+                "library_id": "builtin",
+                "recipe_id": current["id"],
+                "version": str(binding["recipe_revision"]),
+            },
             "created": False,
             "idempotent": True,
         })
@@ -1120,6 +1671,8 @@ class RecipeStore:
 
     def get(self, recipe_id: Any, revision: Any = None) -> dict[str, Any]:
         recipe_id = _bounded_text(recipe_id, "recipe_id", required=True, maximum=80)
+        if isinstance(revision, str) and re.fullmatch(r"[1-9][0-9]*", revision):
+            revision = int(revision)
         try:
             with self._connection() as connection:
                 if revision is None:
@@ -1134,7 +1687,7 @@ class RecipeStore:
                 if version is None or current is None:
                     raise RecipeError("recipe revision was not found")
                 result = _stored_recipe_document(version["document"])
-                result.update({"id": recipe_id, "revision": revision, "status": current["status"], "revision_status": version["status"], "created_at": current["created_at"], "updated_at": version["created_at"], "created_via": current["created_via"], "content_fingerprint": content_fingerprint(result), "recipe_key": f"bank:{recipe_id}"})
+                result.update({"id": recipe_id, "revision": revision, "status": current["status"], "revision_status": version["status"], "created_at": current["created_at"], "updated_at": version["created_at"], "created_via": current["created_via"], "content_fingerprint": content_fingerprint(result), "recipe_key": f"bank:{recipe_id}", "library_recipe_ref": {"library_id": "builtin", "recipe_id": recipe_id, "version": str(revision)}})
                 return result
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc

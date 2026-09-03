@@ -216,13 +216,13 @@ case "$(uname -s)" in
 esac
 
 umask 077
-mkdir -p "$private_root/state" "$private_root/browser/profile" "$browser_socket_directory" "$hermes_home/skills/meal-planner"
+mkdir -p "$private_root/state" "$private_root/browser/profile" "$private_root/secrets/recipe-libraries" "$browser_socket_directory" "$hermes_home/skills/meal-planner"
 if [[ "$service_manager" == "systemd" ]]; then
   mkdir -p "$(dirname -- "$unit_path")" "$(dirname -- "$user_unit_path")"
 else
   mkdir -p "$(dirname -- "$launch_agent_path")" "$(dirname -- "$launchd_stdout_path")" "$(dirname -- "$launchd_stderr_path")"
 fi
-chmod 700 "$private_root" "$private_root/state" "$private_root/browser" "$private_root/browser/profile" "$browser_socket_directory"
+chmod 700 "$private_root" "$private_root/state" "$private_root/browser" "$private_root/browser/profile" "$private_root/secrets" "$private_root/secrets/recipe-libraries" "$browser_socket_directory"
 
 if [[ -e "$config_path" ]]; then
   "$python" -c 'from pathlib import Path; from service import config; import sys; value=config(Path(sys.argv[1])); value["provider"] == sys.argv[2] or sys.exit("existing config uses a different provider"); value["household"] == sys.argv[3] or sys.exit("existing config uses a different household"); value["provider"] != "meny" or value.get("vipps_phone_number") or sys.exit("existing MENY config is missing vipps_phone_number")' "$config_path" "$provider" "$household"
@@ -239,6 +239,10 @@ value = {
     "household": os.environ["HOUSEHOLD"],
     "provider": os.environ["PROVIDER"],
     "confirmation_policy": "fresh",
+    "primary_recipe_library_id": "builtin",
+    "recipe_libraries": [
+        {"library_id": "builtin", "provider": "builtin", "read_only": False},
+    ],
     "email_automation_profile": None,
     "profile_overrides": {},
 }

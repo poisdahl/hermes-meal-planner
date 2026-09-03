@@ -338,6 +338,68 @@ an existing private state directory in place: pending checkout, cancellation,
 order-change, schedule, product-favorite and recurring records are provider-specific.
 Use a separate private installation and MCP registration for another provider.
 
+## Personal recipe-library connections
+
+The built-in bank always exists as exact `library_id="builtin"` and is the
+zero-configuration primary. Optional Mealie and RecipeSage adapters are separate
+deliverables; merely adding either connection never selects it or blocks the
+built-in path. Connections live only in the private config and use stable IDs:
+
+```json
+{
+  "primary_recipe_library_id": "builtin",
+  "recipe_libraries": [
+    {"library_id": "builtin", "provider": "builtin", "read_only": false},
+    {"library_id": "family-mealie", "provider": "mealie", "base_url": "https://recipes.example", "read_only": false}
+  ]
+}
+```
+
+An ID matches `[a-z][a-z0-9-]{0,62}`, is unique case-insensitively and never
+changes with its URL, display name, credential or primary status. Search/save
+without a library ID uses the primary; a per-call exact `library_id` overrides
+only that call. Provider names are not selectors: if “save in Mealie” matches
+zero or several connections, ask for one exact connection instead of choosing
+by order. Cross-library search requires an explicit list of exact IDs. Its
+continuation cursor is a map keyed by those IDs, so one provider's cursor is
+never sent to another connection.
+
+`base_url` is one credential-free origin. HTTPS is the default; loopback HTTP
+is allowed for local hosting. Any other HTTP origin requires the setup helper's
+explicit local warning confirmation and is never configurable through MCP.
+Authenticated adapter calls compare scheme, host and port before attaching a
+credential and never follow redirects.
+
+Credentials are separate from config at
+`$MEAL_PLANNER_HOME/secrets/recipe-libraries/<library_id>.json`, with directory
+mode `0700` and file mode `0600`, owned by the service user. They never belong
+in command arguments, state, SQLite, logs, MCP traffic, fixtures or Git. After
+the provider-specific adapter is installed, use the interactive local helper:
+
+```sh
+home="${MEAL_PLANNER_HOME:-${HERMES_HOME:-$HOME/.hermes}/meal-planner}"
+python3 recipe_library_setup.py --config "$home/config.json" --home "$home" \
+  add --library-id family-mealie --provider mealie --base-url https://recipes.example
+python3 recipe_library_setup.py --config "$home/config.json" --home "$home" \
+  test --library-id family-mealie
+python3 recipe_library_setup.py --config "$home/config.json" --home "$home" \
+  set-primary --library-id family-mealie
+```
+
+The hidden prompt reads credential JSON. Add/update probes authentication and
+semantic read capabilities before writing; primary changes and credential
+removal require exact local confirmations. `update-credential` and `remove`
+provide the other two lifecycle actions. Remove refuses a connection while its
+journal has pending or uncertain work; resolve that work first. A running service is restarted only
+after a successful local change. First-run conversational setup never requests
+library credentials; it continues with `builtin` and only mentions this helper.
+Setup mutations hold one installation-local lock across confirmation and writes,
+so concurrent helpers cannot overwrite one another. Removal atomically disables
+the connection in the operation journal after confirmation and succeeds only
+when no pending or uncertain save exists; this closes the dispatch/removal race.
+The service resolves credentials beside a conventional `HOME/state` directory
+or inside a state-root container mount, without exposing either path through MCP.
+
 ## Private recipe bank
 
 The recipe bank is household-bound SQLite at
@@ -372,15 +434,22 @@ fetched.
 Every external discovery result carries an opaque, store-bound `discovery_ref`
 for its exact normalized household-local snapshot. Tell Hermes to “save this
 recipe” while one displayed result is clearly selected. It passes that exact ref
-to `recipes save`; the built-in library stores the frozen document without
-fetching the source or guessing from a title, URL, ordinal, or latest result. The
-result includes `library_id="builtin"`, so the user-facing confirmation can name
-the saved recipe, its source, and the destination library. If the selection is
-ambiguous, Hermes asks which displayed recipe.
+to `recipes save`; the target is bound in SQLite before any adapter dispatch.
+An explicit per-call ID wins, otherwise the configured primary is resolved once.
+Retry/restart remains on that target even if the primary changes. A definite
+rejection is `failed`; a possibly dispatched lost response is `uncertain` and
+is never blindly retried or redirected to built-in. Only an adapter advertising
+semantic `reconcile_create` may reconcile it. If the selection or connection is
+ambiguous, Hermes asks which exact displayed item or `library_id`.
+An adapter or capability-probe outage before dispatch remains pending and can
+be retried safely after the local connection recovers.
 
 A `discovery_ref` is not a built-in menu `recipe_ref: {id, revision}`, and
-neither is issue #1's provider-neutral
-`library_recipe_ref: {library_id, recipe_id, version}`. Identical rediscovery
+neither is provider-neutral
+`library_recipe_ref: {library_id, recipe_id, version?}`. The version is omitted
+when the provider does not establish one. Search/get return this exact identity
+and a recipe key namespaced by exact library ID; title, slug, URL, list position
+and “latest” are never identity fallbacks. Identical rediscovery
 reuses the original frozen document and ref while renewing its 30-day expiry.
 Unpinned snapshots are capped at 2,000 documents and 64 MiB, oldest-expiring
 first. Pending or uncertain destination work pins its snapshot; failed pins are
@@ -389,11 +458,12 @@ built-in mapping remains without retaining or depending on the snapshot
 document. Repeating a confirmed save returns the exact originally bound recipe
 ID and revision even after cleanup or a later explicit recipe update.
 
-The first write to a non-empty v1 recipe bank creates one transactionally
-consistent private `recipes-v1.backup.sqlite3`, then upgrades the bank to v2 in
-the same writer-serialized migration. The schema version advances only after
-the snapshot and destination-binding tables are complete. Migration failure
-rolls back to usable v1, and an unknown newer schema fails closed. A changed
+The first write to a non-empty v1 recipe bank still creates its private v1
+backup. Opening a non-empty v2 bank creates exactly one transactionally
+consistent, non-overwriting `recipes-v2.backup.sqlite3` at mode `0600`, then
+upgrades atomically to v3. The schema version advances last, after bounded
+generic operation-journal and exact-mapping tables exist. Migration failure
+rolls back to usable v2, and an unknown newer schema fails closed. A changed
 snapshot never updates an existing same-source recipe silently: save returns
 that existing recipe plus a conflict requiring an explicit update with its
 `expected_revision`.
@@ -403,10 +473,13 @@ default; a private key can be supplied only through `THEMEALDB_API_KEY`. Review
 TheMealDB's current terms before using this integration in a public app.
 Wikibooks Cookbook recipes pass a strict ingredients-plus-procedure gate and
 are stored with CC BY-SA 4.0 attribution, the exact permanent revision URL, a
-content hash and a change statement. Images are never copied. Selected full
-external recipes are embedded as immutable menu snapshots, so a later source
-edit cannot change an active or ordered menu, its shopping requirements or its
-recipe email.
+content hash and a change statement. Images are never copied. Selected
+personal-library recipes are fetched exactly once by `library_recipe_ref`,
+validated and embedded as immutable menu snapshots. A missing/stale get,
+attribution/rights failure or `link_only` recipe stops menu save without
+falling back. After save, provider edits, deletion, outage, primary changes and
+restart cannot change an active/ordered menu, shopping requirements or recipe
+email. Existing menu/order/email snapshots need no library connection.
 
 A native full-recipe record looks like this:
 

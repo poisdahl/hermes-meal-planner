@@ -3,6 +3,10 @@
   "household": "My household",
   "provider": "meny",
   "confirmation_policy": "fresh",
+  "primary_recipe_library_id": "builtin",
+  "recipe_libraries": [
+    {"library_id": "builtin", "provider": "builtin", "read_only": false}
+  ],
   "vipps_phone_number": null,
   "email_automation_profile": null,
   "profile_overrides": {

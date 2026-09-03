@@ -50,6 +50,22 @@ from oda import (
 )
 from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, MenyOrderChangeDispatchError, meny_checkout_reviews_match, normalize_product_ref
 from recipes import RecipeError, RecipeStore, normalize_recipe, normalize_source_url, recipe_key, scale_recipe, validate_week
+from recipe_libraries import (
+    CAPABILITY_NAMES,
+    MAX_LIBRARY_RECIPE_KEY,
+    RecipeLibraryAdapter,
+    RecipeLibraryDefiniteError,
+    RecipeLibraryError,
+    library_recipe_key,
+    library_recipe_key_aliases,
+    load_library_secret,
+    load_optional_adapter,
+    normalize_library_configuration,
+    validate_library_id,
+    validate_library_recipe_ref,
+    verified_capabilities,
+    secret_path,
+)
 from recipe_sources import (
     SOURCE_IDS,
     TheMealDBSource,
@@ -752,9 +768,17 @@ class Application:
         self, store: StateStore, provider_client: Any, browser: OdaBrowser,
         *, email_provider_clients: Mapping[str, Any] | None = None,
         external_recipe_sources: Mapping[str, Any] | None = None,
+        recipe_library_adapters: Mapping[str, RecipeLibraryAdapter] | None = None,
     ):
         self.store = store
         self.recipes = RecipeStore(store.directory / "recipes.sqlite3", str(store.config["household"]))
+        self._recipe_operations_recovered = False
+        library_configuration = normalize_library_configuration(store.config)
+        self.recipe_libraries = {
+            item["library_id"]: item for item in library_configuration["recipe_libraries"]
+        }
+        self.primary_recipe_library_id = library_configuration["primary_recipe_library_id"]
+        self.recipe_library_adapters = dict(recipe_library_adapters or {})
         self.oda = provider_client
         self.provider = str(store.config.get("provider") or "oda").casefold()
         self.email_provider_clients = {**dict(email_provider_clients or {}), self.provider: provider_client}
@@ -1027,6 +1051,8 @@ class Application:
                 for key in ("dinner_days", "dishes", "batch_dishes", "salads", "cook_days", "eat_days")
             },
             "recipe_sources": deepcopy(profile["recipes"]["sources"]),
+            "primary_recipe_library_id": self.primary_recipe_library_id,
+            "optional_recipe_libraries": "Configure external recipe libraries only with the local interactive recipe_library_setup.py helper.",
         }
 
     def _setup_question(self, state: Mapping[str, Any]) -> dict[str, Any]:
@@ -1160,6 +1186,24 @@ class Application:
         match = re.fullmatch(r"(\d{4})-W(\d{2})", validate_week(week))
         return date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1).toordinal() // 7
 
+    @staticmethod
+    def _matching_recipe_key(key: str, values: Any) -> str | None:
+        if not isinstance(values, list):
+            return None
+        aliases = library_recipe_key_aliases(key)
+        return next(
+            (
+                value for value in values
+                if isinstance(value, str) and aliases.intersection(library_recipe_key_aliases(value))
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _canonical_usage_key(key: str) -> str:
+        aliases = library_recipe_key_aliases(key)
+        return next((value for value in aliases if value.startswith("library:builtin:")), key)
+
     def _usage_summary(
         self,
         state: Mapping[str, Any],
@@ -1172,10 +1216,11 @@ class Application:
         if isinstance(cooldown, bool) or not isinstance(cooldown, int) or cooldown < 0 or cooldown > 260:
             raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
         target = self._week_index(week)
+        identity_keys = library_recipe_key_aliases(key)
         last_planned = last_ordered = last_cooked = None
         blockers = []
         for menu_id, record in (state.get("recipe_usage") or {}).items():
-            if menu_id == ignore_menu_id or not isinstance(record, Mapping) or key not in record.get("recipe_keys", []):
+            if menu_id == ignore_menu_id or not isinstance(record, Mapping) or not identity_keys.intersection(record.get("recipe_keys", [])):
                 continue
             record_week = record.get("week")
             try:
@@ -1188,8 +1233,8 @@ class Application:
                 last_planned = max(filter(None, (last_planned, record_week)), default=record_week)
             if status == "ordered" or previous == "ordered":
                 last_ordered = max(filter(None, (last_ordered, record_week)), default=record_week)
-            cooked = key in record.get("cooked_keys", [])
-            not_cooked = key in record.get("not_cooked_keys", [])
+            cooked = bool(identity_keys.intersection(record.get("cooked_keys", [])))
+            not_cooked = bool(identity_keys.intersection(record.get("not_cooked_keys", [])))
             if cooked:
                 last_cooked = max(filter(None, (last_cooked, record_week)), default=record_week)
             active = (status in {"planned", "ordered"} and not not_cooked) or cooked
@@ -1377,11 +1422,431 @@ class Application:
             "balanced_limit_per_source": per_source,
         }
 
+    def _library_capabilities(self, library_id: str) -> dict[str, Any]:
+        connection = self.recipe_libraries[library_id]
+        if library_id == "builtin":
+            return {
+                "provider": "builtin",
+                "server_version": "3",
+                "read_only": False,
+                **{
+                    name: name in {"search", "get", "create_from_discovery"}
+                    for name in CAPABILITY_NAMES
+                },
+            }
+        adapter = self.recipe_library_adapters.get(library_id)
+        if adapter is None:
+            raise RecipeLibraryError("optional recipe library adapter is not installed")
+        try:
+            return verified_capabilities(adapter, connection)
+        except RecipeLibraryError:
+            raise
+        except Exception as exc:
+            raise RecipeLibraryError("recipe library capability probe is unavailable") from exc
+
+    @staticmethod
+    def _provider_text(value: Any, field: str, maximum: int, *, required: bool = False) -> str | None:
+        if value is None and not required:
+            return None
+        if not isinstance(value, str):
+            raise RecipeLibraryError(f"{field} must be text")
+        result = unicodedata.normalize("NFC", value).strip()
+        if required and not result:
+            raise RecipeLibraryError(f"{field} is required")
+        if len(result) > maximum or any(0xD800 <= ord(character) <= 0xDFFF for character in result):
+            raise RecipeLibraryError(f"{field} is invalid")
+        return result or None
+
+    def _normalize_library_search_item(self, value: Any, library_id: str) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise RecipeLibraryError("recipe library search returned an invalid item")
+        reference = validate_library_recipe_ref(value.get("library_recipe_ref"))
+        if reference["library_id"] != library_id:
+            raise RecipeLibraryError("recipe library search returned the wrong library identity")
+        result: dict[str, Any] = {
+            "name": self._provider_text(value.get("name"), "recipe library result name", 300, required=True),
+            "library_recipe_ref": reference,
+            "recipe_key": library_recipe_key(reference),
+        }
+        tags = value.get("tags")
+        if tags is not None:
+            if not isinstance(tags, list) or len(tags) > 50:
+                raise RecipeLibraryError("recipe library result tags are invalid")
+            result["tags"] = [
+                self._provider_text(tag, "recipe library result tag", 80, required=True)
+                for tag in tags
+            ]
+        source = value.get("source")
+        if source is not None:
+            if not isinstance(source, Mapping):
+                raise RecipeLibraryError("recipe library result source is invalid")
+            normalized_source = {
+                key: self._provider_text(source.get(key), f"recipe library result source.{key}", maximum)
+                for key, maximum in (
+                    ("kind", 40), ("publisher", 200), ("title", 300),
+                    ("author", 200), ("relationship", 40),
+                )
+                if source.get(key) is not None
+            }
+            if source.get("url") is not None:
+                normalized_source["url"] = normalize_source_url(source.get("url"))
+            result["source"] = normalized_source
+        return result
+
+    def _external_library_get(self, reference: Mapping[str, str]) -> dict[str, Any]:
+        expected_reference = deepcopy(dict(reference))
+        library_id = expected_reference["library_id"]
+        capabilities = self._library_capabilities(library_id)
+        if not capabilities["get"]:
+            raise RecipeLibraryError("recipe library get is unsupported or read-only")
+        adapter = self.recipe_library_adapters[library_id]
+        try:
+            raw = adapter.get(deepcopy(expected_reference))
+        except Exception as exc:
+            raise RecipeLibraryError("recipe library get is unavailable") from exc
+        if not isinstance(raw, Mapping):
+            raise RecipeLibraryError("recipe library get returned invalid data")
+        returned = validate_library_recipe_ref(raw.get("library_recipe_ref"))
+        if (
+            returned["library_id"] != library_id
+            or returned["recipe_id"] != expected_reference["recipe_id"]
+            or (
+                expected_reference.get("version") is not None
+                and returned.get("version") != expected_reference["version"]
+            )
+        ):
+            raise RecipeLibraryError("recipe library get returned a missing or stale identity")
+        recipe = normalize_recipe(raw)
+        recipe["library_recipe_ref"] = returned
+        recipe["recipe_key"] = library_recipe_key(returned)
+        return recipe
+
+    @staticmethod
+    def _outbound_library_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        if snapshot.get("rights", {}).get("storage") != "link_only":
+            return deepcopy(dict(snapshot))
+        return {
+            key: deepcopy(snapshot[key])
+            for key in ("schema_version", "name", "language", "tags", "source", "rights", "external_snapshot")
+            if key in snapshot
+        }
+
+    @staticmethod
+    def _outbound_library_operation(operation: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            key: deepcopy(operation[key])
+            for key in (
+                "operation_id", "kind", "library_id", "target_recipe_id",
+                "request_digest", "idempotency_key", "requested_status", "status",
+                "source_identity", "snapshot_digest", "dispatched_at", "created_at", "updated_at",
+            )
+            if key in operation
+        }
+
+    def _validated_library_create_result(
+        self,
+        value: Any,
+        snapshot: Mapping[str, Any],
+        library_id: str,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        if not isinstance(value, Mapping) or not isinstance(value.get("recipe"), Mapping):
+            raise RecipeLibraryError("recipe library create did not provide a semantic readback")
+        reference = validate_library_recipe_ref(value.get("library_recipe_ref"))
+        if reference["library_id"] != library_id:
+            raise RecipeLibraryError("recipe library create returned the wrong library identity")
+        returned = normalize_recipe(value["recipe"])
+        if canonical(returned.get("source")) != canonical(snapshot.get("source")) or canonical(returned.get("rights")) != canonical(snapshot.get("rights")):
+            raise RecipeLibraryError("recipe library create did not preserve attribution and storage rights")
+        returned["library_recipe_ref"] = reference
+        returned["recipe_key"] = library_recipe_key(reference)
+        return reference, returned
+
+    @staticmethod
+    def _library_operation_response(operation: Mapping[str, Any]) -> dict[str, Any]:
+        result = {
+            "saved": operation.get("status") == "confirmed",
+            "library_id": operation.get("library_id"),
+            "status": operation.get("status"),
+            "operation_id": operation.get("operation_id"),
+        }
+        if operation.get("library_recipe_ref") is not None:
+            result["library_recipe_ref"] = deepcopy(operation["library_recipe_ref"])
+        if operation.get("error_code") is not None:
+            result["error_code"] = operation["error_code"]
+        if operation.get("error") is not None:
+            result["error"] = operation["error"]
+        return result
+
+    def _save_discovery_to_library(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        if not self._recipe_operations_recovered:
+            self.recipes.recover_library_operations()
+            self._recipe_operations_recovered = True
+        discovery_ref = request.get("discovery_ref")
+        explicit_target = request.get("library_id")
+        if explicit_target is None:
+            bound = self.recipes.bound_library_for_discovery(
+                discovery_ref, idempotency_key=request.get("idempotency_key")
+            )
+            target = bound or self.primary_recipe_library_id
+        else:
+            target = validate_library_id(explicit_target)
+        if target not in self.recipe_libraries:
+            raise RecipeLibraryError("library_id must name one exact configured recipe library")
+        operation = self.recipes.begin_library_create(
+            discovery_ref,
+            target,
+            status=str(request.get("status") or "active"),
+            idempotency_key=request.get("idempotency_key"),
+        )
+        if operation["status"] in {"confirmed", "failed"}:
+            return self._library_operation_response(operation)
+        connection = self.recipe_libraries[target]
+        adapter = self.recipe_library_adapters.get(target)
+        if target != "builtin":
+            if operation["status"] != "uncertain" and connection["read_only"]:
+                failed = self.recipes.finish_library_create(
+                    operation["operation_id"], "failed",
+                    error_code="unsupported", error="recipe library create is unsupported or read-only",
+                )
+                return self._library_operation_response(failed)
+            try:
+                capabilities = self._library_capabilities(target)
+            except RecipeLibraryError:
+                if operation["status"] == "uncertain":
+                    return self._library_operation_response(operation)
+                pending = dict(operation)
+                pending.update({
+                    "error_code": "adapter_unavailable",
+                    "error": "optional recipe library is unavailable before dispatch",
+                })
+                return self._library_operation_response(pending)
+            if operation["status"] != "uncertain" and (
+                not capabilities["create_from_discovery"]
+            ):
+                failed = self.recipes.finish_library_create(
+                    operation["operation_id"], "failed",
+                    error_code="unsupported", error="recipe library create is unsupported or read-only",
+                )
+                return self._library_operation_response(failed)
+        if operation["status"] == "uncertain":
+            if target == "builtin":
+                pass
+            elif not capabilities["reconcile_create"]:
+                return self._library_operation_response(operation)
+            else:
+                current = self.recipes.library_operation_snapshot(operation["operation_id"])
+                try:
+                    reconciled = adapter.reconcile_create(
+                        self._outbound_library_snapshot(current["snapshot"]),
+                        self._outbound_library_operation(current),
+                    )
+                    if reconciled is None:
+                        return self._library_operation_response(current)
+                    reference, recipe = self._validated_library_create_result(
+                        reconciled, current["snapshot"], target
+                    )
+                    confirmed = self.recipes.finish_library_create(
+                        operation["operation_id"], "confirmed", library_recipe_ref=reference
+                    )
+                    response = self._library_operation_response(confirmed)
+                    response["recipe"] = recipe
+                    return response
+                except Exception:
+                    return self._library_operation_response(current)
+        resume_builtin = operation["status"] == "uncertain" and target == "builtin"
+        if not resume_builtin:
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            if not claimed["claimed"]:
+                return self._library_operation_response(claimed)
+        current = self.recipes.library_operation_snapshot(operation["operation_id"])
+        if target == "builtin":
+            try:
+                saved = self.recipes.save_discovery(
+                    discovery_ref,
+                    status=current["requested_status"],
+                    idempotency_key=request.get("idempotency_key"),
+                )
+                conflict = saved.pop("conflict", None)
+                if conflict is not None:
+                    failed = self.recipes.finish_library_create(
+                        operation["operation_id"], "failed",
+                        error_code="source_conflict", error="source identity has different content",
+                    )
+                    response = self._library_operation_response(failed)
+                    response["recipe"] = saved
+                    response["conflict"] = conflict
+                    return response
+                reference = saved["library_recipe_ref"]
+            except RecipeError:
+                failed = self.recipes.finish_library_create(
+                    operation["operation_id"], "failed",
+                    error_code="builtin_rejected", error="built-in recipe save was rejected",
+                )
+                return self._library_operation_response(failed)
+            try:
+                confirmed = self.recipes.finish_library_create(
+                    operation["operation_id"], "confirmed", library_recipe_ref=reference
+                )
+                response = self._library_operation_response(confirmed)
+                response["recipe"] = saved
+                return response
+            except RecipeError:
+                uncertain = self.recipes.finish_library_create(
+                    operation["operation_id"], "uncertain",
+                    error_code="builtin_uncertain", error="built-in recipe save needs reconciliation",
+                )
+                return self._library_operation_response(uncertain)
+        try:
+            created = adapter.create_from_snapshot(
+                self._outbound_library_snapshot(current["snapshot"]),
+                self._outbound_library_operation(current),
+            )
+            reference, recipe = self._validated_library_create_result(
+                created, current["snapshot"], target
+            )
+            confirmed = self.recipes.finish_library_create(
+                operation["operation_id"], "confirmed", library_recipe_ref=reference
+            )
+            response = self._library_operation_response(confirmed)
+            response["recipe"] = recipe
+            return response
+        except RecipeLibraryDefiniteError:
+            failed = self.recipes.finish_library_create(
+                operation["operation_id"], "failed",
+                error_code="provider_rejected", error="recipe library definitely rejected the create",
+            )
+            return self._library_operation_response(failed)
+        except Exception:
+            uncertain = self.recipes.finish_library_create(
+                operation["operation_id"], "uncertain",
+                error_code="provider_uncertain", error="recipe library create may have been dispatched; do not retry",
+            )
+            return self._library_operation_response(uncertain)
+
     def _recipes(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "search")
         if action == "discover":
             return self._discover_recipes(request)
+        if action == "libraries":
+            libraries = []
+            for library_id, connection in self.recipe_libraries.items():
+                item = {
+                    key: deepcopy(connection[key])
+                    for key in ("library_id", "provider", "display_name", "read_only")
+                    if key in connection
+                }
+                item["primary"] = library_id == self.primary_recipe_library_id
+                try:
+                    item["capabilities"] = self._library_capabilities(library_id)
+                    item["status"] = "available"
+                except Exception:
+                    item["capabilities"] = None
+                    item["status"] = "unavailable"
+                libraries.append(item)
+            return {"primary_recipe_library_id": self.primary_recipe_library_id, "recipe_libraries": libraries}
         if action == "search":
+            requested_ids = request.get("library_ids")
+            if requested_ids is not None:
+                if request.get("library_id") is not None or not isinstance(requested_ids, list) or not 1 <= len(requested_ids) <= 20:
+                    raise RecipeLibraryError("cross-library search requires one to 20 exact library_ids and no library_id")
+                library_ids = [validate_library_id(item) for item in requested_ids]
+                if len(library_ids) != len(set(library_ids)):
+                    raise RecipeLibraryError("cross-library search library_ids must be unique")
+            else:
+                selected = self.primary_recipe_library_id if request.get("library_id") is None else request.get("library_id")
+                library_ids = [validate_library_id(selected)]
+            if any(item not in self.recipe_libraries for item in library_ids):
+                raise RecipeLibraryError("library_id must name one exact configured recipe library")
+            if requested_ids is None and library_ids == ["builtin"] and request.get("cursor") is not None:
+                raise RecipeLibraryError("built-in recipe search has no continuation cursor")
+            if requested_ids is not None or library_ids != ["builtin"]:
+                query = self._provider_text(request.get("query", ""), "recipe library query", 200) or ""
+                filters = request.get("filters")
+                if filters is None:
+                    filters = {}
+                if not isinstance(filters, Mapping) or len(filters) > 20:
+                    raise RecipeLibraryError("recipe library filters must be a bounded object")
+                try:
+                    encoded_filters = json.dumps(
+                        filters, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+                    ).encode("utf-8")
+                except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+                    raise RecipeLibraryError("recipe library filters must be JSON data") from exc
+                if len(encoded_filters) > 16 * 1024:
+                    raise RecipeLibraryError("recipe library filters are too large")
+                raw_cursor = request.get("cursor")
+                cursor_by_library: dict[str, str | None] = {}
+                if requested_ids is not None:
+                    if raw_cursor is not None:
+                        if not isinstance(raw_cursor, Mapping) or len(raw_cursor) > len(library_ids):
+                            raise RecipeLibraryError("cross-library cursor must map exact library_ids to cursors")
+                        if any(key not in library_ids for key in raw_cursor):
+                            raise RecipeLibraryError("cross-library cursor names an unselected library_id")
+                        for key, value in raw_cursor.items():
+                            cursor_by_library[key] = (
+                                None if value is None else
+                                self._provider_text(value, "recipe library cursor", 500, required=True)
+                            )
+                else:
+                    if isinstance(raw_cursor, Mapping):
+                        raise RecipeLibraryError("single-library cursor must be exact text")
+                    cursor_by_library[library_ids[0]] = (
+                        None if raw_cursor is None else
+                        self._provider_text(raw_cursor, "recipe library cursor", 500, required=True)
+                    )
+                if cursor_by_library.get("builtin") is not None:
+                    raise RecipeLibraryError("built-in recipe search has no continuation cursor")
+                limit = bounded_limit(request.get("limit"), default=10, maximum=50)
+                combined = []
+                cursors: dict[str, str | None] = {}
+                errors: dict[str, str] = {}
+                for library_id in library_ids:
+                    try:
+                        if library_id == "builtin":
+                            state = self.store.read()
+                            week = validate_week(request.get("week") or self._household_today(state).strftime("%G-W%V"))
+                            rows = self.recipes.search(
+                                query, limit=limit,
+                                include_archived=request.get("include_archived") is True,
+                            )
+                            for row in rows:
+                                summary = self._usage_summary(state, row["recipe_key"], week)
+                                if request.get("include_ineligible") is not True and not summary["eligible"]:
+                                    continue
+                                item = {
+                                    key: deepcopy(row.get(key))
+                                    for key in ("id", "revision", "status", "name", "language", "tags", "source", "rights", "portions")
+                                }
+                                item["library_recipe_ref"] = deepcopy(row["library_recipe_ref"])
+                                item["recipe_key"] = library_recipe_key(row["library_recipe_ref"])
+                                item["usage"] = summary
+                                combined.append(item)
+                            cursors[library_id] = None
+                            continue
+                        capabilities = self._library_capabilities(library_id)
+                        if not capabilities["search"]:
+                            raise RecipeLibraryError("recipe library search is unsupported")
+                        page = self.recipe_library_adapters[library_id].search(
+                            query, dict(filters), cursor_by_library.get(library_id), limit
+                        )
+                        if not isinstance(page, Mapping) or not isinstance(page.get("recipes"), list) or len(page["recipes"]) > limit:
+                            raise RecipeLibraryError("recipe library search returned invalid data")
+                        next_cursor = page.get("cursor")
+                        if next_cursor is not None:
+                            next_cursor = self._provider_text(next_cursor, "recipe library cursor", 500, required=True)
+                        cursors[library_id] = next_cursor
+                        combined.extend(
+                            self._normalize_library_search_item(item, library_id)
+                            for item in page["recipes"]
+                        )
+                    except Exception:
+                        if len(library_ids) == 1:
+                            raise RecipeLibraryError("recipe library search is unavailable")
+                        errors[library_id] = "recipe library search is unavailable"
+                result = {"recipes": combined, "library_ids": library_ids, "cursors": cursors}
+                if errors:
+                    result["errors"] = errors
+                return result
             state = self.store.read()
             week = validate_week(request.get("week") or self._household_today(state).strftime("%G-W%V"))
             results = []
@@ -1404,6 +1869,8 @@ class Application:
                             "portions", "created_at", "updated_at", "created_via", "content_fingerprint", "recipe_key",
                         )
                     }
+                    value["library_recipe_ref"] = deepcopy(row["library_recipe_ref"])
+                    value["recipe_key"] = library_recipe_key(row["library_recipe_ref"])
                     value["usage"] = summary
                     if include_ineligible or summary["eligible"]:
                         results.append(value)
@@ -1412,10 +1879,30 @@ class Application:
                 if len(results) == requested_limit or len(rows) < page_limit or include_ineligible:
                     break
                 page_limit = 50
-            return {"week": week, "recipes": results}
+            return {"week": week, "library_id": "builtin", "recipes": results}
         if action == "get":
-            recipe = self.recipes.get(request.get("recipe_id"), request.get("revision"))
+            supplied_reference = request.get("library_recipe_ref")
+            if supplied_reference is None:
+                library_id = self.primary_recipe_library_id if request.get("library_id") is None else request.get("library_id")
+                library_id = validate_library_id(library_id)
+                if library_id != "builtin":
+                    raise RecipeLibraryError("external recipe get requires one exact library_recipe_ref")
+                recipe = self.recipes.get(request.get("recipe_id"), request.get("revision"))
+                recipe["recipe_key"] = library_recipe_key(recipe["library_recipe_ref"])
+            else:
+                reference = validate_library_recipe_ref(supplied_reference)
+                if request.get("library_id") is not None and request["library_id"] != reference["library_id"]:
+                    raise RecipeLibraryError("library_recipe_ref does not match library_id")
+                if reference["library_id"] not in self.recipe_libraries:
+                    raise RecipeLibraryError("library_recipe_ref names an unconfigured recipe library")
+                if reference["library_id"] == "builtin":
+                    recipe = self.recipes.get(reference["recipe_id"], reference.get("version"))
+                    recipe["recipe_key"] = library_recipe_key(recipe["library_recipe_ref"])
+                else:
+                    recipe = self._external_library_get(reference)
             result = scale_recipe(recipe, request.get("portions")) if recipe["rights"]["storage"] == "full" else recipe
+            if result.get("library_recipe_ref") is not None:
+                result["recipe_key"] = library_recipe_key(result["library_recipe_ref"])
             if request.get("week"):
                 result["usage"] = self._usage_summary(self.store.read(), result["recipe_key"], validate_week(request["week"]))
             return {"recipe": result}
@@ -1429,14 +1916,10 @@ class Application:
             key = request.get("idempotency_key")
             status = str(request.get("status") or "active")
             if has_ref:
-                saved = self.recipes.save_discovery(
-                    request.get("discovery_ref"), status=status, idempotency_key=key
-                )
-                conflict = saved.pop("conflict", None)
-                response = {"saved": conflict is None, "library_id": "builtin", "recipe": saved}
-                if conflict is not None:
-                    response["conflict"] = conflict
-                return response
+                return self._save_discovery_to_library(request)
+            target = self.primary_recipe_library_id if request.get("library_id") is None else request.get("library_id")
+            if target != "builtin":
+                raise RecipeLibraryError("external recipe create requires an exact discovery_ref")
             value = normalize_recipe(request.get("recipe"))
             return {
                 "saved": True,
@@ -1444,12 +1927,16 @@ class Application:
                 "recipe": self.recipes.save(value, status=status, idempotency_key=key),
             }
         if action == "update":
+            if request.get("library_id") not in {None, "builtin"}:
+                raise RecipeLibraryError("external recipe lifecycle is not implemented")
             value = normalize_recipe(request.get("recipe"))
             recipe_id = str(request.get("recipe_id") or "")
             expected = request.get("expected_revision")
             key = request.get("idempotency_key")
             return {"recipe": self.recipes.update(recipe_id, expected, value, status=request.get("status"), idempotency_key=key)}
         if action == "archive":
+            if request.get("library_id") not in {None, "builtin"}:
+                raise RecipeLibraryError("external recipe lifecycle is not implemented")
             recipe_id = str(request.get("recipe_id") or "")
             expected = request.get("expected_revision")
             key = request.get("idempotency_key")
@@ -1459,17 +1946,22 @@ class Application:
             recipe_identity = str(request.get("recipe_key") or "")
             if request.get("recipe_id"):
                 stored_identity = self.recipes.get(request.get("recipe_id"))["recipe_key"]
-                if recipe_identity and recipe_identity != stored_identity:
+                if recipe_identity and recipe_identity not in library_recipe_key_aliases(stored_identity):
                     raise HouseholdError("recipe_id and recipe_key refer to different recipes")
-                recipe_identity = stored_identity
-            if not recipe_identity or len(recipe_identity) > 200:
+                recipe_identity = recipe_identity or stored_identity
+            if not recipe_identity or len(recipe_identity) > MAX_LIBRARY_RECIPE_KEY:
                 raise HouseholdError("recipe_key or recipe_id is required")
             menu_id = str(request.get("menu_id") or "") or None
             supplied_request_key = request.get("idempotency_key")
             if supplied_request_key is not None and (not isinstance(supplied_request_key, str) or not 1 <= len(supplied_request_key.strip()) <= 200):
                 raise HouseholdError("idempotency_key must be one to 200 characters")
             request_key = supplied_request_key.strip() if supplied_request_key else None
-            digest = canonical({"action": action, "menu_id": menu_id, "recipe_key": recipe_identity, "week": week})
+            digest = canonical({
+                "action": action,
+                "menu_id": menu_id,
+                "recipe_key": self._canonical_usage_key(recipe_identity),
+                "week": week,
+            })
             with self.store.locked() as state:
                 if request_key:
                     if existing := self._usage_request(state, request_key, digest):
@@ -1477,21 +1969,26 @@ class Application:
                 records = state.setdefault("recipe_usage", {})
                 if menu_id:
                     record = records.get(menu_id)
-                    if not isinstance(record, dict) or record.get("week") != week or recipe_identity not in record.get("recipe_keys", []):
+                    matched = (
+                        self._matching_recipe_key(recipe_identity, record.get("recipe_keys"))
+                        if isinstance(record, dict) and record.get("week") == week else None
+                    )
+                    if matched is None:
                         raise HouseholdError("menu usage record does not contain this recipe and week")
+                    recipe_identity = matched
                 else:
                     candidates = [
-                        (candidate_id, value)
+                        (candidate_id, value, self._matching_recipe_key(recipe_identity, value.get("recipe_keys")))
                         for candidate_id, value in records.items()
                         if isinstance(value, dict)
                         and value.get("week") == week
-                        and recipe_identity in value.get("recipe_keys", [])
+                        and self._matching_recipe_key(recipe_identity, value.get("recipe_keys")) is not None
                         and value.get("status") in {"planned", "ordered", "manual"}
                     ]
                     if len(candidates) > 1:
                         raise HouseholdError("multiple menu usage records match; menu_id is required")
                     if candidates:
-                        menu_id, record = candidates[0]
+                        menu_id, record, recipe_identity = candidates[0]
                     elif action == "mark_cooked":
                         menu_id = f"manual_{secrets.token_hex(10)}"
                         record = records[menu_id] = {"week": week, "status": "manual", "recipe_keys": [recipe_identity], "cooked_keys": [], "not_cooked_keys": [], "cooldown_overrides": {}, "order_id": None}
@@ -1529,7 +2026,23 @@ class Application:
                 if not isinstance(raw, Mapping):
                     raise HouseholdError("menu recipes must be objects")
                 reference = raw.get("recipe_ref")
-                if isinstance(reference, Mapping):
+                library_reference = raw.get("library_recipe_ref")
+                if reference is not None and library_reference is not None:
+                    raise RecipeLibraryError("menu recipe must use exactly one recipe reference type")
+                if library_reference is not None:
+                    checked = validate_library_recipe_ref(library_reference)
+                    if checked["library_id"] not in self.recipe_libraries:
+                        raise RecipeLibraryError("library_recipe_ref names an unconfigured recipe library")
+                    if checked["library_id"] == "builtin":
+                        stored = self.recipes.get(checked["recipe_id"], checked.get("version"))
+                        if stored.get("status") != "active" or stored.get("revision_status", stored.get("status")) != "active":
+                            raise HouseholdError("only active recipes can be added to a new menu")
+                    else:
+                        stored = self._external_library_get(checked)
+                    recipe = scale_recipe(stored, raw.get("portions"))
+                    recipe["library_recipe_ref"] = deepcopy(stored["library_recipe_ref"])
+                    recipe["recipe_key"] = library_recipe_key(recipe["library_recipe_ref"])
+                elif isinstance(reference, Mapping):
                     stored = self.recipes.get(reference.get("id"), reference.get("revision"))
                     if stored.get("status") != "active" or stored.get("revision_status", stored.get("status")) != "active":
                         raise HouseholdError("only active recipes can be added to a new menu")
@@ -1610,8 +2123,13 @@ class Application:
             supplied_menu_id = str(request.get("menu_id") or "") or None
             expected_revision = request.get("expected_revision")
             repeat_keys = request.get("allow_repeat_keys", [])
-            if not isinstance(repeat_keys, list) or len(repeat_keys) > 62 or not all(isinstance(key, str) and 1 <= len(key) <= 200 for key in repeat_keys):
+            if not isinstance(repeat_keys, list) or len(repeat_keys) > 62 or not all(isinstance(key, str) and 1 <= len(key) <= MAX_LIBRARY_RECIPE_KEY for key in repeat_keys):
                 raise HouseholdError("allow_repeat_keys must be a list of recipe keys")
+            repeat_aliases = {
+                alias
+                for repeat_key in repeat_keys
+                for alias in library_recipe_key_aliases(repeat_key)
+            }
             override_reason = str(request.get("override_reason") or "").strip()
             if repeat_keys and not override_reason:
                 raise HouseholdError("a cooldown override reason is required")
@@ -1619,7 +2137,15 @@ class Application:
                 raise HouseholdError("cooldown override reason is too long")
             digest = menu_digest(menu)
             keys = [recipe["recipe_key"] for collection in ("dishes", "salads") for recipe in menu[collection]]
-            if len(keys) != len(set(keys)):
+            seen_keys: set[str] = set()
+            duplicate_key = False
+            for key in keys:
+                aliases = library_recipe_key_aliases(key)
+                if seen_keys.intersection(aliases):
+                    duplicate_key = True
+                    break
+                seen_keys.update(aliases)
+            if duplicate_key:
                 raise HouseholdError("the same recipe cannot appear twice in one menu")
             with self.store.locked() as state:
                 current = state.get("menu")
@@ -1654,12 +2180,14 @@ class Application:
                         current.get("menu_id")
                         if isinstance(current_usage, Mapping)
                         and current_usage.get("status") == "planned"
-                        and key not in current_usage.get("cooked_keys", [])
-                        and key not in current_usage.get("cooldown_overrides", {})
+                        and self._matching_recipe_key(key, current_usage.get("cooked_keys")) is None
+                        and not library_recipe_key_aliases(key).intersection(
+                            (current_usage.get("cooldown_overrides") or {}).keys()
+                        )
                         else None
                     )
                     summary = self._usage_summary(state, key, menu["week"], ignore_menu_id=ignored_menu_id)
-                    if not summary["eligible"] and key not in repeat_keys:
+                    if not summary["eligible"] and not repeat_aliases.intersection(library_recipe_key_aliases(key)):
                         blocked.append({"recipe_key": key, "usage": summary})
                 if blocked:
                     raise HouseholdError(f"recipe cooldown blocks this menu: {canonical(blocked)}")
@@ -1672,7 +2200,11 @@ class Application:
                 state.setdefault("recipe_usage", {})[menu_id] = {
                     "week": menu["week"], "status": "planned", "recipe_keys": keys,
                     "cooked_keys": [], "not_cooked_keys": [],
-                    "cooldown_overrides": {key: override_reason for key in keys if key in repeat_keys},
+                    "cooldown_overrides": {
+                        key: override_reason
+                        for key in keys
+                        if repeat_aliases.intersection(library_recipe_key_aliases(key))
+                    },
                     "order_id": None, "updated_at": now().isoformat(),
                 }
                 return {"menu": deepcopy(menu)}
@@ -4810,6 +5342,10 @@ def config(path: Path) -> dict[str, Any]:
     profile = value.get("email_automation_profile")
     if profile is not None and (not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", profile)):
         raise SystemExit("invalid email automation profile")
+    try:
+        value.update(normalize_library_configuration(value))
+    except RecipeLibraryError as exc:
+        raise SystemExit(str(exc)) from exc
     return value
 
 
@@ -4830,6 +5366,19 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--browser-uid", type=int, default=os.getuid())
     result.add_argument("--browser-gid", type=int, default=os.getgid())
     return result
+
+
+def load_library_secret_for_state(state_directory: Path, library_id: str) -> dict[str, Any]:
+    """Resolve both the standard HOME/state and the state-root Compose layouts."""
+    state = Path(state_directory)
+    homes = [state, state.parent]
+    matches = [home for home in homes if secret_path(home, library_id).exists()]
+    if len(matches) > 1:
+        raise RecipeLibraryError("recipe library credential location is ambiguous")
+    if matches:
+        return load_library_secret(matches[0], library_id)
+    conventional = state.parent if state.name == "state" else state
+    return load_library_secret(conventional, library_id)
 
 
 def main() -> None:
@@ -4858,11 +5407,24 @@ def main() -> None:
     email_provider_clients: dict[str, Any] = {}
     if settings["provider"] == "meny" and args.tokens is not None and args.tokens.is_dir():
         email_provider_clients["oda"] = OdaClient(args.tokens)
+    recipe_library_adapters: dict[str, RecipeLibraryAdapter] = {}
+    for connection in settings["recipe_libraries"]:
+        library_id = connection["library_id"]
+        if library_id == "builtin":
+            continue
+        try:
+            credential = load_library_secret_for_state(args.state, library_id)
+            recipe_library_adapters[library_id] = load_optional_adapter(connection, credential)
+        except RecipeLibraryError:
+            # An optional connection is reported unavailable by the recipes tool;
+            # it must not block the built-in bank or grocery/order paths.
+            continue
     app = Application(
         StateStore(args.state, settings),
         provider_client,
         OdaBrowser(**browser_arguments),
         email_provider_clients=email_provider_clients,
+        recipe_library_adapters=recipe_library_adapters,
     )
     Server(args.socket, args.socket_group, args.agent_uid, app).run()
 

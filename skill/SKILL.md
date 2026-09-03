@@ -36,8 +36,15 @@ individual unavailable/empty/timeout source as a soft failure and state it
 briefly only when useful. Search the target week so bank cooldown eligibility
 is applied. Do not silently use an ineligible
 repeat. If the user deliberately wants one, pass only the exact returned recipe
-key in `allow_repeat_keys` with a concise reason. Materialize a saved recipe by
-its exact ID and revision plus desired portions; never invent or retain provider
+key in `allow_repeat_keys` with a concise reason. Use `library_recipe_ref` for a
+personal-library recipe and legacy `recipe_ref` only for built-in compatibility.
+Personal-library search defaults to the configured exact primary ID;
+cross-library search is explicit. Provider type, display name, recipe
+title/slug/URL, list position and “latest” never select a connection or recipe.
+If a provider name matches zero or several connections, ask once for the exact
+`library_id` shown by the libraries action. Menu save performs one exact get and
+freezes the validated/scaled recipe. Missing, stale, link-only or unavailable
+external data fails without inline/name/built-in fallback. Never invent or retain provider
 product IDs in recipe data. Every new inline recipe must carry explicit source,
 relationship and rights metadata; use `generated`, `user_supplied` or `unknown`
 only when that is the honest provenance, never to relabel provider content. On a menu update or clear, pass the current `menu_id` and
@@ -96,14 +103,17 @@ ask. An unattended scheduled run with any unresolved cart state stops in
 `cart_ready`/`needs_input`; it never applies the suggested default automatically.
 
 Save a discovered recipe only on a clear request. When one displayed result is
-clearly selected, pass its exact `discovery_ref` to `recipes save`; never copy
+clearly selected, pass its exact `discovery_ref` to `recipes save`; pass an
+exact configured `library_id` only when the user selected that connection. Never copy
 the document field by field, refetch it, or guess from its name or position. If
 “this” is ambiguous, ask which displayed recipe. A `discovery_ref` is separate
 from the built-in menu `recipe_ref: {id, revision}` and from the
-provider-neutral `library_recipe_ref: {library_id, recipe_id, version}` defined
-by the optional library boundary; none of these technical references is
-user-facing. After a successful save, confirm the returned recipe name, source,
-and exact `library_id`. On a returned source-change conflict, explain that the
+provider-neutral `library_recipe_ref: {library_id, recipe_id, version?}`; none
+of these technical references is user-facing. An omitted target resolves once
+to the configured primary, and the journal keeps retries bound there after a
+primary change. Never retry or retarget `uncertain`, and never fall back to
+built-in; only advertised create reconciliation may proceed. After a successful
+save, confirm the returned recipe name, source, and exact `library_id`. On a returned source-change conflict, explain that the
 existing recipe was not changed and ask whether the user wants a separate
 explicit update using its returned revision. Preserve explicit source and
 rights facts; do not guess a license or claim authorship. Store original
