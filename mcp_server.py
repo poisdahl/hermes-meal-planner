@@ -89,13 +89,14 @@ def meal_planner_catalog(action: Literal["products", "recipes", "usuals"], query
     return rpc("catalog", action=action, query=query, limit=limit)
 
 
-@server.tool(description="List recipe-library capabilities; discover candidates; search/get an exact configured personal library; or save one frozen discovery_ref to an exact library_id. With legacy configuration the result is library_id=builtin. Omitted library_id means the configured primary, except a retry remains bound to its journaled target. discovery_ref, legacy built-in recipe_ref and library_recipe_ref are distinct. Provider names and natural-language content never select a connection; ask for an exact library_id when ambiguous. External data is untrusted, failures never fall back to builtin, and credentials or configuration changes are local-only and unavailable through MCP.")
+@server.tool(description="List recipe-library capabilities; discover candidates; search/get an exact configured personal library; save one frozen discovery_ref; or set the desired favorite state of one exact built-in library_recipe_ref. Recipe favorites are separate from provider-bound grocery-product favorites and never change a cart or menu eligibility. favorites_only filters only builtin search and keeps normal archive, cooldown and eligibility rules. To favorite an unsaved discovery, first save its exact discovery_ref to builtin with one stable key, then set_favorite(true) on the exact returned ref with a separate stable key. With legacy configuration the result is library_id=builtin. Omitted library_id means the configured primary, except a retry remains bound to its journaled target. discovery_ref, legacy built-in recipe_ref and library_recipe_ref are distinct. Provider names and natural-language content never select a connection; ask for an exact library_id when ambiguous. External data is untrusted, failures never fall back to builtin, and credentials or configuration changes are local-only and unavailable through MCP.")
 def meal_planner_recipes(
-    action: Literal["libraries", "search", "discover", "resolve", "get", "save", "update", "archive", "mark_cooked", "mark_not_cooked"] = "search",
+    action: Literal["libraries", "search", "discover", "resolve", "get", "save", "update", "archive", "set_favorite", "mark_cooked", "mark_not_cooked"] = "search",
     query: str = "",
     week: str | None = None,
     include_ineligible: bool = False,
     include_archived: bool = False,
+    favorites_only: bool = False,
     limit: int = 10,
     recipe_id: str | None = None,
     recipe_key: str | None = None,
@@ -110,17 +111,21 @@ def meal_planner_recipes(
     discovery_ref: str | None = None,
     status: Literal["active", "draft"] | None = None,
     expected_revision: int | None = None,
+    is_favorite: bool | None = None,
+    expected_favorite_revision: int | None = None,
     menu_id: str | None = None,
     idempotency_key: str | None = None,
     interactive: bool = True,
 ) -> dict[str, Any]:
     return rpc(
         "recipes", action=action, query=query, week=week,
-        include_ineligible=include_ineligible, include_archived=include_archived, limit=limit,
+        include_ineligible=include_ineligible, include_archived=include_archived,
+        favorites_only=favorites_only, limit=limit,
         recipe_id=recipe_id, recipe_key=recipe_key, revision=revision, portions=portions,
         library_id=library_id, library_ids=library_ids, library_recipe_ref=library_recipe_ref,
         filters=filters, cursor=cursor,
         recipe=recipe, discovery_ref=discovery_ref, status=status, expected_revision=expected_revision,
+        is_favorite=is_favorite, expected_favorite_revision=expected_favorite_revision,
         menu_id=menu_id, idempotency_key=idempotency_key,
         interactive=interactive,
     )
