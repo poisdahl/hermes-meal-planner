@@ -48,7 +48,7 @@ RESTRICTED_FULL_HOSTS = {"meny.no", "www.meny.no", "oda.com", "www.oda.com"}
 SERVER_FIELDS = {
     "id", "revision", "status", "created_at", "updated_at", "created_via",
     "recipe_key", "content_fingerprint", "content_hash", "shopping_requirements",
-    "library_recipe_ref",
+    "library_id", "library_recipe_ref", "is_favorite", "favorite_revision",
 }
 
 
@@ -606,6 +606,26 @@ class RecipeStore:
         if cursor.rowcount != 1:
             raise RecipeError("recipe bank migration could not advance schema version")
 
+    def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
+        connection.execute("""CREATE TABLE recipe_favorites (
+            library_id TEXT NOT NULL CHECK(library_id = 'builtin'),
+            recipe_id TEXT NOT NULL,
+            is_favorite INTEGER NOT NULL CHECK(is_favorite IN (0, 1)),
+            favorite_revision INTEGER NOT NULL CHECK(favorite_revision >= 1),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(library_id, recipe_id),
+            FOREIGN KEY(recipe_id) REFERENCES recipes(id) ON DELETE CASCADE
+        )""")
+        connection.execute(
+            "CREATE INDEX recipe_favorites_state ON recipe_favorites(library_id, is_favorite)"
+        )
+        cursor = connection.execute(
+            "UPDATE metadata SET value='4' WHERE key='schema_version' AND value='3'"
+        )
+        if cursor.rowcount != 1:
+            raise RecipeError("recipe bank migration could not advance schema version")
+
     def _schema(self, connection: sqlite3.Connection) -> None:
         metadata = self._metadata(connection)
         if metadata is None:
@@ -623,7 +643,7 @@ class RecipeStore:
                 "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
             )
             version = "1"
-        if version not in {"1", "2", "3"}:
+        if version not in {"1", "2", "3", "4"}:
             raise RecipeError("recipe bank schema is newer than this meal planner")
         row = connection.execute("SELECT value FROM metadata WHERE key='household'").fetchone()
         if row is None:
@@ -640,6 +660,9 @@ class RecipeStore:
             version = "2"
         if version == "2":
             self._migrate_v2_to_v3(connection)
+            version = "3"
+        if version == "3":
+            self._migrate_v3_to_v4(connection)
         namespace = connection.execute(
             "SELECT value FROM metadata WHERE key='discovery_namespace'"
         ).fetchone()
@@ -670,6 +693,25 @@ class RecipeStore:
             ("idempotency", "key"),
             ("discovery_snapshots", "discovery_ref"),
             ("discovery_bindings", "destination, discovery_ref"),
+        ):
+            digest.update(table.encode())
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
+                digest.update(_canonical(list(row)).encode())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _v3_digest(connection: sqlite3.Connection) -> str:
+        digest = hashlib.sha256()
+        for table, order in (
+            ("metadata", "key"),
+            ("recipes", "id"),
+            ("revisions", "recipe_id, revision"),
+            ("idempotency", "key"),
+            ("discovery_snapshots", "discovery_ref"),
+            ("discovery_bindings", "destination, discovery_ref"),
+            ("library_operations", "operation_id"),
+            ("library_mappings", "library_id, source_identity, snapshot_digest"),
+            ("library_connection_controls", "library_id"),
         ):
             digest.update(table.encode())
             for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
@@ -808,6 +850,80 @@ class RecipeStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _validate_v3_backup(self, backup: Path, current: sqlite3.Connection) -> None:
+        try:
+            backup_status = backup.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RecipeError("existing recipe v3 backup is invalid") from exc
+        if not stat.S_ISREG(backup_status.st_mode):
+            raise RecipeError("existing recipe v3 backup is invalid")
+        try:
+            live_status = self.path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+        if (backup_status.st_dev, backup_status.st_ino) == (live_status.st_dev, live_status.st_ino):
+            raise RecipeError("existing recipe v3 backup is invalid")
+        try:
+            source = sqlite3.connect(
+                f"{backup.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            try:
+                if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise RecipeError("existing recipe v3 backup is invalid")
+                metadata = dict(source.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('household', 'schema_version')"
+                ).fetchall())
+                if metadata != {"household": self.household, "schema_version": "3"}:
+                    raise RecipeError("existing recipe v3 backup is invalid")
+                if self._v3_digest(source) != self._v3_digest(current):
+                    raise RecipeError("existing recipe v3 backup is stale")
+            finally:
+                source.close()
+        except sqlite3.Error as exc:
+            raise RecipeError("existing recipe v3 backup is invalid") from exc
+        if backup_status.st_mode & 0o777 != 0o600:
+            raise RecipeError("existing recipe v3 backup is not private")
+
+    def _backup_v3(self, connection: sqlite3.Connection) -> None:
+        backup = self.path.with_name("recipes-v3.backup.sqlite3")
+        try:
+            backup.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            self._validate_v3_backup(backup, connection)
+            return
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".recipes-v3.backup.", suffix=".sqlite3", dir=backup.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.close(descriptor)
+            source = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            destination = sqlite3.connect(str(temporary), timeout=2.0)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+            os.chmod(temporary, 0o600)
+            self._validate_v3_backup(temporary, connection)
+            with temporary.open("rb") as copied:
+                os.fsync(copied.fileno())
+            try:
+                os.link(temporary, backup, follow_symlinks=False)
+            except FileExistsError:
+                self._validate_v3_backup(backup, connection)
+            directory_descriptor = os.open(backup.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def _connect(self, target: str | None = None) -> sqlite3.Connection:
         if target is None:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -825,7 +941,7 @@ class RecipeStore:
             if metadata is not None:
                 if metadata.get("household") not in {None, self.household}:
                     raise RecipeError("recipe bank belongs to a different household")
-                if metadata.get("schema_version") not in {None, "1", "2", "3"}:
+                if metadata.get("schema_version") not in {None, "1", "2", "3", "4"}:
                     raise RecipeError("recipe bank schema is newer than this meal planner")
             recipes_exist = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recipes'"
@@ -855,6 +971,22 @@ class RecipeStore:
             )
             if nonempty_v2:
                 self._backup_v2(connection)
+            nonempty_v3 = (
+                target is None
+                and existed
+                and metadata is not None
+                and metadata.get("schema_version") == "3"
+                and any(
+                    connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+                    for table in (
+                        "recipes", "revisions", "idempotency",
+                        "discovery_snapshots", "discovery_bindings",
+                        "library_operations", "library_mappings", "library_connection_controls",
+                    )
+                )
+            )
+            if nonempty_v3:
+                self._backup_v3(connection)
             self._schema(connection)
             self._cleanup_library_data(connection)
             self._cleanup_discoveries(connection)
@@ -886,7 +1018,36 @@ class RecipeStore:
         return " ".join(_normalized_text(value) for value in [recipe.get("name"), *(recipe.get("tags") or []), source.get("publisher"), source.get("author")] if value)
 
     @staticmethod
-    def _record(row: sqlite3.Row, *, created: bool | None = None) -> dict[str, Any]:
+    def _favorite_state(connection: sqlite3.Connection, recipe_id: str) -> dict[str, Any]:
+        row = connection.execute(
+            "SELECT is_favorite, favorite_revision, created_at, updated_at "
+            "FROM recipe_favorites WHERE library_id='builtin' AND recipe_id=?",
+            (recipe_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "library_id": "builtin",
+                "is_favorite": False,
+                "favorite_revision": 0,
+                "favorite_created_at": None,
+                "favorite_updated_at": None,
+            }
+        return {
+            "library_id": "builtin",
+            "is_favorite": bool(row["is_favorite"]),
+            "favorite_revision": row["favorite_revision"],
+            "favorite_created_at": row["created_at"],
+            "favorite_updated_at": row["updated_at"],
+        }
+
+    @classmethod
+    def _record(
+        cls,
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        created: bool | None = None,
+    ) -> dict[str, Any]:
         result = _stored_recipe_document(row["document"])
         result.update({
             "id": row["id"], "revision": row["revision"], "status": row["status"],
@@ -897,6 +1058,8 @@ class RecipeStore:
                 "library_id": "builtin", "recipe_id": row["id"], "version": str(row["revision"]),
             },
         })
+        favorite = cls._favorite_state(connection, row["id"])
+        result.update({key: favorite[key] for key in ("library_id", "is_favorite", "favorite_revision")})
         if created is not None:
             result["created"] = created
         return result
@@ -916,6 +1079,14 @@ class RecipeStore:
         if not isinstance(decoded, Mapping):
             raise RecipeError("recipe bank is unavailable")
         result = dict(decoded)
+        reference = result.get("library_recipe_ref")
+        result_recipe_id = result.get("id")
+        if isinstance(reference, Mapping) and reference.get("library_id") == "builtin":
+            result_recipe_id = reference.get("recipe_id")
+        if isinstance(result_recipe_id, str) and connection.execute(
+            "SELECT 1 FROM recipes WHERE id=?", (result_recipe_id,)
+        ).fetchone() is None:
+            raise RecipeError("idempotency key belongs to a permanently deleted recipe")
         result["idempotent"] = True
         result["created"] = False
         return result
@@ -1044,7 +1215,8 @@ class RecipeStore:
             datetime.now(timezone.utc) - timedelta(days=FAILED_LIBRARY_OPERATION_TTL_DAYS)
         ).isoformat()
         connection.execute(
-            "DELETE FROM library_operations WHERE status='failed' AND updated_at <= ?",
+            "DELETE FROM library_operations WHERE status='failed' "
+            "AND (error_code IS NULL OR error_code!='recipe_deleted') AND updated_at <= ?",
             (cutoff,),
         )
 
@@ -1072,11 +1244,54 @@ class RecipeStore:
                     "SELECT 1 FROM library_connection_controls WHERE library_id=?", (library,)
                 ).fetchone() is not None:
                     raise RecipeError("recipe library connection is disabled")
+                if key is not None:
+                    keyed = connection.execute(
+                        "SELECT * FROM library_operations WHERE library_id=? AND idempotency_key=?",
+                        (library, key),
+                    ).fetchone()
+                    if keyed is not None:
+                        if keyed["error_code"] == "recipe_deleted":
+                            raise RecipeError(
+                                "idempotency key was already used for a permanently deleted recipe"
+                            )
+                        keyed_result = self._library_operation(keyed)
+                        if keyed["kind"] != "create" or keyed_result["requested_status"] != status:
+                            raise RecipeError(
+                                "idempotency key was already used for another library operation"
+                            )
+                        if keyed["discovery_ref"] == ref:
+                            return keyed_result
+                        snapshot = connection.execute(
+                            "SELECT snapshot_key, source_identity FROM discovery_snapshots "
+                            "WHERE discovery_ref=?",
+                            (ref,),
+                        ).fetchone()
+                        if snapshot is None:
+                            raise RecipeError("discovery reference was not found")
+                        request_digest = _hash({
+                            "kind": "create",
+                            "library_id": library,
+                            "snapshot_digest": snapshot["snapshot_key"],
+                            "status": status,
+                        })
+                        if (
+                            keyed["request_digest"] != request_digest
+                            or keyed["source_identity"] != snapshot["source_identity"]
+                            or keyed["snapshot_digest"] != snapshot["snapshot_key"]
+                        ):
+                            raise RecipeError(
+                                "idempotency key was already used for another library operation"
+                            )
+                        return keyed_result
                 existing = connection.execute(
                     "SELECT * FROM library_operations WHERE library_id=? AND discovery_ref=? AND kind='create'",
                     (library, ref),
                 ).fetchone()
                 if existing is not None:
+                    if key is not None:
+                        raise RecipeError(
+                            "discovery was already saved with a different idempotency key"
+                        )
                     return self._library_operation(existing)
                 resolved = self._resolved_snapshot(connection, ref)
                 snapshot = connection.execute(
@@ -1085,6 +1300,12 @@ class RecipeStore:
                 ).fetchone()
                 if snapshot is None:
                     raise RecipeError("discovery reference was not found")
+                request_digest = _hash({
+                    "kind": "create",
+                    "library_id": library,
+                    "snapshot_digest": snapshot["snapshot_key"],
+                    "status": status,
+                })
                 mapped = connection.execute(
                     "SELECT operation_id FROM library_mappings WHERE library_id=? "
                     "AND source_identity=? AND snapshot_digest=?",
@@ -1097,11 +1318,6 @@ class RecipeStore:
                     ).fetchone()
                     if prior is None or prior["status"] != "confirmed":
                         raise RecipeError("recipe library journal is unavailable")
-                    if key is not None and connection.execute(
-                        "SELECT 1 FROM library_operations WHERE library_id=? AND idempotency_key=?",
-                        (library, key),
-                    ).fetchone() is not None:
-                        raise RecipeError("idempotency key was already used for another library operation")
                     self._cleanup_library_data(connection)
                     if connection.execute("SELECT COUNT(*) FROM library_operations").fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
                         raise RecipeError("recipe library operation journal is full")
@@ -1113,7 +1329,8 @@ class RecipeStore:
                         result_metadata, provider_recipe_id, provider_version, error_code, error_text,
                         dispatched_at, created_at, updated_at
                     ) VALUES(?, 'create', ?, ?, NULL, ?, ?, ?, 'confirmed', ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)""", (
-                        operation_id, library, ref, prior["request_digest"], prior["request_metadata"], key,
+                        operation_id, library, ref, request_digest,
+                        _canonical({"status": status}), key,
                         snapshot["source_identity"], snapshot["snapshot_key"], prior["result_metadata"],
                         prior["provider_recipe_id"], prior["provider_version"], prior["dispatched_at"],
                         timestamp, timestamp,
@@ -1121,19 +1338,6 @@ class RecipeStore:
                     return self._library_operation(connection.execute(
                         "SELECT * FROM library_operations WHERE operation_id=?", (operation_id,)
                     ).fetchone())
-                request_digest = _hash({
-                    "kind": "create",
-                    "library_id": library,
-                    "snapshot_digest": snapshot["snapshot_key"],
-                    "status": status,
-                })
-                if key is not None:
-                    reused = connection.execute(
-                        "SELECT 1 FROM library_operations WHERE library_id=? AND idempotency_key=?",
-                        (library, key),
-                    ).fetchone()
-                    if reused is not None:
-                        raise RecipeError("idempotency key was already used for another library operation")
                 conflict = connection.execute(
                     "SELECT 1 FROM library_operations WHERE library_id=? AND source_identity=? "
                     "AND snapshot_digest != ? AND status IN ('pending','confirmed','uncertain') LIMIT 1",
@@ -1218,11 +1422,24 @@ class RecipeStore:
             with self._connection() as connection:
                 ref = self._discovery_ref(connection, ref)
                 if key is not None:
-                    rows = connection.execute(
-                        "SELECT library_id FROM library_operations WHERE discovery_ref=? "
-                        "AND kind='create' AND idempotency_key=?",
-                        (ref, key),
-                    ).fetchall()
+                    snapshot = connection.execute(
+                        "SELECT snapshot_key, source_identity FROM discovery_snapshots "
+                        "WHERE discovery_ref=?",
+                        (ref,),
+                    ).fetchone()
+                    if snapshot is None:
+                        rows = connection.execute(
+                            "SELECT DISTINCT library_id FROM library_operations "
+                            "WHERE kind='create' AND idempotency_key=?",
+                            (key,),
+                        ).fetchall()
+                    else:
+                        rows = connection.execute(
+                            "SELECT DISTINCT library_id FROM library_operations WHERE kind='create' "
+                            "AND idempotency_key=? AND (discovery_ref=? OR "
+                            "(source_identity IS ? AND snapshot_digest=?))",
+                            (key, ref, snapshot["source_identity"], snapshot["snapshot_key"]),
+                        ).fetchall()
                     if len(rows) > 1:
                         raise RecipeError("discovery save has multiple bound targets; exact library_id is required")
                     if rows:
@@ -1557,6 +1774,8 @@ class RecipeStore:
             "created": False,
             "idempotent": True,
         })
+        favorite = self._favorite_state(connection, current["id"])
+        result.update({key: favorite[key] for key in ("library_id", "is_favorite", "favorite_revision")})
         return result
 
     def save_discovery(self, value: Any, *, status: str = "active", idempotency_key: Any = None) -> dict[str, Any]:
@@ -1593,7 +1812,7 @@ class RecipeStore:
                         existing_content_hash != resolved["content_hash"]
                         or existing_attribution_digest != resolved["attribution_digest"]
                     ):
-                        result = self._record(existing, created=False)
+                        result = self._record(connection, existing, created=False)
                         result["conflict"] = {
                             "kind": "source_changed",
                             "discovery_ref": ref,
@@ -1605,7 +1824,7 @@ class RecipeStore:
                         }
                         self._store_idem(connection, key, "save_discovery", request_hash, result)
                         return result
-                result = self._record(existing, created=False) if existing is not None else self._save(connection, recipe, status, None, "discovery")
+                result = self._record(connection, existing, created=False) if existing is not None else self._save(connection, recipe, status, None, "discovery")
                 timestamp = _now()
                 connection.execute("""
                     INSERT INTO discovery_bindings(
@@ -1637,7 +1856,7 @@ class RecipeStore:
             if duplicate is not None:
                 if duplicate["content_hash"] != content_hash:
                     raise RecipeError("source identity already belongs to a different recipe revision")
-                result = self._record(duplicate, created=False)
+                result = self._record(connection, duplicate, created=False)
                 result["duplicate"] = "source_key"
                 self._store_idem(connection, key, "save", request_hash, result)
                 return result
@@ -1651,7 +1870,7 @@ class RecipeStore:
         )
         connection.execute("INSERT INTO revisions VALUES(?,?,?,?,?)", (recipe_id, 1, status, _canonical(recipe), created_at))
         row = connection.execute("SELECT * FROM recipes WHERE id=?", (recipe_id,)).fetchone()
-        result = self._record(row, created=True)
+        result = self._record(connection, row, created=True)
         if warning:
             result["duplicate_warning"] = {"kind": "content_fingerprint", "recipe_id": warning["id"]}
         self._store_idem(connection, key, "save", request_hash, result)
@@ -1675,11 +1894,12 @@ class RecipeStore:
             revision = int(revision)
         try:
             with self._connection() as connection:
+                connection.execute("BEGIN")
                 if revision is None:
                     row = connection.execute("SELECT * FROM recipes WHERE id=?", (recipe_id,)).fetchone()
                     if row is None:
                         raise RecipeError("recipe was not found")
-                    return self._record(row)
+                    return self._record(connection, row)
                 if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
                     raise RecipeError("revision must be a positive integer")
                 version = connection.execute("SELECT status, document, created_at FROM revisions WHERE recipe_id=? AND revision=?", (recipe_id, revision)).fetchone()
@@ -1688,26 +1908,168 @@ class RecipeStore:
                     raise RecipeError("recipe revision was not found")
                 result = _stored_recipe_document(version["document"])
                 result.update({"id": recipe_id, "revision": revision, "status": current["status"], "revision_status": version["status"], "created_at": current["created_at"], "updated_at": version["created_at"], "created_via": current["created_via"], "content_fingerprint": content_fingerprint(result), "recipe_key": f"bank:{recipe_id}", "library_recipe_ref": {"library_id": "builtin", "recipe_id": recipe_id, "version": str(revision)}})
+                favorite = self._favorite_state(connection, recipe_id)
+                result.update({key: favorite[key] for key in ("library_id", "is_favorite", "favorite_revision")})
                 return result
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
-    def search(self, query: Any = "", *, limit: Any = 10, include_archived: bool = False, offset: int = 0) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: Any = "",
+        *,
+        limit: Any = 10,
+        include_archived: bool = False,
+        favorites_only: bool = False,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         text = _bounded_text(query, "query", maximum=200) or ""
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
             raise RecipeError("limit must be between one and 50")
+        if not isinstance(include_archived, bool) or not isinstance(favorites_only, bool):
+            raise RecipeError("recipe search filters must be true or false")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise RecipeError("search offset must be a non-negative integer")
         literal = _normalized_text(text).replace("!", "!!").replace("%", "!%").replace("_", "!_")
         needle = f"%{literal}%"
         status = "" if include_archived else "AND status != 'archived'"
+        favorite = (
+            "AND EXISTS (SELECT 1 FROM recipe_favorites AS favorite "
+            "WHERE favorite.library_id='builtin' AND favorite.recipe_id=recipes.id "
+            "AND favorite.is_favorite=1)"
+            if favorites_only else ""
+        )
         try:
             with self._connection() as connection:
+                connection.execute("BEGIN")
                 rows = connection.execute(
-                    f"SELECT * FROM recipes WHERE (lower(name) LIKE ? ESCAPE '!' OR search_text LIKE ? ESCAPE '!') {status} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    f"SELECT * FROM recipes WHERE (lower(name) LIKE ? ESCAPE '!' OR search_text LIKE ? ESCAPE '!') {status} {favorite} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                     (needle, needle, limit, offset),
                 ).fetchall()
-                return [self._record(row) for row in rows]
+                return [self._record(connection, row) for row in rows]
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def set_favorite(
+        self,
+        library_recipe_ref: Any,
+        is_favorite: Any,
+        *,
+        expected_favorite_revision: Any = None,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if reference["library_id"] != "builtin":
+            raise RecipeError("recipe favorites are supported only for the builtin library")
+        if not isinstance(is_favorite, bool):
+            raise RecipeError("is_favorite must be true or false")
+        if expected_favorite_revision is not None and (
+            isinstance(expected_favorite_revision, bool)
+            or not isinstance(expected_favorite_revision, int)
+            or expected_favorite_revision < 0
+        ):
+            raise RecipeError("expected_favorite_revision must be a non-negative integer")
+        key = self._idempotency_key(idempotency_key)
+        if key is None:
+            raise RecipeError("idempotency_key is required")
+        recipe_id = reference["recipe_id"]
+        request_hash = _hash({
+            "library_id": "builtin",
+            "recipe_id": recipe_id,
+            "is_favorite": is_favorite,
+            "expected_favorite_revision": expected_favorite_revision,
+        })
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                recipe = connection.execute(
+                    "SELECT id, revision FROM recipes WHERE id=?", (recipe_id,)
+                ).fetchone()
+                if recipe is None:
+                    raise RecipeError("recipe was not found")
+                if existing := self._idem(connection, key, "set_favorite", request_hash):
+                    existing.pop("created", None)
+                    return existing
+                current = self._favorite_state(connection, recipe_id)
+                if (
+                    expected_favorite_revision is not None
+                    and expected_favorite_revision != current["favorite_revision"]
+                ):
+                    raise RecipeError(
+                        "favorite revision conflict; current favorite revision is "
+                        f"{current['favorite_revision']}"
+                    )
+                changed = current["is_favorite"] != is_favorite
+                if changed:
+                    timestamp = _now()
+                    favorite_revision = current["favorite_revision"] + 1
+                    connection.execute("""
+                        INSERT INTO recipe_favorites(
+                            library_id, recipe_id, is_favorite, favorite_revision,
+                            created_at, updated_at
+                        ) VALUES('builtin',?,?,?,?,?)
+                        ON CONFLICT(library_id, recipe_id) DO UPDATE SET
+                            is_favorite=excluded.is_favorite,
+                            favorite_revision=excluded.favorite_revision,
+                            updated_at=excluded.updated_at
+                    """, (
+                        recipe_id, int(is_favorite), favorite_revision,
+                        current["favorite_created_at"] or timestamp, timestamp,
+                    ))
+                    current = self._favorite_state(connection, recipe_id)
+                result = {
+                    "library_id": "builtin",
+                    "library_recipe_ref": {
+                        "library_id": "builtin",
+                        "recipe_id": recipe_id,
+                        "version": str(recipe["revision"]),
+                    },
+                    "is_favorite": current["is_favorite"],
+                    "favorite_revision": current["favorite_revision"],
+                    "created_at": current["favorite_created_at"],
+                    "updated_at": current["favorite_updated_at"],
+                }
+                if not changed:
+                    result["idempotent"] = True
+                self._store_idem(connection, key, "set_favorite", request_hash, result)
+                return result
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def delete(self, recipe_id: Any, expected_revision: Any) -> dict[str, Any]:
+        """Permanently remove one exact built-in recipe and its local identity metadata."""
+        recipe_id = _bounded_text(recipe_id, "recipe_id", required=True, maximum=80)
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+            raise RecipeError("expected_revision must be a positive integer")
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    "SELECT revision FROM recipes WHERE id=?", (recipe_id,)
+                ).fetchone()
+                if current is None:
+                    raise RecipeError("recipe was not found")
+                if current["revision"] != expected_revision:
+                    raise RecipeError(f"recipe revision conflict; current revision is {current['revision']}")
+                connection.execute(
+                    "DELETE FROM discovery_bindings WHERE destination='builtin' AND recipe_id=?",
+                    (recipe_id,),
+                )
+                connection.execute(
+                    "DELETE FROM library_mappings WHERE library_id='builtin' AND recipe_id=?",
+                    (recipe_id,),
+                )
+                connection.execute(
+                    "UPDATE library_operations SET discovery_ref=NULL, status='failed', "
+                    "result_metadata=NULL, provider_recipe_id=NULL, provider_version=NULL, "
+                    "error_code='recipe_deleted', "
+                    "error_text='built-in recipe was permanently deleted', updated_at=? "
+                    "WHERE library_id='builtin' AND provider_recipe_id=?",
+                    (_now(), recipe_id),
+                )
+                connection.execute("DELETE FROM revisions WHERE recipe_id=?", (recipe_id,))
+                connection.execute("DELETE FROM recipes WHERE id=?", (recipe_id,))
+                return {"library_id": "builtin", "recipe_id": recipe_id, "deleted": True}
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
@@ -1745,7 +2107,7 @@ class RecipeStore:
                 if cursor.rowcount != 1:
                     raise RecipeError("recipe revision conflict")
                 connection.execute("INSERT INTO revisions VALUES(?,?,?,?,?)", (recipe_id, revision, next_status, _canonical(recipe), updated_at))
-                result = self._record(connection.execute("SELECT * FROM recipes WHERE id=?", (recipe_id,)).fetchone(), created=False)
+                result = self._record(connection, connection.execute("SELECT * FROM recipes WHERE id=?", (recipe_id,)).fetchone(), created=False)
                 self._store_idem(connection, key, "update", request_hash, result)
                 return result
         except sqlite3.Error as exc:
@@ -1768,14 +2130,14 @@ class RecipeStore:
                 if current["revision"] != expected_revision:
                     raise RecipeError(f"recipe revision conflict; current revision is {current['revision']}")
                 if current["status"] == "archived":
-                    result = self._record(current, created=False)
+                    result = self._record(connection, current, created=False)
                     result["idempotent"] = True
                 else:
                     revision = current["revision"] + 1
                     updated_at = _now()
                     connection.execute("UPDATE recipes SET revision=?, status='archived', updated_at=? WHERE id=?", (revision, updated_at, recipe_id))
                     connection.execute("INSERT INTO revisions VALUES(?,?,?,?,?)", (recipe_id, revision, "archived", current["document"], updated_at))
-                    result = self._record(connection.execute("SELECT * FROM recipes WHERE id=?", (recipe_id,)).fetchone(), created=False)
+                    result = self._record(connection, connection.execute("SELECT * FROM recipes WHERE id=?", (recipe_id,)).fetchone(), created=False)
                 self._store_idem(connection, key, "archive", request_hash, result)
                 return result
         except sqlite3.Error as exc:

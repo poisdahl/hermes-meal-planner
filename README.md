@@ -419,6 +419,24 @@ is retained as a separate recipe with a duplicate warning. Updates use the
 returned recipe revision. Archive is reversible at the data level because all
 recipe revisions remain in SQLite; ordinary search hides archived recipes.
 
+Built-in recipe favorites are separate local metadata for the exact logical
+`(library_id="builtin", recipe_id)` and never alter recipe content, revisions,
+source, rights or attribution. Search and get return `library_id`,
+`is_favorite` and `favorite_revision`; `favorites_only=true` is an additional
+built-in search filter, so query, archive, cooldown, diet and other eligibility
+rules still apply. Archiving or updating a recipe preserves its mark. An
+archived favorite is visible only with `include_archived=true`, which allows it
+to be inspected or unfavorited. Permanent deletion removes the mark, and a
+later import with a new recipe ID begins unfavorited. External-library copies
+have independent identities and no built-in favorite state. A favorite mark
+never means cooked, repeat now, add to cart, or bypass any menu or rights rule.
+Conditional writes compare `expected_favorite_revision` with the current value
+before evaluating the desired state. An already-current desired state is an
+idempotent observation, not a state-changing write, and does not consume or
+increment that revision. Thus competing state-changing writes from one
+revision conflict after the first commit, while a completed no-op leaves a
+later real change with that still-current expected revision valid.
+
 Source URLs must be credential-free HTTPS. Query strings and fragments are
 discarded before persistence. Original Oda or MENY recipe text is stored only
 as a `link_only` record; a full stored version must be explicitly identified as
@@ -458,12 +476,24 @@ built-in mapping remains without retaining or depending on the snapshot
 document. Repeating a confirmed save returns the exact originally bound recipe
 ID and revision even after cleanup or a later explicit recipe update.
 
+To favorite one unambiguously selected unsaved discovery, Hermes first saves
+its exact `discovery_ref` to `builtin` with a stable save idempotency key, then
+calls `set_favorite(true)` on the exact returned `library_recipe_ref` with a
+separate stable favorite key. It asks one short clarification before either
+stage when “this” is ambiguous. If only the save succeeds, Hermes reports
+exactly `saved in builtin; favorite not set`; if the second outcome cannot be
+known, it reports `favorite outcome uncertain`. A retry reuses the same bound
+ref and both keys: it never repeats discovery, guesses by name, creates a
+duplicate, deletes the saved recipe or rolls either stage back destructively.
+
 The first write to a non-empty v1 recipe bank still creates its private v1
 backup. Opening a non-empty v2 bank creates exactly one transactionally
 consistent, non-overwriting `recipes-v2.backup.sqlite3` at mode `0600`, then
-upgrades atomically to v3. The schema version advances last, after bounded
-generic operation-journal and exact-mapping tables exist. Migration failure
-rolls back to usable v2, and an unknown newer schema fails closed. A changed
+upgrades atomically to v3. Opening a non-empty v3 bank likewise creates one
+transactionally consistent, non-overwriting `recipes-v3.backup.sqlite3` at
+mode `0600`, then upgrades atomically to v4 with the separate favorite table.
+The schema version advances last. Migration failure rolls back to the usable
+prior schema, and an unknown newer schema fails closed. A changed
 snapshot never updates an existing same-source recipe silently: save returns
 that existing recipe plus a conflict requiring an explicit update with its
 `expected_revision`.
@@ -544,14 +574,17 @@ requests, in a safe order, are:
 - “Change dinner portions to four,” then “Reset dinner portions.”
 - “Plan next week's seven dinners,” then answer its continuation question and
   save the final complete menu.
-- “Discover vegetarian dinners,” “search my recipe bank,” “save this family recipe,”
-  “scale that recipe to six portions,” or “archive recipe …”. Search excludes
-  recipes still inside the cooldown unless the user asks to see repeats.
+- “Discover vegetarian dinners,” “search my recipe bank,” “favorite this
+  recipe,” “list my favorite recipes,” “plan next week from favorite recipes,”
+  “save this family recipe,” “scale that recipe to six portions,” or “archive
+  recipe …”. Favorite planning uses explicit built-in `favorites_only`; search
+  still excludes archived, ineligible or cooling-down recipes unless the user
+  explicitly requests the existing supported override.
 - “Save this product as a favorite” or “Add this every two weeks,” using an
   exact product returned by search.
-- “List favorite products” uses the local product-favorites tool and never
-  changes the cart. Recipe favorites are unsupported until a separate recipe
-  capability is installed; never store a recipe through the product tool. If
+- “List favorite products” uses the local provider-bound product-favorites tool
+  and never changes the cart. Recipe favorites use the separate built-in recipe
+  capability; never store a recipe through the product tool. If
   one displayed product and one displayed recipe have the same name and the
   request is genuinely ambiguous, ask one short clarification.
 - “Schedule a weekly Thursday draft,” or explicitly configure a guarded

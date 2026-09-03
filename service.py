@@ -1284,6 +1284,8 @@ class Application:
         results = []
         for row in self.recipes.search(query, limit=limit, include_archived=False):
             recipe = self.recipes.get(row["id"], row["revision"])
+            for field in ("library_id", "is_favorite", "favorite_revision"):
+                recipe.pop(field, None)
             recipe["usage"] = self._usage_summary(state, recipe["recipe_key"], week)
             if recipe["usage"]["eligible"]:
                 results.append(recipe)
@@ -1427,10 +1429,13 @@ class Application:
         if library_id == "builtin":
             return {
                 "provider": "builtin",
-                "server_version": "3",
+                "server_version": "4",
                 "read_only": False,
                 **{
-                    name: name in {"search", "get", "create_from_discovery"}
+                    name: name in {
+                        "search", "get", "create_from_discovery", "favorite_read",
+                        "favorite_write_desired_state", "favorite_conditional_write",
+                    }
                     for name in CAPABILITY_NAMES
                 },
             }
@@ -1757,6 +1762,11 @@ class Application:
                 library_ids = [validate_library_id(selected)]
             if any(item not in self.recipe_libraries for item in library_ids):
                 raise RecipeLibraryError("library_id must name one exact configured recipe library")
+            favorites_only = request.get("favorites_only", False)
+            if not isinstance(favorites_only, bool):
+                raise RecipeLibraryError("favorites_only must be true or false")
+            if favorites_only and library_ids != ["builtin"]:
+                raise RecipeLibraryError("favorites_only is supported only for the builtin recipe library")
             if requested_ids is None and library_ids == ["builtin"] and request.get("cursor") is not None:
                 raise RecipeLibraryError("built-in recipe search has no continuation cursor")
             if requested_ids is not None or library_ids != ["builtin"]:
@@ -1808,6 +1818,7 @@ class Application:
                             rows = self.recipes.search(
                                 query, limit=limit,
                                 include_archived=request.get("include_archived") is True,
+                                favorites_only=favorites_only,
                             )
                             for row in rows:
                                 summary = self._usage_summary(state, row["recipe_key"], week)
@@ -1815,7 +1826,11 @@ class Application:
                                     continue
                                 item = {
                                     key: deepcopy(row.get(key))
-                                    for key in ("id", "revision", "status", "name", "language", "tags", "source", "rights", "portions")
+                                    for key in (
+                                        "id", "revision", "status", "name", "language", "tags",
+                                        "source", "rights", "portions", "library_id", "is_favorite",
+                                        "favorite_revision",
+                                    )
                                 }
                                 item["library_recipe_ref"] = deepcopy(row["library_recipe_ref"])
                                 item["recipe_key"] = library_recipe_key(row["library_recipe_ref"])
@@ -1857,7 +1872,8 @@ class Application:
             while True:
                 rows = self.recipes.search(
                     request.get("query", ""), limit=page_limit,
-                    include_archived=request.get("include_archived") is True, offset=offset,
+                    include_archived=request.get("include_archived") is True,
+                    favorites_only=favorites_only, offset=offset,
                 )
                 offset += len(rows)
                 for row in rows:
@@ -1867,6 +1883,7 @@ class Application:
                         for key in (
                             "id", "revision", "status", "name", "language", "tags", "source", "rights",
                             "portions", "created_at", "updated_at", "created_via", "content_fingerprint", "recipe_key",
+                            "library_id", "is_favorite", "favorite_revision",
                         )
                     }
                     value["library_recipe_ref"] = deepcopy(row["library_recipe_ref"])
@@ -1906,6 +1923,18 @@ class Application:
             if request.get("week"):
                 result["usage"] = self._usage_summary(self.store.read(), result["recipe_key"], validate_week(request["week"]))
             return {"recipe": result}
+        if action == "set_favorite":
+            reference = validate_library_recipe_ref(request.get("library_recipe_ref"))
+            if request.get("recipe_id") is not None:
+                raise RecipeLibraryError("set_favorite requires only one exact library_recipe_ref identity")
+            if request.get("library_id") is not None and request["library_id"] != reference["library_id"]:
+                raise RecipeLibraryError("library_recipe_ref does not match library_id")
+            return self.recipes.set_favorite(
+                reference,
+                request.get("is_favorite"),
+                expected_favorite_revision=request.get("expected_favorite_revision"),
+                idempotency_key=request.get("idempotency_key"),
+            )
         if action == "resolve":
             return self.recipes.resolve_discovery(request.get("discovery_ref"))
         if action == "save":
@@ -2039,6 +2068,8 @@ class Application:
                             raise HouseholdError("only active recipes can be added to a new menu")
                     else:
                         stored = self._external_library_get(checked)
+                    for field in ("library_id", "is_favorite", "favorite_revision"):
+                        stored.pop(field, None)
                     recipe = scale_recipe(stored, raw.get("portions"))
                     recipe["library_recipe_ref"] = deepcopy(stored["library_recipe_ref"])
                     recipe["recipe_key"] = library_recipe_key(recipe["library_recipe_ref"])
@@ -2046,6 +2077,8 @@ class Application:
                     stored = self.recipes.get(reference.get("id"), reference.get("revision"))
                     if stored.get("status") != "active" or stored.get("revision_status", stored.get("status")) != "active":
                         raise HouseholdError("only active recipes can be added to a new menu")
+                    for field in ("library_id", "is_favorite", "favorite_revision"):
+                        stored.pop(field, None)
                     recipe = scale_recipe(stored, raw.get("portions"))
                 else:
                     candidate = deepcopy(dict(raw))

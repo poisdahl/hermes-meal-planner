@@ -41,6 +41,11 @@ personal-library recipe and legacy `recipe_ref` only for built-in compatibility.
 Personal-library search defaults to the configured exact primary ID;
 cross-library search is explicit. Provider type, display name, recipe
 title/slug/URL, list position and “latest” never select a connection or recipe.
+When the user explicitly asks to list favorite recipes or plan from favorites,
+search the exact `builtin` library with `favorites_only=true` and the target
+week. That flag is only an additional filter: do not bypass query, archive,
+cooldown, diet, eligibility, draft, link-only, rights or menu constraints. A
+favorite never means cooked, repeat now, add to cart or automatic menu use.
 If a provider name matches zero or several connections, ask once for the exact
 `library_id` shown by the libraries action. Menu save performs one exact get and
 freezes the validated/scaled recipe. Missing, stale, link-only or unavailable
@@ -70,9 +75,13 @@ For a product-favorite or recurring add, pass product search's `product_id` and
 do not construct an item object. “Save this product as a favorite,” “list
 favorite products,” and equivalent requests use
 `meal_planner_product_favorites`. This local provider-bound list never changes
-the cart. Never route “favorite this recipe” to the product tool; recipe
-favorites are unsupported unless a separate discovered recipe-favorites
-capability is available. If one displayed product and one displayed recipe
+the cart. Never route “favorite this recipe” to the product tool. Built-in
+recipe favorites use recipe `set_favorite` with the exact returned
+`library_recipe_ref`, explicit desired `is_favorite`, optional observed
+`expected_favorite_revision`, and a stable favorite idempotency key. Never
+toggle, guess by name, or treat an external-library copy as the built-in recipe.
+An already-observed desired state is a no-op and keeps its favorite revision.
+If one displayed product and one displayed recipe
 share the same name and the request is genuinely ambiguous, ask one short
 clarification. To add goods to an existing order or move its delivery, start
 that exact order change first,
@@ -106,7 +115,17 @@ Save a discovered recipe only on a clear request. When one displayed result is
 clearly selected, pass its exact `discovery_ref` to `recipes save`; pass an
 exact configured `library_id` only when the user selected that connection. Never copy
 the document field by field, refetch it, or guess from its name or position. If
-“this” is ambiguous, ask which displayed recipe. A `discovery_ref` is separate
+“this” is ambiguous, ask which displayed recipe before any save or favorite
+call. To “favorite this” when that exact selected discovery is not yet saved,
+call `recipes save` with its exact `discovery_ref`, resolved destination
+`builtin`, and one stable save idempotency key. Then call recipe
+`set_favorite(true)` with the exact returned built-in `library_recipe_ref` and
+a separate stable favorite idempotency key. The stages are not one transaction.
+If save succeeds but the favorite call definitely fails, report exactly
+`saved in builtin; favorite not set`. If its outcome is uncertain, report
+exactly `favorite outcome uncertain`. On retry, reuse the bound discovery ref and both
+keys; never rediscover, name-match, create a duplicate, delete the saved recipe,
+or destructively roll back either stage. A `discovery_ref` is separate
 from the built-in menu `recipe_ref: {id, revision}` and from the
 provider-neutral `library_recipe_ref: {library_id, recipe_id, version?}`; none
 of these technical references is user-facing. An omitted target resolves once

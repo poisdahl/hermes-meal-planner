@@ -176,6 +176,13 @@ def create_v2_bank(path: Path, recipe: dict) -> None:
         connection.commit()
 
 
+def create_v3_bank(path: Path, recipe: dict) -> None:
+    create_v2_bank(path, recipe)
+    with closing(sqlite3.connect(path)) as connection:
+        RecipeStore(path, "Hus A")._migrate_v2_to_v3(connection)
+        connection.commit()
+
+
 class SyntheticLibraryAdapter(RecipeLibraryAdapter):
     def __init__(
         self,
@@ -307,6 +314,362 @@ class RecipeStoreTests(unittest.TestCase):
         self.assertEqual(duplicate["duplicate"], "source_key")
         with self.assertRaisesRegex(RecipeError, "different recipe revision"):
             self.store.save(full_recipe("Endret", external_id="same"))
+
+    def test_favorite_desired_state_identity_and_recipe_content_are_independent(self):
+        saved = self.store.save(full_recipe(external_id="favorite-exact"))
+        reference = saved["library_recipe_ref"]
+        self.assertEqual(
+            (saved["library_id"], saved["is_favorite"], saved["favorite_revision"]),
+            ("builtin", False, 0),
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            before = connection.execute(
+                "SELECT revision, status, source_key, content_fingerprint, content_hash, "
+                "document, updated_at FROM recipes WHERE id=?",
+                (saved["id"],),
+            ).fetchone()
+            self.assertEqual(connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0], "4")
+            self.assertNotIn("is_favorite", json.loads(before[5]))
+        self.assertFalse(self.path.with_name("recipes-v3.backup.sqlite3").exists())
+
+        noop = self.store.set_favorite(
+            reference, False, expected_favorite_revision=0, idempotency_key="favorite-noop"
+        )
+        self.assertEqual((noop["is_favorite"], noop["favorite_revision"]), (False, 0))
+        self.assertTrue(noop["idempotent"])
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM recipe_favorites").fetchone()[0], 0)
+
+        favorite = self.store.set_favorite(
+            reference, True, expected_favorite_revision=0, idempotency_key="favorite-true"
+        )
+        self.assertEqual((favorite["is_favorite"], favorite["favorite_revision"]), (True, 1))
+        self.assertEqual(favorite["library_recipe_ref"]["recipe_id"], saved["id"])
+        replayed = self.store.set_favorite(
+            {**reference, "version": "999"}, True,
+            expected_favorite_revision=0, idempotency_key="favorite-true",
+        )
+        self.assertEqual(replayed["favorite_revision"], 1)
+        self.assertTrue(replayed["idempotent"])
+        observed = self.store.set_favorite(reference, True, idempotency_key="favorite-observed")
+        self.assertEqual(observed["favorite_revision"], 1)
+        self.assertTrue(observed["idempotent"])
+        with self.assertRaisesRegex(RecipeError, "different content"):
+            self.store.set_favorite(reference, False, idempotency_key="favorite-true")
+        with self.assertRaisesRegex(RecipeError, "current favorite revision is 1"):
+            self.store.set_favorite(
+                reference, False, expected_favorite_revision=0, idempotency_key="favorite-stale"
+            )
+
+        current = self.store.get(saved["id"])
+        historical = self.store.get(saved["id"], 1)
+        for value in (current, historical, self.store.search("Kremet")[0]):
+            self.assertEqual(value["library_id"], "builtin")
+            self.assertTrue(value["is_favorite"])
+            self.assertEqual(value["favorite_revision"], 1)
+        with closing(sqlite3.connect(self.path)) as connection:
+            after = connection.execute(
+                "SELECT revision, status, source_key, content_fingerprint, content_hash, "
+                "document, updated_at FROM recipes WHERE id=?",
+                (saved["id"],),
+            ).fetchone()
+            favorite_row = connection.execute(
+                "SELECT library_id, recipe_id, is_favorite, favorite_revision, created_at, updated_at "
+                "FROM recipe_favorites"
+            ).fetchone()
+        self.assertEqual(after, before)
+        self.assertEqual(favorite_row[:4], ("builtin", saved["id"], 1, 1))
+        self.assertTrue(favorite_row[4])
+        self.assertTrue(favorite_row[5])
+
+        for invalid in (None, 1, "true"):
+            with self.assertRaisesRegex(RecipeError, "is_favorite"):
+                self.store.set_favorite(reference, invalid, idempotency_key=f"invalid-{invalid}")
+        for invalid in (-1, True, "0"):
+            with self.assertRaisesRegex(RecipeError, "expected_favorite_revision"):
+                self.store.set_favorite(
+                    reference, False, expected_favorite_revision=invalid,
+                    idempotency_key=f"invalid-revision-{invalid}",
+                )
+        with self.assertRaisesRegex(RecipeError, "idempotency_key is required"):
+            self.store.set_favorite(reference, False, idempotency_key=None)
+        with self.assertRaisesRegex(RecipeError, "only for the builtin"):
+            self.store.set_favorite(
+                {"library_id": "family-mealie", "recipe_id": saved["id"]}, True,
+                idempotency_key="external-favorite",
+            )
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            self.store.set_favorite(
+                {"library_id": "builtin", "recipe_id": "rec_missing"}, True,
+                idempotency_key="missing-favorite",
+            )
+
+    def test_concurrent_favorite_writes_and_conditional_noop_ordering(self):
+        saved = self.store.save(full_recipe(external_id="favorite-concurrent"))
+        reference = saved["library_recipe_ref"]
+        barrier = threading.Barrier(8)
+        results = []
+        errors = []
+
+        def set_equal(index):
+            try:
+                barrier.wait()
+                results.append(self.store.set_favorite(
+                    reference, True, idempotency_key=f"equal-favorite-{index}"
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=set_equal, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual({item["favorite_revision"] for item in results}, {1})
+        self.assertEqual({item["is_favorite"] for item in results}, {True})
+        self.assertEqual(sum(item.get("idempotent") is not True for item in results), 1)
+
+        self.store.set_favorite(
+            reference, False, expected_favorite_revision=1, idempotency_key="reset-favorite"
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        original_state = RecipeStore._favorite_state
+        gated_once = []
+        outcomes = []
+
+        def gated_state(connection, recipe_id):
+            state = original_state(connection, recipe_id)
+            if threading.current_thread().name == "favorite-change" and not gated_once:
+                gated_once.append(True)
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("favorite change did not resume")
+            return state
+
+        def conditional(desired, key):
+            try:
+                outcomes.append(self.store.set_favorite(
+                    reference, desired, expected_favorite_revision=2, idempotency_key=key
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcomes.append(exc)
+
+        with mock.patch.object(RecipeStore, "_favorite_state", side_effect=gated_state):
+            winner = threading.Thread(
+                target=conditional, args=(True, "opposite-true"), name="favorite-change"
+            )
+            loser = threading.Thread(
+                target=conditional, args=(False, "opposite-false"), name="favorite-noop"
+            )
+            winner.start()
+            self.assertTrue(entered.wait(5))
+            loser.start()
+            threading.Event().wait(0.05)
+            release.set()
+            winner.join(5)
+            loser.join(5)
+        self.assertFalse(winner.is_alive())
+        self.assertFalse(loser.is_alive())
+        self.assertEqual(sum(isinstance(item, dict) for item in outcomes), 1)
+        conflicts = [item for item in outcomes if isinstance(item, RecipeError)]
+        self.assertEqual(len(conflicts), 1)
+        self.assertRegex(str(conflicts[0]), "current favorite revision is 3")
+
+        noop_entered = threading.Event()
+        noop_release = threading.Event()
+        noop_gated_once = []
+        reverse_outcomes = []
+
+        def gate_noop_first(connection, recipe_id):
+            state = original_state(connection, recipe_id)
+            if threading.current_thread().name == "favorite-noop-first" and not noop_gated_once:
+                noop_gated_once.append(True)
+                noop_entered.set()
+                if not noop_release.wait(5):
+                    raise AssertionError("favorite no-op did not resume")
+            return state
+
+        def conditional_at_three(desired, key):
+            try:
+                reverse_outcomes.append(self.store.set_favorite(
+                    reference, desired, expected_favorite_revision=3, idempotency_key=key
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                reverse_outcomes.append(exc)
+
+        # A same-state call is an observation, not a state-changing write. It
+        # therefore does not consume revision 3; the later real change remains valid.
+        with mock.patch.object(RecipeStore, "_favorite_state", side_effect=gate_noop_first):
+            noop = threading.Thread(
+                target=conditional_at_three, args=(True, "opposite-noop-first"),
+                name="favorite-noop-first",
+            )
+            change = threading.Thread(
+                target=conditional_at_three, args=(False, "opposite-change-second"),
+                name="favorite-change-second",
+            )
+            noop.start()
+            self.assertTrue(noop_entered.wait(5))
+            change.start()
+            threading.Event().wait(0.05)
+            noop_release.set()
+            noop.join(5)
+            change.join(5)
+        self.assertFalse(noop.is_alive())
+        self.assertFalse(change.is_alive())
+        self.assertTrue(all(isinstance(item, dict) for item in reverse_outcomes))
+        self.assertEqual(
+            {(item["is_favorite"], item["favorite_revision"]) for item in reverse_outcomes},
+            {(True, 3), (False, 4)},
+        )
+
+    def test_favorite_update_archive_delete_and_reimport_lifecycle(self):
+        discovery = self.store.persist_discovery(
+            external_recipe("themealdb", "Favorite lifecycle", "favorite-lifecycle")
+        )
+        saved = self.store.save_discovery(discovery["discovery_ref"], idempotency_key="save-lifecycle")
+        favorite = self.store.set_favorite(
+            saved["library_recipe_ref"], True, idempotency_key="favorite-lifecycle"
+        )
+        changed = external_recipe(
+            "themealdb", "Favorite lifecycle updated", "favorite-lifecycle"
+        )
+        updated = self.store.update(saved["id"], 1, changed, status="active")
+        self.assertEqual((updated["is_favorite"], updated["favorite_revision"]), (True, 1))
+        archived = self.store.archive(saved["id"], 2)
+        self.assertEqual((archived["is_favorite"], archived["favorite_revision"]), (True, 1))
+        self.assertEqual(self.store.search("lifecycle", favorites_only=True), [])
+        self.assertEqual(
+            self.store.search("lifecycle", favorites_only=True, include_archived=True)[0]["id"],
+            saved["id"],
+        )
+        unarchived = self.store.update(
+            saved["id"], archived["revision"], changed, status="active"
+        )
+        self.assertEqual((unarchived["is_favorite"], unarchived["favorite_revision"]), (True, 1))
+        self.assertEqual(
+            self.store.search("lifecycle", favorites_only=True)[0]["id"], saved["id"]
+        )
+        archived = self.store.archive(saved["id"], unarchived["revision"])
+        unfavorite = self.store.set_favorite(
+            archived["library_recipe_ref"], False,
+            expected_favorite_revision=favorite["favorite_revision"],
+            idempotency_key="unfavorite-archived",
+        )
+        self.assertEqual((unfavorite["is_favorite"], unfavorite["favorite_revision"]), (False, 2))
+        self.store.set_favorite(
+            archived["library_recipe_ref"], True,
+            expected_favorite_revision=2, idempotency_key="refavorite-before-delete",
+        )
+        deleted = self.store.delete(saved["id"], archived["revision"])
+        self.assertTrue(deleted["deleted"])
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM recipe_favorites").fetchone()[0], 0)
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM discovery_bindings WHERE destination='builtin'"
+            ).fetchone()[0], 0)
+        with self.assertRaisesRegex(RecipeError, "permanently deleted"):
+            self.store.save_discovery(
+                discovery["discovery_ref"], idempotency_key="save-lifecycle"
+            )
+        reimported = self.store.save_discovery(
+            discovery["discovery_ref"], idempotency_key="reimport-lifecycle"
+        )
+        self.assertNotEqual(reimported["id"], saved["id"])
+        self.assertEqual((reimported["is_favorite"], reimported["favorite_revision"]), (False, 0))
+        with self.assertRaisesRegex(RecipeError, "different content"):
+            self.store.set_favorite(
+                reimported["library_recipe_ref"], True,
+                idempotency_key="favorite-lifecycle",
+            )
+
+    def test_get_and_favorites_search_use_one_read_snapshot(self):
+        def read_during_write(read, mutate):
+            start = threading.Event()
+            updated = threading.Event()
+            committed = threading.Event()
+            errors = []
+
+            def writer():
+                self.assertTrue(start.wait(2))
+                try:
+                    with closing(sqlite3.connect(self.path, timeout=5.0)) as connection:
+                        connection.execute("PRAGMA foreign_keys=ON")
+                        connection.execute("BEGIN IMMEDIATE")
+                        mutate(connection)
+                        updated.set()
+                        connection.commit()
+                    committed.set()
+                except Exception as exc:  # pragma: no cover - surfaced below
+                    errors.append(exc)
+                    updated.set()
+
+            original = RecipeStore._favorite_state
+            paused = False
+
+            def pause_before_favorite(connection, recipe_id):
+                nonlocal paused
+                if not paused:
+                    paused = True
+                    start.set()
+                    self.assertTrue(updated.wait(2))
+                    self.assertFalse(committed.wait(0.1))
+                return original(connection, recipe_id)
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            try:
+                with mock.patch.object(
+                    RecipeStore, "_favorite_state", side_effect=pause_before_favorite
+                ):
+                    result = read()
+            finally:
+                start.set()
+                thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(committed.is_set())
+            return result
+
+        searched = self.store.save(full_recipe("Snapshot search", external_id="snapshot-search"))
+        self.store.set_favorite(
+            searched["library_recipe_ref"], True, idempotency_key="favorite-snapshot-search"
+        )
+        search_result = read_during_write(
+            lambda: self.store.search("Snapshot search", favorites_only=True),
+            lambda connection: connection.execute(
+                "UPDATE recipe_favorites SET is_favorite=0, favorite_revision=2 "
+                "WHERE library_id='builtin' AND recipe_id=?",
+                (searched["id"],),
+            ),
+        )
+        self.assertEqual(len(search_result), 1)
+        self.assertEqual(
+            (search_result[0]["is_favorite"], search_result[0]["favorite_revision"]),
+            (True, 1),
+        )
+        self.assertEqual(self.store.search("Snapshot search", favorites_only=True), [])
+
+        fetched = self.store.save(full_recipe("Snapshot get", external_id="snapshot-get"))
+        self.store.set_favorite(
+            fetched["library_recipe_ref"], True, idempotency_key="favorite-snapshot-get"
+        )
+        get_result = read_during_write(
+            lambda: self.store.get(fetched["id"]),
+            lambda connection: connection.execute(
+                "DELETE FROM recipes WHERE id=?", (fetched["id"],)
+            ),
+        )
+        self.assertEqual(
+            (get_result["is_favorite"], get_result["favorite_revision"]), (True, 1)
+        )
+        with self.assertRaisesRegex(RecipeError, "not found"):
+            self.store.get(fetched["id"])
 
     def test_discovery_reference_is_store_bound_frozen_and_replays_bound_revision(self):
         original = external_recipe("themealdb", "Frozen soup", "frozen")
@@ -689,7 +1052,7 @@ class RecipeStoreTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as connection:
             self.assertEqual(
                 connection.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()[0],
-                "3",
+                "4",
             )
 
     def test_v1_backup_waits_for_and_includes_a_concurrent_writer(self):
@@ -734,7 +1097,7 @@ class RecipeStoreTests(unittest.TestCase):
                 "Committed before migration",
             )
 
-    def test_nonempty_v2_migration_creates_one_private_consistent_backup_and_v3_tables(self):
+    def test_nonempty_v2_migration_creates_one_private_consistent_backup_and_v4_tables(self):
         path = Path(self.temp.name) / "v2.sqlite3"
         create_v2_bank(path, full_recipe("V2 recipe", external_id="v2-recipe"))
         store = RecipeStore(path, "Hus A")
@@ -753,9 +1116,10 @@ class RecipeStoreTests(unittest.TestCase):
         with closing(sqlite3.connect(path)) as connection:
             self.assertEqual(connection.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
-            ).fetchone()[0], "3")
+            ).fetchone()[0], "4")
             self.assertTrue({
                 "library_operations", "library_mappings", "library_connection_controls",
+                "recipe_favorites",
             }.issubset({
                 row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
             }))
@@ -823,7 +1187,7 @@ class RecipeStoreTests(unittest.TestCase):
         newer.parent.mkdir()
         create_v2_bank(newer, full_recipe("Newer", external_id="newer"))
         with closing(sqlite3.connect(newer)) as connection:
-            connection.execute("UPDATE metadata SET value='4' WHERE key='schema_version'")
+            connection.execute("UPDATE metadata SET value='5' WHERE key='schema_version'")
             connection.commit()
         with self.assertRaisesRegex(RecipeError, "newer"):
             RecipeStore(newer, "Hus A").search("")
@@ -891,6 +1255,137 @@ class RecipeStoreTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(results, ["Concurrent v2"] * 8)
         self.assertTrue(path.with_name("recipes-v2.backup.sqlite3").is_file())
+
+    def test_nonempty_v3_migration_backup_is_private_consistent_atomic_and_nonoverwriting(self):
+        path = Path(self.temp.name) / "v3" / "recipes.sqlite3"
+        path.parent.mkdir()
+        create_v3_bank(path, full_recipe("V3 recipe", external_id="v3-recipe"))
+        backup = path.with_name("recipes-v3.backup.sqlite3")
+
+        def fail_after_partial(_store, connection):
+            connection.execute("CREATE TABLE partial_v4 (value TEXT)")
+            raise RecipeError("synthetic v4 failure")
+
+        with mock.patch.object(RecipeStore, "_migrate_v3_to_v4", fail_after_partial):
+            with self.assertRaisesRegex(RecipeError, "synthetic v4 failure"):
+                RecipeStore(path, "Hus A").search("")
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+        with closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0], "3")
+            self.assertNotIn("partial_v4", {
+                row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            })
+            self.assertNotIn("recipe_favorites", {
+                row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            })
+        with closing(sqlite3.connect(backup)) as connection:
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0], "3")
+            self.assertEqual(connection.execute("SELECT name FROM recipes").fetchone()[0], "V3 recipe")
+
+        before = (backup.stat().st_ino, backup.read_bytes())
+        self.assertEqual(RecipeStore(path, "Hus A").search("")[0]["name"], "V3 recipe")
+        with closing(sqlite3.connect(path)) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT value FROM metadata WHERE key='schema_version'"
+            ).fetchone()[0], "4")
+            self.assertIn("recipe_favorites", {
+                row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            })
+        RecipeStore(path, "Hus A").search("")
+        self.assertEqual((backup.stat().st_ino, backup.read_bytes()), before)
+
+    def test_v3_control_only_bank_is_backed_up_and_unknown_v5_fails_closed(self):
+        control_only = Path(self.temp.name) / "control-only" / "recipes.sqlite3"
+        control_only.parent.mkdir()
+        create_v3_bank(control_only, full_recipe("Removed v3", external_id="removed-v3"))
+        with closing(sqlite3.connect(control_only)) as connection:
+            connection.execute("DELETE FROM idempotency")
+            connection.execute("DELETE FROM revisions")
+            connection.execute("DELETE FROM recipes")
+            connection.execute(
+                "INSERT INTO library_connection_controls VALUES(?,?)",
+                ("family-mealie", "2026-09-03T12:00:00+00:00"),
+            )
+            connection.commit()
+        self.assertEqual(RecipeStore(control_only, "Hus A").search(""), [])
+        with closing(sqlite3.connect(control_only.with_name("recipes-v3.backup.sqlite3"))) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM library_connection_controls"
+            ).fetchone()[0], 1)
+
+        newer = Path(self.temp.name) / "v5" / "recipes.sqlite3"
+        newer.parent.mkdir()
+        create_v3_bank(newer, full_recipe("Future v5", external_id="future-v5"))
+        with closing(sqlite3.connect(newer)) as connection:
+            connection.execute("UPDATE metadata SET value='5' WHERE key='schema_version'")
+            connection.commit()
+        with self.assertRaisesRegex(RecipeError, "newer"):
+            RecipeStore(newer, "Hus A").search("")
+        self.assertFalse(newer.with_name("recipes-v3.backup.sqlite3").exists())
+
+    def test_v3_backup_waits_for_writer_and_concurrent_opens_create_one_copy(self):
+        path = Path(self.temp.name) / "writer-v3" / "recipes.sqlite3"
+        path.parent.mkdir()
+        create_v3_bank(path, full_recipe("Before v3 writer", external_id="writer-v3"))
+        changed = normalize_recipe(full_recipe("Committed v3 writer", external_id="writer-v3"))
+        serialized = json.dumps(
+            changed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        writer = sqlite3.connect(path, timeout=2.0)
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "UPDATE recipes SET name=?, search_text=?, document=?",
+            (changed["name"], changed["name"].casefold(), serialized),
+        )
+        writer.execute("UPDATE revisions SET document=?", (serialized,))
+        outcome = []
+
+        def migrate_after_writer():
+            try:
+                outcome.append(RecipeStore(path, "Hus A").search("")[0]["name"])
+            except Exception as exc:  # pragma: no cover - asserted below
+                outcome.append(exc)
+
+        migration = threading.Thread(target=migrate_after_writer)
+        migration.start()
+        threading.Event().wait(0.05)
+        writer.commit()
+        writer.close()
+        migration.join(5)
+        self.assertFalse(migration.is_alive())
+        self.assertEqual(outcome, ["Committed v3 writer"])
+        with closing(sqlite3.connect(path.with_name("recipes-v3.backup.sqlite3"))) as backup:
+            self.assertEqual(backup.execute("SELECT name FROM recipes").fetchone()[0], "Committed v3 writer")
+
+        concurrent = Path(self.temp.name) / "concurrent-v3" / "recipes.sqlite3"
+        concurrent.parent.mkdir()
+        create_v3_bank(concurrent, full_recipe("Concurrent v3", external_id="concurrent-v3"))
+        barrier = threading.Barrier(8)
+        results = []
+        errors = []
+
+        def open_store():
+            try:
+                barrier.wait()
+                results.append(RecipeStore(concurrent, "Hus A").search("")[0]["name"])
+            except Exception as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=open_store) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(6)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(results, ["Concurrent v3"] * 8)
+        self.assertTrue(concurrent.with_name("recipes-v3.backup.sqlite3").is_file())
 
     def test_reference_docs_cover_selection_confirmation_and_three_ref_types(self):
         readme = (CORE / "README.md").read_text(encoding="utf-8")
@@ -2090,10 +2585,24 @@ class RecipeFlowTests(unittest.TestCase):
             store, self.oda, self.browser,
             recipe_library_adapters={"family-mealie": adapter, "other-mealie": broken},
         )
-        app.recipes.save(full_recipe("Builtin exact", external_id="builtin-exact"))
+        builtin = app.recipes.save(full_recipe("Builtin exact", external_id="builtin-exact"))
+        app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": builtin["library_recipe_ref"], "is_favorite": True,
+            "idempotency_key": "favorite-builtin-independent",
+        })
         listed = app.handle({"operation": "recipes", "action": "libraries"})
         statuses = {item["library_id"]: item["status"] for item in listed["recipe_libraries"]}
         self.assertEqual(statuses, {"builtin": "available", "family-mealie": "available", "other-mealie": "unavailable"})
+        builtin_capabilities = next(
+            item["capabilities"] for item in listed["recipe_libraries"]
+            if item["library_id"] == "builtin"
+        )
+        self.assertEqual(builtin_capabilities["server_version"], "4")
+        self.assertTrue(builtin_capabilities["favorite_read"])
+        self.assertTrue(builtin_capabilities["favorite_write_desired_state"])
+        self.assertTrue(builtin_capabilities["favorite_conditional_write"])
+        self.assertFalse(builtin_capabilities["favorite_reconcile"])
         result = app.handle({
             "operation": "recipes", "action": "search", "library_id": "family-mealie",
             "query": "exact", "filters": {"tag": "dinner"}, "limit": 2,
@@ -2115,9 +2624,290 @@ class RecipeFlowTests(unittest.TestCase):
             "query": "exact", "include_ineligible": True,
         })
         self.assertEqual({item["library_recipe_ref"]["library_id"] for item in cross["recipes"]}, {"builtin", "family-mealie"})
+        cross_by_library = {
+            item["library_recipe_ref"]["library_id"]: item for item in cross["recipes"]
+        }
+        self.assertTrue(cross_by_library["builtin"]["is_favorite"])
+        self.assertNotIn("is_favorite", cross_by_library["family-mealie"])
         self.assertEqual(cross["errors"], {"other-mealie": "recipe library search is unavailable"})
         self.assertNotIn("secret provider failure", canonical(cross))
         self.assertNotIn("base_url", canonical(listed))
+        with self.assertRaisesRegex(HouseholdError, "only for the builtin"):
+            app.handle({
+                "operation": "recipes", "action": "search",
+                "library_ids": ["builtin", "family-mealie"],
+                "favorites_only": True,
+            })
+
+    def test_builtin_favorites_filter_without_changing_normal_discovery_or_menu(self):
+        favorite = self.save_bank_recipe("Stable favorite", "stable-favorite")
+        other = self.save_bank_recipe("Stable other", "stable-other")
+        state = self.store.read()
+        before_discovery = self.app._internal_recipe_candidates(
+            "Stable favorite", 10, state, "2026-W50"
+        )
+        menu_request = {
+            "week": "2026-W50",
+            "dishes": [{"library_recipe_ref": favorite["library_recipe_ref"]}],
+            "salads": [],
+        }
+        before_menu = self.app._materialize_menu(menu_request)
+
+        changed = self.app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": favorite["library_recipe_ref"],
+            "is_favorite": True, "expected_favorite_revision": 0,
+            "idempotency_key": "service-favorite-true",
+        })
+        self.assertEqual((changed["is_favorite"], changed["favorite_revision"]), (True, 1))
+        self.assertEqual(
+            self.app._internal_recipe_candidates("Stable favorite", 10, state, "2026-W50"),
+            before_discovery,
+        )
+        self.assertEqual(self.app._materialize_menu(menu_request), before_menu)
+        self.assertNotIn("is_favorite", before_discovery[0])
+        self.assertNotIn("is_favorite", before_menu["dishes"][0])
+
+        exact = self.app.handle({
+            "operation": "recipes", "action": "get",
+            "library_recipe_ref": favorite["library_recipe_ref"],
+        })["recipe"]
+        self.assertEqual(
+            (exact["library_id"], exact["is_favorite"], exact["favorite_revision"]),
+            ("builtin", True, 1),
+        )
+        favorites = self.app.handle({
+            "operation": "recipes", "action": "search", "library_id": "builtin",
+            "query": "Stable", "week": "2026-W50", "favorites_only": True,
+        })["recipes"]
+        self.assertEqual([item["id"] for item in favorites], [favorite["id"]])
+        self.assertEqual(
+            (favorites[0]["library_id"], favorites[0]["is_favorite"], favorites[0]["favorite_revision"]),
+            ("builtin", True, 1),
+        )
+        ordinary = self.app.handle({
+            "operation": "recipes", "action": "search", "library_id": "builtin",
+            "query": "Stable", "week": "2026-W50", "include_ineligible": True,
+        })["recipes"]
+        self.assertEqual({item["id"] for item in ordinary}, {favorite["id"], other["id"]})
+
+        self.app.handle({
+            "operation": "recipes", "action": "mark_cooked",
+            "recipe_id": favorite["id"], "week": "2026-W49",
+            "idempotency_key": "favorite-cooked",
+        })
+        self.assertEqual(self.app.handle({
+            "operation": "recipes", "action": "search", "library_id": "builtin",
+            "query": "Stable", "week": "2026-W50", "favorites_only": True,
+        })["recipes"], [])
+        blocked = self.app.handle({
+            "operation": "recipes", "action": "search", "library_id": "builtin",
+            "query": "Stable", "week": "2026-W50", "favorites_only": True,
+            "include_ineligible": True,
+        })["recipes"]
+        self.assertFalse(blocked[0]["usage"]["eligible"])
+
+        archived = self.app.handle({
+            "operation": "recipes", "action": "archive", "recipe_id": favorite["id"],
+            "expected_revision": favorite["revision"],
+        })["recipe"]
+        self.assertTrue(archived["is_favorite"])
+        self.assertEqual(self.app.handle({
+            "operation": "recipes", "action": "search", "library_id": "builtin",
+            "query": "Stable", "favorites_only": True, "include_ineligible": True,
+        })["recipes"], [])
+        visible = self.app.handle({
+            "operation": "recipes", "action": "search", "library_id": "builtin",
+            "query": "Stable", "favorites_only": True, "include_archived": True,
+            "include_ineligible": True,
+        })["recipes"]
+        self.assertEqual([item["id"] for item in visible], [favorite["id"]])
+        removed = self.app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": archived["library_recipe_ref"], "is_favorite": False,
+            "expected_favorite_revision": 1, "idempotency_key": "service-unfavorite",
+        })
+        self.assertEqual((removed["is_favorite"], removed["favorite_revision"]), (False, 2))
+
+    def test_link_only_favorite_stays_inspectable_but_not_menu_eligible(self):
+        link_only = {
+            "name": "MENY link favorite", "language": "nb-NO", "tags": ["middag"],
+            "source": {
+                "kind": "provider", "publisher": "MENY", "title": "MENY link favorite",
+                "url": "https://meny.no/oppskrifter/fisk", "external_id": "meny-link-favorite",
+                "relationship": "original",
+            },
+            "rights": {"storage": "link_only", "license": None, "credit": "MENY"},
+        }
+        saved = self.app.handle({
+            "operation": "recipes", "action": "save", "recipe": link_only,
+            "idempotency_key": "save-link-favorite",
+        })["recipe"]
+        marked = self.app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": saved["library_recipe_ref"], "is_favorite": True,
+            "idempotency_key": "mark-link-favorite",
+        })
+        self.assertTrue(marked["is_favorite"])
+        inspected = self.app.handle({
+            "operation": "recipes", "action": "get",
+            "library_recipe_ref": saved["library_recipe_ref"],
+        })["recipe"]
+        self.assertTrue(inspected["is_favorite"])
+        self.assertEqual(inspected["rights"]["storage"], "link_only")
+        with self.assertRaisesRegex(HouseholdError, "link_only"):
+            self.app.handle({
+                "operation": "menu", "action": "save",
+                "menu": {
+                    "week": "2026-W50",
+                    "dishes": [{"library_recipe_ref": saved["library_recipe_ref"]}],
+                },
+            })
+
+    def test_unsaved_discovery_favorite_partial_failure_retries_without_duplicate(self):
+        discovery = self.app.recipes.persist_discovery(
+            external_recipe("themealdb", "Favorite after save", "favorite-after-save")
+        )
+        save_key = "save-before-favorite"
+        favorite_key = "favorite-after-save"
+        save_request = {
+            "operation": "recipes", "action": "save",
+            "discovery_ref": discovery["discovery_ref"],
+            "idempotency_key": save_key,
+        }
+        saved = self.app.handle(save_request)
+        self.assertTrue(saved["saved"])
+        returned_reference = saved["recipe"]["library_recipe_ref"]
+        with mock.patch.object(
+            self.app.recipes, "set_favorite", side_effect=RecipeError("simulated favorite failure")
+        ):
+            with self.assertRaisesRegex(RecipeError, "simulated favorite failure"):
+                self.app.handle({
+                    "operation": "recipes", "action": "set_favorite",
+                    "library_recipe_ref": returned_reference, "is_favorite": True,
+                    "idempotency_key": favorite_key,
+                })
+        replayed = self.app.handle(save_request)
+        self.assertEqual(replayed["library_recipe_ref"], returned_reference)
+        self.assertEqual(
+            self.app.recipes.search("Favorite after save", include_archived=True)[0]["id"],
+            returned_reference["recipe_id"],
+        )
+        self.assertEqual(len(self.app.recipes.search("Favorite after save", include_archived=True)), 1)
+        marked = self.app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": returned_reference, "is_favorite": True,
+            "idempotency_key": favorite_key,
+        })
+        self.assertTrue(marked["is_favorite"])
+        self.assertNotEqual(save_key, favorite_key)
+
+        self.app.recipes.delete(returned_reference["recipe_id"], 1)
+        expired = (
+            datetime.now(timezone.utc)
+            - timedelta(days=recipe_module.FAILED_LIBRARY_OPERATION_TTL_DAYS + 1)
+        ).isoformat()
+        with sqlite3.connect(self.app.recipes.path) as connection:
+            connection.execute(
+                "UPDATE library_operations SET updated_at=? "
+                "WHERE idempotency_key=? AND error_code='recipe_deleted'",
+                (expired, save_key),
+            )
+        self.app.recipe_libraries["family-mealie"] = {
+            "library_id": "family-mealie", "provider": "mealie",
+            "base_url": "https://recipes.example", "read_only": False,
+        }
+        self.app.primary_recipe_library_id = "family-mealie"
+        with self.assertRaisesRegex(RecipeError, "already used"):
+            self.app.handle(save_request)
+        with sqlite3.connect(self.app.recipes.path) as connection:
+            tombstone = connection.execute(
+                "SELECT status, error_code FROM library_operations WHERE idempotency_key=?",
+                (save_key,),
+            ).fetchone()
+        self.assertEqual(tombstone, ("failed", "recipe_deleted"))
+        reimport_request = {
+            **save_request, "library_id": "builtin",
+            "idempotency_key": "new-save-after-delete",
+        }
+        reimported = self.app.handle(reimport_request)
+        self.assertNotEqual(
+            reimported["library_recipe_ref"]["recipe_id"], returned_reference["recipe_id"]
+        )
+        with self.assertRaisesRegex(RecipeError, "already used"):
+            self.app.handle(save_request)
+        with sqlite3.connect(self.app.recipes.path) as connection:
+            connection.execute(
+                "UPDATE discovery_snapshots SET expires_at='2000-01-01T00:00:00+00:00' "
+                "WHERE discovery_ref=?",
+                (discovery["discovery_ref"],),
+            )
+        self.app.recipes.cleanup_discoveries()
+        reimport_retry = {
+            key: value for key, value in reimport_request.items() if key != "library_id"
+        }
+        self.assertEqual(
+            self.app.handle(reimport_retry)["library_recipe_ref"],
+            reimported["library_recipe_ref"],
+        )
+        with self.assertRaisesRegex(RecipeError, "already used"):
+            self.app.handle(save_request)
+        with self.assertRaisesRegex(RecipeError, "different content"):
+            self.app.handle({
+                "operation": "recipes", "action": "set_favorite",
+                "library_recipe_ref": reimported["library_recipe_ref"], "is_favorite": True,
+                "idempotency_key": favorite_key,
+            })
+
+        skill = (CORE / "skill" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("saved in builtin; favorite not set", skill)
+        self.assertIn("favorite outcome uncertain", skill)
+        self.assertIn("reuse the bound discovery ref and both", skill)
+        self.assertIn("never rediscover", skill)
+
+    def test_deleted_builtin_key_remains_ambiguous_with_live_external_target(self):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [
+                {"library_id": "builtin", "provider": "builtin", "read_only": False},
+                {
+                    "library_id": "family-mealie", "provider": "mealie",
+                    "base_url": "https://recipes.example", "read_only": False,
+                },
+            ],
+        }
+        store = StateStore(Path(self.temp.name) / "mixed-deleted-key", settings)
+        adapter = SyntheticLibraryAdapter("family-mealie", full_recipe("External retained"))
+        app = Application(
+            store, self.oda, self.browser,
+            recipe_library_adapters={"family-mealie": adapter},
+        )
+        discovery = app.recipes.persist_discovery(
+            external_recipe("themealdb", "Mixed destination", "mixed-destination")
+        )
+        request = {
+            "operation": "recipes", "action": "save",
+            "discovery_ref": discovery["discovery_ref"],
+            "idempotency_key": "mixed-destination-key",
+        }
+        builtin = app.handle({**request, "library_id": "builtin"})
+        app.handle({**request, "library_id": "family-mealie"})
+        self.assertEqual(adapter.create_calls, 1)
+        app.recipes.delete(builtin["library_recipe_ref"]["recipe_id"], 1)
+        app.primary_recipe_library_id = "family-mealie"
+        with self.assertRaisesRegex(RecipeError, "multiple bound targets"):
+            app.handle(request)
+        self.assertEqual(adapter.create_calls, 1)
+        with sqlite3.connect(app.recipes.path) as connection:
+            connection.execute(
+                "UPDATE discovery_snapshots SET expires_at='2000-01-01T00:00:00+00:00' "
+                "WHERE discovery_ref=?",
+                (discovery["discovery_ref"],),
+            )
+        app.recipes.cleanup_discoveries()
+        with self.assertRaisesRegex(RecipeError, "multiple bound targets"):
+            app.handle(request)
+        self.assertEqual(adapter.create_calls, 1)
 
     def test_cross_library_cursors_round_trip_per_exact_library(self):
         settings = {
@@ -2170,6 +2960,54 @@ class RecipeFlowTests(unittest.TestCase):
             app.handle({
                 "operation": "recipes", "action": "search",
                 "library_id": "builtin", "cursor": "opaque",
+            })
+
+    def test_same_frozen_snapshot_has_independent_builtin_and_external_favorite_identity(self):
+        shared = external_recipe("themealdb", "Shared frozen favorite", "shared-favorite")
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [
+                {"library_id": "builtin", "provider": "builtin", "read_only": False},
+                {
+                    "library_id": "family-mealie", "provider": "mealie",
+                    "base_url": "https://recipes.example", "read_only": False,
+                },
+            ],
+        }
+        adapter = SyntheticLibraryAdapter("family-mealie", shared)
+        app = Application(
+            StateStore(Path(self.temp.name) / "independent-favorites", settings),
+            self.oda, self.browser, recipe_library_adapters={"family-mealie": adapter},
+        )
+        discovery = app.recipes.persist_discovery(shared)
+        builtin = app.handle({
+            "operation": "recipes", "action": "save", "library_id": "builtin",
+            "discovery_ref": discovery["discovery_ref"], "idempotency_key": "save-shared-builtin",
+        })["recipe"]
+        app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": builtin["library_recipe_ref"], "is_favorite": True,
+            "idempotency_key": "favorite-shared-builtin",
+        })
+        cross = app.handle({
+            "operation": "recipes", "action": "search",
+            "library_ids": ["builtin", "family-mealie"], "query": "Shared",
+            "include_ineligible": True,
+        })["recipes"]
+        by_library = {item["library_recipe_ref"]["library_id"]: item for item in cross}
+        self.assertEqual(set(by_library), {"builtin", "family-mealie"})
+        self.assertTrue(by_library["builtin"]["is_favorite"])
+        self.assertNotIn("is_favorite", by_library["family-mealie"])
+        external = app.handle({
+            "operation": "recipes", "action": "get",
+            "library_recipe_ref": adapter.reference,
+        })["recipe"]
+        self.assertNotIn("is_favorite", external)
+        with self.assertRaisesRegex(HouseholdError, "only for the builtin"):
+            app.handle({
+                "operation": "recipes", "action": "set_favorite",
+                "library_recipe_ref": adapter.reference, "is_favorite": True,
+                "idempotency_key": "favorite-shared-external",
             })
 
     def test_corrupt_builtin_bank_does_not_block_healthy_external_read_paths(self):
@@ -2355,10 +3193,14 @@ class RecipeFlowTests(unittest.TestCase):
         ref = app.recipes.persist_discovery(source)["discovery_ref"]
         first = app.handle({
             "operation": "recipes", "action": "save", "discovery_ref": ref,
+            "status": "draft",
             "idempotency_key": "journal-first",
         })
         self.assertEqual((first["library_id"], first["status"]), ("family-mealie", "confirmed"))
-        repeated = app.handle({"operation": "recipes", "action": "save", "discovery_ref": ref})
+        repeated = app.handle({
+            "operation": "recipes", "action": "save", "discovery_ref": ref,
+            "status": "draft",
+        })
         self.assertEqual(repeated["library_recipe_ref"], first["library_recipe_ref"])
         self.assertEqual(first_adapter.create_calls, 1)
         other = app.handle({
@@ -2383,9 +3225,15 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertNotEqual(rediscovered, ref)
         reused = app.handle({
             "operation": "recipes", "action": "save", "discovery_ref": rediscovered,
+            "status": "active", "idempotency_key": "journal-reused",
         })
         self.assertEqual(reused["library_recipe_ref"], first["library_recipe_ref"])
         self.assertEqual(first_adapter.create_calls, 1)
+        reused_again = app.handle({
+            "operation": "recipes", "action": "save", "discovery_ref": rediscovered,
+            "status": "active", "idempotency_key": "journal-reused",
+        })
+        self.assertEqual(reused_again["library_recipe_ref"], first["library_recipe_ref"])
         changed_primary = Application(
             StateStore(Path(self.temp.name) / "journal", {
                 **settings, "primary_recipe_library_id": "other-mealie",
@@ -2994,6 +3842,16 @@ class RecipeFlowTests(unittest.TestCase):
 
     def test_draft_recipe_requires_explicit_activation_before_menu_use(self):
         draft = self.app.handle({"operation": "recipes", "action": "save", "status": "draft", "recipe": full_recipe(external_id="draft")})["recipe"]
+        marked = self.app.handle({
+            "operation": "recipes", "action": "set_favorite",
+            "library_recipe_ref": draft["library_recipe_ref"], "is_favorite": True,
+            "idempotency_key": "favorite-draft",
+        })
+        self.assertTrue(marked["is_favorite"])
+        self.assertTrue(self.app.handle({
+            "operation": "recipes", "action": "get",
+            "library_recipe_ref": draft["library_recipe_ref"],
+        })["recipe"]["is_favorite"])
         with self.assertRaisesRegex(HouseholdError, "only active"):
             self.app.handle({"operation": "menu", "action": "save", "menu": {"week": "2026-W40", "dishes": [{"recipe_ref": {"id": draft["id"]}}]}})
         active = self.app.handle({
@@ -3001,6 +3859,8 @@ class RecipeFlowTests(unittest.TestCase):
             "expected_revision": 1, "status": "active", "recipe": full_recipe(external_id="draft"),
         })["recipe"]
         self.assertEqual(active["status"], "active")
+        self.assertTrue(active["is_favorite"])
+        self.assertEqual(active["favorite_revision"], 1)
         result = self.app.handle({"operation": "menu", "action": "save", "menu": {"week": "2026-W40", "dishes": [{"recipe_ref": {"id": active["id"]}}]}})
         self.assertEqual(result["menu"]["dishes"][0]["recipe_ref"]["revision"], 2)
 
