@@ -465,7 +465,11 @@ class CoreTestsBase:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(json.dumps({"household": "Test"}), encoding="utf-8")
-            self.assertEqual(config(path), {"household": "Test", "provider": "oda", "confirmation_policy": "fresh"})
+            self.assertEqual(config(path), {
+                "household": "Test", "provider": "oda", "confirmation_policy": "fresh",
+                "primary_recipe_library_id": "builtin",
+                "recipe_libraries": [{"library_id": "builtin", "provider": "builtin", "read_only": False}],
+            })
             path.write_text(json.dumps({"household": "Test", "provider": "MENY", "confirmation_policy": "STANDING"}), encoding="utf-8")
             self.assertEqual(config(path)["provider"], "meny")
             self.assertEqual(config(path)["confirmation_policy"], "standing")
