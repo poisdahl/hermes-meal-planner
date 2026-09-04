@@ -396,6 +396,7 @@ the probed response schemas remain compatible. Its read-only connection test
 checks `/api/app/about`, authenticated `/api/users/self`, one bounded recipe
 list page, the favorite-read response shape and one bounded organizer-tag page.
 It reports `search`, `get`, `create_from_discovery`, `reconcile_create`,
+`delete`, `reconcile_delete`,
 `favorite_read`, `favorite_write_desired_state`, `favorite_reconcile`,
 `label_read` and, when the authenticated user may organize and the connection
 is writable, `label_create`. Native favorite writes
@@ -403,8 +404,9 @@ use Mealie's exact recipe UUID add/remove routes, then read the exact native
 state back. Mealie exposes no ETag or favorite revision for these routes, so
 `favorite_conditional_write` is false and `expected_favorite_revision` is
 rejected before dispatch. A configured `read_only` connection retains
-search/get and native favorite reads but reports no create or favorite-write
-capability and cannot be selected as a writable primary.
+search/get, native favorite reads and delete reconciliation but reports no
+create, delete or favorite-write capability and cannot be selected as a
+writable primary.
 
 Mealie search is paginated and returns the immutable provider UUID in the
 namespaced `library_recipe_ref`; the current slug is display-only
@@ -466,14 +468,17 @@ version, validates the bearer session, reads the authenticated-user shape,
 lists at most one private recipe and validates the authenticated label-list
 shape. It reports `search`, `get`, `create_from_discovery`, `reconcile_create`,
 `label_read` and, for a writable connection, `label_create`; a configured
-`read_only` connection retains search/get and label reads, suppresses creates
-and reconciliation, and cannot be the writable primary. RecipeSage rating is
+`read_only` connection retains search/get, label reads and delete
+reconciliation, suppresses create and delete writes, and cannot be the
+writable primary. RecipeSage rating is
 not treated as a favorite. Native
 favorite read, desired-state mutation, conditional favorite write and favorite
 reconciliation are all false for the verified v4.0.6 hosted contract. Rating,
 labels, folders and local shadow metadata are never used to emulate that
 missing boolean, so `set_favorite` fails before any RecipeSage dispatch.
-Conditional update, archive and delete are likewise not reported or emulated.
+Conditional update and archive are likewise not reported or emulated. Writable
+connections report exact-ID `delete`; all connections report its authenticated
+exact-read `reconcile_delete` capability.
 
 Private list/search uses the current account only. The authenticated `getMe`
 UUID is cached for the connection, and every list, search, exact-get, create
@@ -509,6 +514,46 @@ explicit token renewal can resume the same frozen save without rediscovery. If
 authentication expires while an already-uncertain operation is being
 reconciled, the operation stays uncertain but reports `needs_auth`; renewal
 allows reconciliation to continue and never repeats the create blindly.
+
+### External recipe lifecycle
+
+Lifecycle capabilities are connection-specific. The verified Mealie 3.24.0
+and RecipeSage 4.0.6 contracts have exact private-recipe deletion and safe
+delete reconciliation, but no provider-enforced compare-and-swap update and no
+native reversible archive state. They therefore report `conditional_update`
+and `archive_desired_state` false instead of approximating either feature with
+a read-before-write, label, rating, folder or local shadow. A read-only
+connection also reports `delete` false and sends no mutation.
+
+An external conditional update is accepted only from an adapter that reports
+`conditional_update`. It takes one exact versioned `library_recipe_ref`, the
+complete normalized replacement and one stable idempotency key. The provider
+must enforce the supplied version during its write. A stale version conflicts
+without dispatch, and source, rights and attribution must remain unchanged.
+
+External archive and permanent deletion always use two calls, independently of
+the checkout confirmation policy. `archive_prepare` or `delete_prepare` reads
+the exact provider ID and returns a confirmation bound to its library, ID,
+provider origin, authenticated account and authorization scope, version,
+normalized name, content digest and requested state. A separate
+`archive_confirm` or `delete_confirm` must present that unchanged confirmation
+ID and a stable idempotency key within ten minutes. Confirm rereads the exact
+target; identity, version, content or archive-state drift fails before any
+mutation. Delete preview marks the action permanent and states that immutable
+active-menu, pending-checkout, confirmed-order and recipe-email snapshots are
+retained.
+
+A possibly dispatched update, archive or deletion remains `uncertain` and
+blocks another mutation of that target. Retry only the same confirmation and
+same idempotency key so the service performs exact reconciliation; it never
+blindly repeats delete/archive. A deletion becomes confirmed only after a fresh
+authentication check followed by authoritative exact-ID absence. Auth,
+permission, rate-limit, malformed and ambiguous 404 responses cannot prove
+absence, and a changed provider origin, authenticated account or Mealie
+group/household scope cannot inherit or reconcile the old operation. Missing
+recipes are not recreated, retargeted or copied into the
+built-in bank. A later provider recipe with the same title or source URL but a
+new ID is a distinct identity and inherits no mapping, usage or favorite state.
 
 The sanitized fixture in `tests/fixtures/recipesage/v4.0.6.json` records exact
 selected request/response schemas captured from the hosted OpenAPI and the

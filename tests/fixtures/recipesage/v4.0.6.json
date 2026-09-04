@@ -7,7 +7,7 @@
     "selfhost_verified_version": "v4.0.3",
     "selfhost_release_commit": "d7e81d3a4c7033b96552abc60494a0e17e0cbbbc",
     "selfhost_config_version": "2026-08-16",
-    "captured_at": "2026-09-03T23:19:44Z",
+    "captured_at": "2026-09-04T11:24:00Z",
     "hosted_schema_source": "https://api.recipesage.com/openapi.json",
     "stable_schema_source": "RecipeSage v4.0.3 and v4.0.6 tags plus RecipeSage-selfhost config 2026-08-16",
     "schema_evidence": "Exact selected request and response schemas captured from the official hosted OpenAPI; the official self-host image reports version selfhost, so runtime support additionally requires this same schema fingerprint.",
@@ -17,6 +17,13 @@
   "terms": {
     "hosted_api": "Personal, non-commercial use only; broader rights are not implied.",
     "selfhost": "Use follows the configured instance and RecipeSage license."
+  },
+  "lifecycle_capabilities": {
+    "conditional_update": false,
+    "archive_desired_state": false,
+    "delete": true,
+    "reconcile_delete": true,
+    "evidence": "The verified v4.0.6 hosted OpenAPI exposes an authenticated exact-UUID delete. Its update has no expected revision or provider compare-and-swap field, and main/inbox folders are not archive state. Authenticated exact-ID absence can reconcile a dispatched delete."
   },
   "favorite_capabilities": {
     "favorite_read": false,
@@ -34,6 +41,7 @@
     "recipe_get": "GET /compat/v2/recipes/getRecipe?id={immutable-uuid}",
     "recipe_lookup_by_url": "GET /compat/v2/recipes/getRecipesByUrl?url={exact-url}",
     "recipe_create": "POST /compat/v2/recipes/createRecipe",
+    "recipe_delete": "POST /compat/v2/recipes/deleteRecipe",
     "label_list": "GET /compat/v2/labels/getLabels",
     "label_create": "POST /compat/v2/labels/createLabel"
   },
@@ -244,6 +252,18 @@
             "properties": {"id": {"type": "string", "format": "uuid"}},
             "required": ["id"]
           }}}}}
+        }
+      },
+      "/compat/v2/recipes/deleteRecipe": {
+        "post": {
+          "operationId": "recipes-deleteRecipe",
+          "security": [{"Authorization": []}],
+          "requestBody": {"content": {"application/json": {"schema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "format": "uuid", "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"}},
+            "required": ["id"]
+          }}}},
+          "responses": {"200": {"content": {"application/json": {"schema": {"type": "string"}}}}}
         }
       },
       "/compat/v2/labels/getLabels": {
@@ -458,7 +478,8 @@
       "recipe_list": [400, 401, 500],
       "recipe_search": [400, 500],
       "recipe_get": [400, 401, 403, 404, 500],
-      "recipe_create": [400, 401, 403, 500]
+      "recipe_create": [400, 401, 403, 500],
+      "recipe_delete": [400, 401, 403, 500]
     },
     "adapter_policy": {
       "needs_auth": [401, 403],

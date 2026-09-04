@@ -42,7 +42,11 @@ MAX_FAILED_DISCOVERY_BINDINGS = 2_000
 MAX_LIBRARY_OPERATIONS = 10_000
 MAX_LIBRARY_MAPPINGS = 10_000
 FAILED_LIBRARY_OPERATION_TTL_DAYS = 90
+LIBRARY_LIFECYCLE_CONFIRMATION_TTL = timedelta(minutes=10)
 ACTIVE_DISCOVERY_BINDING_STATUSES = {"pending", "uncertain"}
+LIBRARY_RECIPE_MUTATION_KINDS = {
+    "conditional_update", "archive", "delete", "favorite", "label",
+}
 DISCOVERY_DESTINATION_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,62}")
 VALID_RELATIONSHIPS = {"original", "adapted", "inspired_by", "generated", "user_supplied", "unknown"}
 VALID_STORAGE = {"full", "link_only"}
@@ -1434,6 +1438,151 @@ class RecipeStore:
             "claimed": claimed,
         }
 
+    @staticmethod
+    def _lifecycle_operation(
+        row: sqlite3.Row, *, created: bool = False, claimed: bool = False
+    ) -> dict[str, Any]:
+        kind = row["kind"]
+        if kind not in {"conditional_update", "archive", "delete"}:
+            raise RecipeError("recipe library journal is unavailable")
+        try:
+            metadata = json.loads(row["request_metadata"])
+            action = "update" if kind == "conditional_update" else kind
+            if not isinstance(metadata, Mapping) or metadata.get("action") != action:
+                raise RecipeError("recipe library journal is unavailable")
+            reference = validate_library_recipe_ref({
+                "library_id": row["library_id"],
+                "recipe_id": row["target_recipe_id"],
+                "version": row["provider_version"],
+            })
+            if "version" not in reference:
+                raise RecipeError("recipe library journal is unavailable")
+            provider_principal = _bounded_text(
+                metadata.get("provider_principal"),
+                "recipe library provider principal",
+                required=True,
+                maximum=300,
+            )
+            provider_binding = _bounded_text(
+                metadata.get("provider_binding"),
+                "recipe library provider binding",
+                required=True,
+                maximum=64,
+            )
+            if re.fullmatch(r"[a-f0-9]{64}", provider_binding or "") is None:
+                raise RecipeError("recipe library journal is unavailable")
+            replacement = None
+            name = None
+            current_archived = None
+            requested_archived = None
+            if kind == "conditional_update":
+                if set(metadata) != {
+                    "action", "provider_binding", "provider_principal",
+                    "replacement",
+                }:
+                    raise RecipeError("recipe library journal is unavailable")
+                replacement = normalize_recipe(metadata.get("replacement"))
+            elif kind == "archive":
+                if set(metadata) != {
+                    "action", "provider_binding", "provider_principal", "name",
+                    "current_archived", "requested_archived",
+                }:
+                    raise RecipeError("recipe library journal is unavailable")
+                name = _bounded_text(
+                    metadata.get("name"), "recipe library recipe name",
+                    required=True, maximum=300,
+                )
+                current_archived = metadata.get("current_archived")
+                requested_archived = metadata.get("requested_archived")
+                if not isinstance(current_archived, bool) or not isinstance(
+                    requested_archived, bool
+                ):
+                    raise RecipeError("recipe library journal is unavailable")
+            else:
+                if set(metadata) != {
+                    "action", "provider_binding", "provider_principal", "name",
+                }:
+                    raise RecipeError("recipe library journal is unavailable")
+                name = _bounded_text(
+                    metadata.get("name"), "recipe library recipe name",
+                    required=True, maximum=300,
+                )
+            if re.fullmatch(r"[a-f0-9]{64}", row["snapshot_digest"] or "") is None:
+                raise RecipeError("recipe library journal is unavailable")
+            result_metadata = None
+            if row["result_metadata"]:
+                raw_result = json.loads(row["result_metadata"])
+                if not isinstance(raw_result, Mapping):
+                    raise RecipeError("recipe library journal is unavailable")
+                result_reference = validate_library_recipe_ref(
+                    raw_result.get("library_recipe_ref")
+                )
+                if (
+                    result_reference["library_id"] != row["library_id"]
+                    or result_reference["recipe_id"] != row["target_recipe_id"]
+                    or (
+                        kind in {"conditional_update", "archive"}
+                        and "version" not in result_reference
+                    )
+                ):
+                    raise RecipeError("recipe library journal is unavailable")
+                if kind == "conditional_update":
+                    if set(raw_result) != {"library_recipe_ref", "updated"} or raw_result.get("updated") is not True:
+                        raise RecipeError("recipe library journal is unavailable")
+                elif kind == "archive":
+                    if (
+                        set(raw_result) != {"library_recipe_ref", "archived"}
+                        or raw_result.get("archived") is not requested_archived
+                    ):
+                        raise RecipeError("recipe library journal is unavailable")
+                elif set(raw_result) != {"library_recipe_ref", "deleted"} or raw_result.get("deleted") is not True:
+                    raise RecipeError("recipe library journal is unavailable")
+                result_metadata = dict(raw_result)
+                result_metadata["library_recipe_ref"] = result_reference
+            if row["status"] == "confirmed" and result_metadata is None:
+                raise RecipeError("recipe library journal is unavailable")
+            created_at = datetime.fromisoformat(row["created_at"])
+            if created_at.tzinfo is None:
+                raise ValueError
+        except (
+            json.JSONDecodeError, TypeError, ValueError, RecipeLibraryError,
+        ) as exc:
+            raise RecipeError("recipe library journal is unavailable") from exc
+        result = {
+            "operation_id": row["operation_id"],
+            "confirmation_id": (
+                row["operation_id"] if kind in {"archive", "delete"} else None
+            ),
+            "kind": kind,
+            "action": action,
+            "library_id": row["library_id"],
+            "target_recipe_id": row["target_recipe_id"],
+            "library_recipe_ref": reference,
+            "request_digest": row["request_digest"],
+            "idempotency_key": row["idempotency_key"],
+            "snapshot_digest": row["snapshot_digest"],
+            "provider_principal": provider_principal,
+            "provider_binding": provider_binding,
+            "replacement": replacement,
+            "name": name,
+            "current_archived": current_archived,
+            "requested_archived": requested_archived,
+            "status": row["status"],
+            "result": result_metadata,
+            "error_code": row["error_code"],
+            "error": row["error_text"],
+            "dispatched_at": row["dispatched_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "created": created,
+            "claimed": claimed,
+        }
+        if kind in {"archive", "delete"}:
+            result["expires_at"] = (
+                created_at + LIBRARY_LIFECYCLE_CONFIRMATION_TTL
+            ).isoformat()
+        return result
+
     @classmethod
     def _operation(
         cls, row: sqlite3.Row, *, created: bool = False, claimed: bool = False
@@ -1442,9 +1591,22 @@ class RecipeStore:
             return cls._favorite_operation(row, created=created, claimed=claimed)
         if row["kind"] == "label":
             return cls._label_operation(row, created=created, claimed=claimed)
+        if row["kind"] in {"conditional_update", "archive", "delete"}:
+            return cls._lifecycle_operation(row, created=created, claimed=claimed)
         return cls._library_operation(row, created=created, claimed=claimed)
 
     def _cleanup_library_data(self, connection: sqlite3.Connection) -> None:
+        confirmation_cutoff = (
+            datetime.now(timezone.utc) - LIBRARY_LIFECYCLE_CONFIRMATION_TTL
+        ).isoformat()
+        connection.execute(
+            "UPDATE library_operations SET status='failed', "
+            "error_code='confirmation_expired', "
+            "error_text='recipe lifecycle confirmation expired', updated_at=? "
+            "WHERE kind IN ('archive','delete') AND status='pending' "
+            "AND dispatched_at IS NULL AND created_at <= ?",
+            (_now(), confirmation_cutoff),
+        )
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=FAILED_LIBRARY_OPERATION_TTL_DAYS)
         ).isoformat()
@@ -1522,6 +1684,11 @@ class RecipeStore:
                     (library, ref),
                 ).fetchone()
                 if existing is not None:
+                    if existing["error_code"] == "recipe_deleted":
+                        raise RecipeError(
+                            "the external recipe previously saved from this discovery "
+                            "reference was permanently deleted"
+                        )
                     if key is not None:
                         raise RecipeError(
                             "discovery was already saved with a different idempotency key"
@@ -1677,7 +1844,8 @@ class RecipeStore:
                     return self._favorite_operation(keyed)
                 self._cleanup_library_data(connection)
                 active = connection.execute(
-                    "SELECT 1 FROM library_operations WHERE kind='favorite' "
+                    "SELECT 1 FROM library_operations WHERE kind IN "
+                    "('conditional_update','archive','delete','favorite','label') "
                     "AND library_id=? AND target_recipe_id=? "
                     "AND status IN ('pending','uncertain') LIMIT 1",
                     (reference["library_id"], reference["recipe_id"]),
@@ -1876,7 +2044,8 @@ class RecipeStore:
                     return self._label_operation(keyed[0])
                 self._cleanup_library_data(connection)
                 if connection.execute(
-                    "SELECT 1 FROM library_operations WHERE kind='label' "
+                    "SELECT 1 FROM library_operations WHERE kind IN "
+                    "('conditional_update','archive','delete','favorite','label') "
                     "AND library_id=? AND target_recipe_id=? "
                     "AND status IN ('pending','uncertain') LIMIT 1",
                     (library, recipe_ref["recipe_id"]),
@@ -1918,6 +2087,457 @@ class RecipeStore:
                     ).fetchone(),
                     created=True,
                 )
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def begin_library_conditional_update(
+        self,
+        library_recipe_ref: Any,
+        replacement: Any,
+        current_digest: Any,
+        *,
+        provider_binding: Any,
+        provider_principal: Any,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        try:
+            reference = validate_library_recipe_ref(library_recipe_ref)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        if reference["library_id"] == "builtin" or "version" not in reference:
+            raise RecipeError(
+                "external conditional update requires an exact versioned recipe reference"
+            )
+        document = normalize_recipe(replacement)
+        digest = _bounded_text(
+            current_digest, "recipe lifecycle snapshot digest", required=True,
+            maximum=64,
+        )
+        if re.fullmatch(r"[a-f0-9]{64}", digest or "") is None:
+            raise RecipeError("recipe lifecycle snapshot digest is invalid")
+        key = self._idempotency_key(idempotency_key)
+        if key is None:
+            raise RecipeError("idempotency_key is required")
+        principal = _bounded_text(
+            provider_principal,
+            "recipe library provider principal",
+            required=True,
+            maximum=300,
+        )
+        binding = _bounded_text(
+            provider_binding,
+            "recipe library provider binding",
+            required=True,
+            maximum=64,
+        )
+        if re.fullmatch(r"[a-f0-9]{64}", binding or "") is None:
+            raise RecipeError("recipe library provider binding is invalid")
+        metadata = {
+            "action": "update",
+            "provider_binding": binding,
+            "provider_principal": principal,
+            "replacement": document,
+        }
+        request_digest = _hash({
+            "kind": "conditional_update",
+            "library_recipe_ref": reference,
+            "replacement": document,
+        })
+        library = reference["library_id"]
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM library_connection_controls WHERE library_id=?",
+                    (library,),
+                ).fetchone() is not None:
+                    raise RecipeError("recipe library connection is disabled")
+                if connection.execute(
+                    "SELECT 1 FROM idempotency WHERE key=?", (key,)
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "idempotency key was already used with different content"
+                    )
+                keyed = connection.execute(
+                    "SELECT * FROM library_operations WHERE idempotency_key=?", (key,)
+                ).fetchall()
+                if keyed:
+                    if (
+                        len(keyed) != 1
+                        or keyed[0]["kind"] != "conditional_update"
+                        or keyed[0]["library_id"] != library
+                        or keyed[0]["target_recipe_id"] != reference["recipe_id"]
+                        or keyed[0]["request_digest"] != request_digest
+                    ):
+                        raise RecipeError(
+                            "idempotency key was already used for another library operation"
+                        )
+                    return self._lifecycle_operation(keyed[0])
+                self._cleanup_library_data(connection)
+                active = connection.execute(
+                    "SELECT 1 FROM library_operations WHERE library_id=? "
+                    "AND target_recipe_id=? AND kind IN "
+                    "('conditional_update','archive','delete','favorite','label') "
+                    "AND status IN ('pending','uncertain') LIMIT 1",
+                    (library, reference["recipe_id"]),
+                ).fetchone()
+                if active is not None:
+                    raise RecipeError(
+                        "another mutation for this exact external recipe is pending or "
+                        "uncertain; retry its original operation"
+                    )
+                if connection.execute(
+                    "SELECT COUNT(*) FROM library_operations"
+                ).fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
+                    raise RecipeError("recipe library operation journal is full")
+                operation_id = f"libop:v1:{secrets.token_urlsafe(18)}"
+                timestamp = _now()
+                connection.execute("""INSERT INTO library_operations(
+                    operation_id, kind, library_id, discovery_ref, target_recipe_id,
+                    request_digest, request_metadata, idempotency_key, status,
+                    source_identity, snapshot_digest, result_metadata,
+                    provider_recipe_id, provider_version, error_code, error_text,
+                    dispatched_at, created_at, updated_at
+                ) VALUES(?, 'conditional_update', ?, NULL, ?, ?, ?, ?, 'pending',
+                    NULL, ?, NULL, ?, ?, NULL, NULL, NULL, ?, ?)""", (
+                    operation_id, library, reference["recipe_id"], request_digest,
+                    _canonical(metadata), key, digest, reference["recipe_id"],
+                    reference["version"], timestamp, timestamp,
+                ))
+                return self._lifecycle_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone(),
+                    created=True,
+                )
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def prepare_library_lifecycle(
+        self,
+        kind: Any,
+        library_recipe_ref: Any,
+        name: Any,
+        snapshot_digest: Any,
+        *,
+        provider_binding: Any,
+        provider_principal: Any,
+        current_archived: Any = None,
+        requested_archived: Any = None,
+    ) -> dict[str, Any]:
+        if kind not in {"archive", "delete"}:
+            raise RecipeError("recipe lifecycle prepare action is invalid")
+        try:
+            reference = validate_library_recipe_ref(library_recipe_ref)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        if reference["library_id"] == "builtin" or "version" not in reference:
+            raise RecipeError(
+                "external lifecycle prepare requires an exact versioned recipe reference"
+            )
+        recipe_name = _bounded_text(
+            name, "recipe library recipe name", required=True, maximum=300
+        )
+        digest = _bounded_text(
+            snapshot_digest, "recipe lifecycle snapshot digest", required=True,
+            maximum=64,
+        )
+        if re.fullmatch(r"[a-f0-9]{64}", digest or "") is None:
+            raise RecipeError("recipe lifecycle snapshot digest is invalid")
+        principal = _bounded_text(
+            provider_principal,
+            "recipe library provider principal",
+            required=True,
+            maximum=300,
+        )
+        binding = _bounded_text(
+            provider_binding,
+            "recipe library provider binding",
+            required=True,
+            maximum=64,
+        )
+        if re.fullmatch(r"[a-f0-9]{64}", binding or "") is None:
+            raise RecipeError("recipe library provider binding is invalid")
+        metadata: dict[str, Any] = {
+            "action": kind,
+            "provider_binding": binding,
+            "provider_principal": principal,
+            "name": recipe_name,
+        }
+        if kind == "archive":
+            if not isinstance(current_archived, bool) or not isinstance(
+                requested_archived, bool
+            ):
+                raise RecipeError(
+                    "archive prepare requires current and requested archive states"
+                )
+            metadata.update({
+                "current_archived": current_archived,
+                "requested_archived": requested_archived,
+            })
+        elif current_archived is not None or requested_archived is not None:
+            raise RecipeError("delete prepare does not accept archive state")
+        request_digest = _hash({
+            "kind": kind,
+            "library_recipe_ref": reference,
+            "snapshot_digest": digest,
+            **metadata,
+        })
+        library = reference["library_id"]
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM library_connection_controls WHERE library_id=?",
+                    (library,),
+                ).fetchone() is not None:
+                    raise RecipeError("recipe library connection is disabled")
+                self._cleanup_library_data(connection)
+                active = connection.execute(
+                    "SELECT * FROM library_operations WHERE library_id=? "
+                    "AND target_recipe_id=? AND kind IN "
+                    "('conditional_update','archive','delete','favorite','label') "
+                    "AND status IN ('pending','uncertain') ORDER BY created_at LIMIT 1",
+                    (library, reference["recipe_id"]),
+                ).fetchone()
+                if active is not None:
+                    if (
+                        active["kind"] == kind
+                        and active["request_digest"] == request_digest
+                        and active["idempotency_key"] is None
+                        and active["dispatched_at"] is None
+                    ):
+                        return self._lifecycle_operation(active)
+                    raise RecipeError(
+                        "another mutation for this exact external recipe is pending or "
+                        "uncertain; finish or expire it first"
+                    )
+                if connection.execute(
+                    "SELECT COUNT(*) FROM library_operations"
+                ).fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
+                    raise RecipeError("recipe library operation journal is full")
+                operation_id = f"libop:v1:{secrets.token_urlsafe(18)}"
+                timestamp = _now()
+                connection.execute("""INSERT INTO library_operations(
+                    operation_id, kind, library_id, discovery_ref, target_recipe_id,
+                    request_digest, request_metadata, idempotency_key, status,
+                    source_identity, snapshot_digest, result_metadata,
+                    provider_recipe_id, provider_version, error_code, error_text,
+                    dispatched_at, created_at, updated_at
+                ) VALUES(?, ?, ?, NULL, ?, ?, ?, NULL, 'pending', NULL, ?, NULL,
+                    ?, ?, NULL, NULL, NULL, ?, ?)""", (
+                    operation_id, kind, library, reference["recipe_id"], request_digest,
+                    _canonical(metadata), digest, reference["recipe_id"],
+                    reference["version"], timestamp, timestamp,
+                ))
+                return self._lifecycle_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone(),
+                    created=True,
+                )
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def confirm_library_lifecycle(
+        self, confirmation_id: Any, *, idempotency_key: Any
+    ) -> dict[str, Any]:
+        operation = _bounded_text(
+            confirmation_id, "confirmation_id", required=True, maximum=80
+        )
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe lifecycle confirmation was not found")
+        key = self._idempotency_key(idempotency_key)
+        if key is None:
+            raise RecipeError("idempotency_key is required")
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone()
+                if row is None or row["kind"] not in {"archive", "delete"}:
+                    raise RecipeError("recipe lifecycle confirmation was not found")
+                if row["idempotency_key"] is not None:
+                    if row["idempotency_key"] != key:
+                        raise RecipeError(
+                            "recipe lifecycle confirmation already uses another "
+                            "idempotency key"
+                        )
+                    return self._lifecycle_operation(row)
+                created_at = datetime.fromisoformat(row["created_at"])
+                if (
+                    created_at.tzinfo is None
+                    or datetime.now(timezone.utc)
+                    >= created_at + LIBRARY_LIFECYCLE_CONFIRMATION_TTL
+                ):
+                    timestamp = _now()
+                    connection.execute(
+                        "UPDATE library_operations SET status='failed', "
+                        "error_code='confirmation_expired', "
+                        "error_text='recipe lifecycle confirmation expired', "
+                        "updated_at=? WHERE operation_id=?",
+                        (timestamp, operation),
+                    )
+                    return self._lifecycle_operation(
+                        connection.execute(
+                            "SELECT * FROM library_operations WHERE operation_id=?",
+                            (operation,),
+                        ).fetchone()
+                    )
+                if connection.execute(
+                    "SELECT 1 FROM idempotency WHERE key=?", (key,)
+                ).fetchone() is not None or connection.execute(
+                    "SELECT 1 FROM library_operations WHERE idempotency_key=?", (key,)
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "idempotency key was already used for another operation"
+                    )
+                timestamp = _now()
+                connection.execute(
+                    "UPDATE library_operations SET idempotency_key=?, updated_at=? "
+                    "WHERE operation_id=? AND idempotency_key IS NULL",
+                    (key, timestamp, operation),
+                )
+                return self._lifecycle_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation,),
+                    ).fetchone()
+                )
+        except (ValueError, TypeError) as exc:
+            raise RecipeError("recipe lifecycle confirmation is invalid") from exc
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def finish_library_lifecycle(
+        self,
+        operation_id: Any,
+        status: Any,
+        *,
+        result: Any = None,
+        error_code: Any = None,
+        error: Any = None,
+    ) -> dict[str, Any]:
+        operation = _bounded_text(
+            operation_id, "operation_id", required=True, maximum=80
+        )
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe lifecycle operation was not found")
+        if status not in {"confirmed", "failed", "uncertain"}:
+            raise RecipeError("recipe lifecycle operation status is invalid")
+        lifecycle_result = None
+        if result is not None:
+            if not isinstance(result, Mapping):
+                raise RecipeError("recipe lifecycle result is invalid")
+            try:
+                reference = validate_library_recipe_ref(
+                    result.get("library_recipe_ref")
+                )
+            except RecipeLibraryError as exc:
+                raise RecipeError(str(exc)) from exc
+            lifecycle_result = dict(result)
+            lifecycle_result["library_recipe_ref"] = reference
+        if (status == "confirmed") != (lifecycle_result is not None):
+            raise RecipeError(
+                "confirmed recipe lifecycle operation requires exactly one result"
+            )
+        code = _bounded_text(
+            error_code, "recipe library error_code", maximum=80
+        )
+        if code is not None and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code) is None:
+            raise RecipeError("recipe library error_code is invalid")
+        error_text = _bounded_text(error, "recipe library error", maximum=500)
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?", (operation,)
+                ).fetchone()
+                if row is None or row["kind"] not in {
+                    "conditional_update", "archive", "delete",
+                }:
+                    raise RecipeError("recipe lifecycle operation was not found")
+                if row["status"] in {"confirmed", "failed"}:
+                    return self._lifecycle_operation(row)
+                if lifecycle_result is not None:
+                    reference = lifecycle_result["library_recipe_ref"]
+                    if (
+                        reference["library_id"] != row["library_id"]
+                        or reference["recipe_id"] != row["target_recipe_id"]
+                        or (
+                            row["kind"] in {"conditional_update", "archive"}
+                            and "version" not in reference
+                        )
+                    ):
+                        raise RecipeError(
+                            "recipe lifecycle result does not match the bound target"
+                        )
+                    expected_keys = (
+                        {"library_recipe_ref", "updated"}
+                        if row["kind"] == "conditional_update"
+                        else {"library_recipe_ref", "archived"}
+                        if row["kind"] == "archive"
+                        else {"library_recipe_ref", "deleted"}
+                    )
+                    expected_value = (
+                        lifecycle_result.get("updated") is True
+                        if row["kind"] == "conditional_update"
+                        else isinstance(lifecycle_result.get("archived"), bool)
+                        if row["kind"] == "archive"
+                        else lifecycle_result.get("deleted") is True
+                    )
+                    if set(lifecycle_result) != expected_keys or not expected_value:
+                        raise RecipeError("recipe lifecycle result is invalid")
+                    if row["kind"] == "archive":
+                        metadata = json.loads(row["request_metadata"])
+                        if lifecycle_result["archived"] != metadata["requested_archived"]:
+                            raise RecipeError("recipe lifecycle result is invalid")
+                timestamp = _now()
+                provider_version = (
+                    lifecycle_result["library_recipe_ref"].get("version")
+                    if lifecycle_result is not None
+                    else row["provider_version"]
+                )
+                connection.execute("""UPDATE library_operations SET
+                    status=?, result_metadata=?, error_code=?, error_text=?,
+                    updated_at=? WHERE operation_id=?""", (
+                    status,
+                    _canonical(lifecycle_result) if lifecycle_result is not None else None,
+                    code, error_text, timestamp, operation,
+                ))
+                if status == "confirmed" and row["kind"] == "delete":
+                    connection.execute(
+                        "DELETE FROM library_mappings WHERE library_id=? AND recipe_id=?",
+                        (row["library_id"], row["target_recipe_id"]),
+                    )
+                    connection.execute(
+                        "UPDATE library_operations SET error_code='recipe_deleted', "
+                        "error_text='the mapped external recipe was permanently deleted', "
+                        "updated_at=? WHERE kind='create' AND library_id=? "
+                        "AND provider_recipe_id=? AND status='confirmed'",
+                        (timestamp, row["library_id"], row["target_recipe_id"]),
+                    )
+                elif status == "confirmed" and provider_version is not None:
+                    connection.execute(
+                        "UPDATE library_mappings SET version=?, updated_at=? "
+                        "WHERE library_id=? AND recipe_id=?",
+                        (
+                            provider_version, timestamp, row["library_id"],
+                            row["target_recipe_id"],
+                        ),
+                    )
+                self._cleanup_library_data(connection)
+                return self._lifecycle_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation,),
+                    ).fetchone()
+                )
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RecipeError("recipe library journal is unavailable") from exc
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
@@ -2018,6 +2638,29 @@ class RecipeStore:
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
+    def library_operation_for_idempotency(
+        self, idempotency_key: Any
+    ) -> dict[str, Any] | None:
+        key = self._idempotency_key(idempotency_key)
+        if key is None:
+            raise RecipeError("idempotency_key is required")
+        try:
+            with self._connection() as connection:
+                if connection.execute(
+                    "SELECT 1 FROM idempotency WHERE key=?", (key,)
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "idempotency key was already used with different content"
+                    )
+                rows = connection.execute(
+                    "SELECT * FROM library_operations WHERE idempotency_key=?", (key,)
+                ).fetchall()
+                if len(rows) > 1:
+                    raise RecipeError("recipe library journal is unavailable")
+                return self._operation(rows[0]) if rows else None
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
     def claim_library_dispatch(self, operation_id: Any) -> dict[str, Any]:
         operation = _bounded_text(operation_id, "operation_id", required=True, maximum=80)
         if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
@@ -2032,6 +2675,32 @@ class RecipeStore:
                     raise RecipeError("recipe library operation was not found")
                 if row["status"] != "pending" or row["dispatched_at"] is not None:
                     return self._operation(row)
+                if row["kind"] in {"archive", "delete"}:
+                    try:
+                        created_at = datetime.fromisoformat(row["created_at"])
+                    except (TypeError, ValueError) as exc:
+                        raise RecipeError(
+                            "recipe library journal is unavailable"
+                        ) from exc
+                    if (
+                        created_at.tzinfo is None
+                        or datetime.now(timezone.utc)
+                        >= created_at + LIBRARY_LIFECYCLE_CONFIRMATION_TTL
+                    ):
+                        timestamp = _now()
+                        connection.execute(
+                            "UPDATE library_operations SET status='failed', "
+                            "error_code='confirmation_expired', "
+                            "error_text='recipe lifecycle confirmation expired', "
+                            "updated_at=? WHERE operation_id=?",
+                            (timestamp, operation),
+                        )
+                        return self._operation(
+                            connection.execute(
+                                "SELECT * FROM library_operations WHERE operation_id=?",
+                                (operation,),
+                            ).fetchone()
+                        )
                 timestamp = _now()
                 cursor = connection.execute(
                     "UPDATE library_operations SET dispatched_at=?, error_code=NULL, "

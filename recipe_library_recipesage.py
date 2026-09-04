@@ -18,6 +18,7 @@ from recipe_libraries import (
     RecipeLibraryAdapter,
     RecipeLibraryDefiniteError,
     RecipeLibraryError,
+    RecipeLibraryExternalMissingError,
     RecipeLibraryUncertainError,
     normalize_label_name,
     normalize_library_origin,
@@ -49,6 +50,7 @@ _REQUIRED_OPERATIONS = {
     "/compat/v2/recipes/getRecipe": ("get", "recipes-getRecipe"),
     "/compat/v2/recipes/getRecipesByUrl": ("get", "recipes-getRecipesByUrl"),
     "/compat/v2/recipes/createRecipe": ("post", "recipes-createRecipe"),
+    "/compat/v2/recipes/deleteRecipe": ("post", "recipes-deleteRecipe"),
     "/compat/v2/labels/getLabels": ("get", "labels-getLabels"),
     "/compat/v2/labels/createLabel": ("post", "labels-createLabel"),
 }
@@ -664,6 +666,18 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
                 properties={"id": ("string", "uuid")},
             )
             return
+        if path == "/compat/v2/recipes/deleteRecipe":
+            request_schema = cls._json_schema(
+                cls._request_schema(operation),
+                schema_type="object",
+                required={"id"},
+                exact_required=True,
+                properties={"id": ("string", "uuid")},
+            )
+            if request_schema["properties"]["id"].get("pattern") != _UUID_PATTERN:
+                raise RecipeLibraryError("RecipeSage OpenAPI contract is incompatible")
+            cls._json_schema(response_schema, schema_type="string")
+            return
         raise RecipeLibraryError("RecipeSage OpenAPI contract is incompatible")
 
     @classmethod
@@ -812,7 +826,9 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
                 "search",
                 "get",
                 "create_from_discovery",
+                "delete",
                 "reconcile_create",
+                "reconcile_delete",
                 "label_read",
                 "label_create",
             }
@@ -820,6 +836,7 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
         }
         if self.read_only:
             capabilities["create_from_discovery"] = False
+            capabilities["delete"] = False
             capabilities["reconcile_create"] = False
             capabilities["label_create"] = False
         return {
@@ -1356,6 +1373,10 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
         except _RecipeSageHTTPStatus as exc:
             if self._needs_auth(exc):
                 raise RecipeLibraryError("RecipeSage needs_auth") from None
+            if exc.status == 404:
+                raise RecipeLibraryExternalMissingError(
+                    "RecipeSage exact recipe is externally missing"
+                ) from None
             raise RecipeLibraryError("RecipeSage exact recipe get failed") from None
         except _RecipeSageTransportFailure:
             raise RecipeLibraryError(
@@ -1405,6 +1426,113 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
             )
         recipe_id = _provider_id(reference["recipe_id"])
         return self._result(self._get_raw(recipe_id))
+
+    def authenticated_principal(self) -> str:
+        try:
+            validation = self._request(
+                "GET", self._api_path("/users/validateSession")
+            )
+            if validation != "Valid":
+                raise RecipeLibraryError(
+                    "RecipeSage session validation response is incompatible"
+                )
+            self._user_id = None
+            return self._authenticated_user_id()
+        except _RecipeSageHTTPStatus as exc:
+            if self._needs_auth(exc):
+                raise RecipeLibraryError(
+                    "RecipeSage authenticated principal needs_auth"
+                ) from None
+            raise RecipeLibraryError(
+                "RecipeSage authenticated principal is unavailable"
+            ) from None
+        except _RecipeSageTransportFailure:
+            raise RecipeLibraryError(
+                "RecipeSage authenticated principal is unavailable"
+            ) from None
+
+    def delete_recipe(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        operation: Mapping[str, Any],
+    ) -> None:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if (
+            reference["library_id"] != self.library_id
+            or operation.get("kind") != "delete"
+            or operation.get("library_id") != self.library_id
+            or operation.get("target_recipe_id") != reference["recipe_id"]
+        ):
+            raise RecipeLibraryDefiniteError("RecipeSage delete request is invalid")
+        if self.read_only:
+            raise RecipeLibraryDefiniteError("RecipeSage connection is read-only")
+        recipe_id = _provider_id(reference["recipe_id"])
+        try:
+            result = self._request(
+                "POST",
+                self._api_path("/recipes/deleteRecipe"),
+                body={"id": recipe_id},
+            )
+        except _RecipeSageHTTPStatus as exc:
+            if exc.status in {404, 408}:
+                raise RecipeLibraryUncertainError(
+                    "RecipeSage recipe deletion outcome is uncertain"
+                ) from None
+            if 400 <= exc.status < 500:
+                message = (
+                    "RecipeSage recipe deletion needs_auth"
+                    if self._needs_auth(exc)
+                    else "RecipeSage rejected recipe deletion"
+                )
+                raise RecipeLibraryDefiniteError(message) from None
+            raise RecipeLibraryUncertainError(
+                "RecipeSage recipe deletion outcome is uncertain"
+            ) from None
+        except (_RecipeSageTransportFailure, RecipeLibraryError):
+            raise RecipeLibraryUncertainError(
+                "RecipeSage recipe deletion outcome is uncertain"
+            ) from None
+        if result != "Ok":
+            raise RecipeLibraryUncertainError(
+                "RecipeSage recipe deletion outcome is uncertain"
+            )
+
+    def reconcile_delete(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        operation: Mapping[str, Any],
+    ) -> bool | None:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if (
+            reference["library_id"] != self.library_id
+            or operation.get("kind") != "delete"
+            or operation.get("library_id") != self.library_id
+            or operation.get("target_recipe_id") != reference["recipe_id"]
+        ):
+            raise RecipeLibraryDefiniteError(
+                "RecipeSage delete reconciliation is invalid"
+            )
+        recipe_id = _provider_id(reference["recipe_id"])
+        try:
+            principal = self.authenticated_principal()
+            if principal != operation.get("provider_principal"):
+                raise RecipeLibraryError(
+                    "RecipeSage delete reconciliation principal changed"
+                )
+            self._get_raw(recipe_id)
+            return False
+        except RecipeLibraryExternalMissingError:
+            return True
+        except _RecipeSageHTTPStatus as exc:
+            if self._needs_auth(exc):
+                raise RecipeLibraryError("RecipeSage delete reconciliation needs_auth") from None
+            raise RecipeLibraryError(
+                "RecipeSage delete reconciliation is unavailable"
+            ) from None
+        except _RecipeSageTransportFailure:
+            raise RecipeLibraryError(
+                "RecipeSage delete reconciliation is unavailable"
+            ) from None
 
     def list_labels(self) -> list[Mapping[str, Any]]:
         try:

@@ -289,7 +289,10 @@ class MealieAdapter(RecipeLibraryAdapter):
         except _MealieTransportFailure:
             raise RecipeLibraryError("Mealie capability probe is unavailable") from None
         capabilities = {
-            name: name in {"search", "get", "create_from_discovery", "reconcile_create"}
+            name: name in {
+                "search", "get", "create_from_discovery", "delete",
+                "reconcile_create", "reconcile_delete",
+            }
             for name in CAPABILITY_NAMES
         }
         capabilities["favorite_read"] = favorite_read
@@ -301,6 +304,7 @@ class MealieAdapter(RecipeLibraryAdapter):
         )
         if self.read_only:
             capabilities["create_from_discovery"] = False
+            capabilities["delete"] = False
             capabilities["reconcile_create"] = False
         self._favorite_read = favorite_read
         self._favorite_user_id = favorite_user_id
@@ -831,6 +835,107 @@ class MealieAdapter(RecipeLibraryAdapter):
                 recipe_id, recipe_exists=True
             )
         return result
+
+    def delete_recipe(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        operation: Mapping[str, Any],
+    ) -> None:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if (
+            reference["library_id"] != self.library_id
+            or operation.get("kind") != "delete"
+            or operation.get("library_id") != self.library_id
+            or operation.get("target_recipe_id") != reference["recipe_id"]
+        ):
+            raise RecipeLibraryDefiniteError("Mealie delete request is invalid")
+        if self.read_only:
+            raise RecipeLibraryDefiniteError("Mealie connection is read-only")
+        recipe_id = _provider_id(reference["recipe_id"])
+        try:
+            raw = self._request(
+                "DELETE", f"/api/recipes/{quote(recipe_id, safe='')}", expected=(200,)
+            )
+        except _MealieHTTPStatus as exc:
+            if exc.status == 404 or exc.status == 408:
+                raise RecipeLibraryUncertainError(
+                    "Mealie recipe deletion outcome is uncertain"
+                ) from None
+            if 400 <= exc.status < 500:
+                message = (
+                    "Mealie recipe deletion needs_auth"
+                    if exc.status in {401, 403}
+                    else "Mealie rejected recipe deletion"
+                )
+                raise RecipeLibraryDefiniteError(message) from None
+            raise RecipeLibraryUncertainError(
+                "Mealie recipe deletion outcome is uncertain"
+            ) from None
+        except (_MealieTransportFailure, RecipeLibraryError):
+            raise RecipeLibraryUncertainError(
+                "Mealie recipe deletion outcome is uncertain"
+            ) from None
+        try:
+            if not isinstance(raw, Mapping) or _provider_id(raw.get("id")) != recipe_id:
+                raise RecipeLibraryError("Mealie delete response is incompatible")
+        except RecipeLibraryError:
+            raise RecipeLibraryUncertainError(
+                "Mealie recipe deletion outcome is uncertain"
+            ) from None
+
+    def authenticated_principal(self) -> str:
+        try:
+            user = self._request("GET", "/api/users/self")
+        except _MealieHTTPStatus as exc:
+            if exc.status in {401, 403}:
+                raise RecipeLibraryError("Mealie authenticated principal needs_auth") from None
+            raise RecipeLibraryError(
+                "Mealie authenticated principal is unavailable"
+            ) from None
+        except _MealieTransportFailure:
+            raise RecipeLibraryError(
+                "Mealie authenticated principal is unavailable"
+            ) from None
+        if not isinstance(user, Mapping):
+            raise RecipeLibraryError(
+                "Mealie authenticated principal response is incompatible"
+            )
+        return _canonical({
+            "group_id": _provider_id(user.get("groupId")),
+            "household_id": _provider_id(user.get("householdId")),
+            "user_id": _provider_id(user.get("id")),
+        })
+
+    def reconcile_delete(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        operation: Mapping[str, Any],
+    ) -> bool | None:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if (
+            reference["library_id"] != self.library_id
+            or operation.get("kind") != "delete"
+            or operation.get("library_id") != self.library_id
+            or operation.get("target_recipe_id") != reference["recipe_id"]
+        ):
+            raise RecipeLibraryDefiniteError("Mealie delete reconciliation is invalid")
+        recipe_id = _provider_id(reference["recipe_id"])
+        try:
+            principal = self.authenticated_principal()
+            if principal != operation.get("provider_principal"):
+                raise RecipeLibraryError(
+                    "Mealie delete reconciliation principal changed"
+                )
+            self._get_raw(recipe_id)
+            return False
+        except RecipeLibraryExternalMissingError:
+            return True
+        except _MealieHTTPStatus as exc:
+            if exc.status in {401, 403}:
+                raise RecipeLibraryError("Mealie delete reconciliation needs_auth") from None
+            raise RecipeLibraryError("Mealie delete reconciliation is unavailable") from None
+        except _MealieTransportFailure:
+            raise RecipeLibraryError("Mealie delete reconciliation is unavailable") from None
 
     def get_favorite(self, library_recipe_ref: Mapping[str, str]) -> Mapping[str, Any]:
         reference = validate_library_recipe_ref(library_recipe_ref)

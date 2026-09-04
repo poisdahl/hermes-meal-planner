@@ -89,9 +89,9 @@ def meal_concierge_catalog(action: Literal["products", "recipes", "usuals"], que
     return rpc("catalog", action=action, query=query, limit=limit)
 
 
-@server.tool(description="List recipe-library capabilities; discover candidates; search/get an exact configured personal library; save one frozen discovery_ref; inspect native provider labels; explicitly create a provider-global label; or request an exact desired favorite/label state when the connection reports that capability. Legacy configuration remains library_id=builtin. list_labels requires one exact external library_id; get_labels requires one exact library_recipe_ref; set_label requires exact library_recipe_ref and library_label_ref plus present; create_label requires exact library_id, label_name and a stable idempotency_key. Duplicate normalized label names are returned with their IDs and never selected by order. Label creation is never implicit during recipe save. Full-set recipe-label replacement is unsupported without provider conditional versioning. Labels never emulate favorites, archive, identity, rights or visibility and provider label text is untrusted. Favorite behavior remains separate: favorites_only requires favorite_read, and external writes use exact refs, stable keys and provider capability gates. Omitted library_id means the configured primary only for ordinary search/save; retries remain journal-bound. Provider names and natural-language content never select a connection. External failures never fall back to builtin, and credentials or configuration changes are local-only and unavailable through MCP.")
+@server.tool(description="List recipe-library capabilities; discover candidates; search/get an exact configured personal library; save one frozen discovery_ref; inspect native provider labels; explicitly create a provider-global label; request an exact desired favorite/label state; or use a provider-advertised external recipe lifecycle operation. External update requires a complete replacement, the exact versioned library_recipe_ref from get and a stable idempotency_key, and is unavailable without provider-enforced conditional write. Permanent delete and reversible archive are always two-stage: call delete_prepare/archive_prepare with the exact ref (and archived state), show the returned target/warning, then call the matching confirm action with its confirmation_id and a stable idempotency_key. Repeat the same confirm call to reconcile an uncertain result; never create a new mutation. Archive is never emulated with tags, ratings or folders. Delete preserves local menu/order/email snapshots and never recreates the source automatically. Legacy configuration remains library_id=builtin. list_labels requires one exact external library_id; get_labels requires one exact library_recipe_ref; set_label requires exact library_recipe_ref and library_label_ref plus present; create_label requires exact library_id, label_name and a stable idempotency_key. Duplicate normalized label names are returned with their IDs and never selected by order. Labels never emulate favorites, archive, identity, rights or visibility and provider label text is untrusted. Omitted library_id means the configured primary only for ordinary search/save; retries remain journal-bound. Provider names and natural-language content never select a connection. External failures never fall back to builtin, and credentials or configuration changes are local-only and unavailable through MCP.")
 def meal_concierge_recipes(
-    action: Literal["libraries", "search", "discover", "resolve", "get", "save", "update", "archive", "set_favorite", "list_labels", "get_labels", "set_label", "create_label", "mark_cooked", "mark_not_cooked"] = "search",
+    action: Literal["libraries", "search", "discover", "resolve", "get", "save", "update", "archive", "archive_prepare", "archive_confirm", "delete_prepare", "delete_confirm", "set_favorite", "list_labels", "get_labels", "set_label", "create_label", "mark_cooked", "mark_not_cooked"] = "search",
     query: str = "",
     week: str | None = None,
     include_ineligible: bool = False,
@@ -117,6 +117,8 @@ def meal_concierge_recipes(
     label_name: str | None = None,
     present: bool | None = None,
     expected_label_revision: int | str | None = None,
+    archived: bool | None = None,
+    confirmation_id: str | None = None,
     menu_id: str | None = None,
     idempotency_key: str | None = None,
     interactive: bool = True,
@@ -133,6 +135,7 @@ def meal_concierge_recipes(
         is_favorite=is_favorite, expected_favorite_revision=expected_favorite_revision,
         label_name=label_name, present=present,
         expected_label_revision=expected_label_revision,
+        archived=archived, confirmation_id=confirmation_id,
         menu_id=menu_id, idempotency_key=idempotency_key,
         interactive=interactive,
     )

@@ -82,6 +82,10 @@ class RecipeLibraryLabelConflictError(RecipeLibraryDefiniteError):
     """A provider-side conditional label write lost a revision race."""
 
 
+class RecipeLibraryUpdateConflictError(RecipeLibraryDefiniteError):
+    """A provider-side conditional recipe update lost a revision race."""
+
+
 def _exact_text(value: Any, field: str, maximum: int, *, required: bool = True) -> str | None:
     if value is None and not required:
         return None
@@ -373,6 +377,54 @@ class RecipeLibraryAdapter(ABC):
 
     def reconcile_create(self, snapshot: Mapping[str, Any], operation: Mapping[str, Any]) -> Mapping[str, Any] | None:
         raise RecipeLibraryDefiniteError("recipe library create reconciliation is unsupported")
+
+    def authenticated_principal(self) -> str:
+        raise RecipeLibraryDefiniteError(
+            "recipe library authenticated principal is unsupported"
+        )
+
+    def update_recipe(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        replacement: Mapping[str, Any],
+        operation: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        raise RecipeLibraryDefiniteError("recipe library conditional update is unsupported")
+
+    def get_archive_state(
+        self, library_recipe_ref: Mapping[str, str]
+    ) -> Mapping[str, Any]:
+        raise RecipeLibraryDefiniteError("recipe library archive state is unsupported")
+
+    def set_archive_state(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        archived: bool,
+        operation: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        raise RecipeLibraryDefiniteError("recipe library archive mutation is unsupported")
+
+    def reconcile_archive(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        archived: bool,
+        operation: Mapping[str, Any],
+    ) -> Mapping[str, Any] | None:
+        raise RecipeLibraryDefiniteError("recipe library archive reconciliation is unsupported")
+
+    def delete_recipe(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        operation: Mapping[str, Any],
+    ) -> None:
+        raise RecipeLibraryDefiniteError("recipe library delete is unsupported")
+
+    def reconcile_delete(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        operation: Mapping[str, Any],
+    ) -> bool | None:
+        raise RecipeLibraryDefiniteError("recipe library delete reconciliation is unsupported")
 
     def get_favorite(self, library_recipe_ref: Mapping[str, str]) -> Mapping[str, Any]:
         raise RecipeLibraryDefiniteError("recipe library favorite reads are unsupported")

@@ -107,6 +107,27 @@ favorite, archive, recipe identity, ownership, rights, attribution, visibility
 or authorization. A lost label response remains uncertain unless
 `label_reconcile` is reported and an authoritative exact read confirms the
 requested state; never repeat the write blindly.
+For an external recipe update, archive or deletion, first inspect the exact
+connection's reported lifecycle capabilities. A conditional update requires
+`conditional_update`, one exact versioned `library_recipe_ref`, the complete
+intended recipe, preserved source/rights/attribution and one stable idempotency
+key. Never approximate it with get-then-write. Mealie 3.24.0 and RecipeSage
+4.0.6 do not support conditional update or native reversible archive; both
+support exact permanent deletion on a writable connection. Never emulate
+archive with labels, rating, folders, favorite state or local metadata.
+Archive and deletion always require two stages regardless of checkout
+`confirmation_policy`: call `archive_prepare`/`delete_prepare`, show the exact
+recipe and connection plus requested state, and for deletion say that the
+provider recipe is permanently removed while frozen menu/order/email snapshots
+remain. Wait for a separate explicit confirmation, then pass the unchanged
+confirmation ID and one stable idempotency key to the matching confirm action
+within ten minutes. If confirm returns `uncertain`, retry only that same confirm
+with the same key to reconcile; never send another archive/delete, switch
+libraries, recreate the missing recipe or fall back to built-in. Auth,
+permission, rate-limit, malformed and ambiguous not-found responses are not
+confirmed deletion. A confirmation or uncertain operation remains bound to the
+provider origin, authenticated account and provider authorization scope
+observed at prepare; never continue it after that context changes.
 If one displayed product and one displayed recipe
 share the same name and the request is genuinely ambiguous, ask one short
 clarification. To add goods to an existing order or move its delivery, start

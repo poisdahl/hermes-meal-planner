@@ -4,7 +4,7 @@
     "minimum_supported_version": "3.24.0",
     "stable_release": "v3.24.0",
     "stable_release_commit": "2c04da733f88836f788234a4bf1127599fbc1294",
-    "captured_at": "2026-09-03T23:19:44Z",
+    "captured_at": "2026-09-04T11:24:00Z",
     "stable_schema_source": "Mealie v3.24.0 tag schemas and routes",
     "runtime_schema_source": "https://demo.mealie.io/openapi.json",
     "runtime_reported_version": "nightly",
@@ -18,12 +18,20 @@
     "recipe_create": "POST /api/recipes",
     "recipe_create_stub": "GET /api/recipes/{created-slug}",
     "recipe_create_finalize": "PATCH /api/recipes/{immutable-id}",
+    "recipe_delete": "DELETE /api/recipes/{immutable-id}",
     "favorite_read": "GET /api/users/self/favorites",
     "favorite_exact_read": "GET /api/users/self/ratings/{immutable-recipe-id}",
     "favorite_add": "POST /api/users/{authenticated-user-id}/favorites/{immutable-recipe-id}",
     "favorite_remove": "DELETE /api/users/{authenticated-user-id}/favorites/{immutable-recipe-id}",
     "tag_list": "GET /api/organizers/tags?page={page}&perPage={bounded}",
     "tag_create": "POST /api/organizers/tags"
+  },
+  "lifecycle_capabilities": {
+    "conditional_update": false,
+    "archive_desired_state": false,
+    "delete": true,
+    "reconcile_delete": true,
+    "evidence": "Mealie v3.24.0 accepts an immutable recipe UUID on its delete route and returns the deleted recipe identity. Its update routes have no provider-enforced conditional token, and no native reversible archive state is exposed. Authenticated exact-ID absence can reconcile a dispatched delete."
   },
   "app_about": {
     "production": true,

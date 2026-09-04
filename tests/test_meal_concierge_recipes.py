@@ -37,6 +37,7 @@ from recipe_libraries import (  # noqa: E402
     RecipeLibraryFavoriteConflictError,
     RecipeLibraryLabelConflictError,
     RecipeLibraryUncertainError,
+    RecipeLibraryUpdateConflictError,
     library_recipe_key,
     load_library_secret,
     normalize_library_configuration,
@@ -220,6 +221,11 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         favorite_reconcile: bool = True,
         favorite_conditional: bool = False,
         favorite_revision: int | str = 0,
+        conditional_update: bool = False,
+        archive: bool = False,
+        delete: bool = False,
+        lifecycle_mode: str = "confirmed",
+        archived: bool = False,
     ):
         self.library_id = library_id
         self.recipe = deepcopy(recipe)
@@ -232,6 +238,12 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         self.favorite_reconcile_enabled = favorite_reconcile
         self.favorite_conditional = favorite_conditional
         self.favorite_revision = favorite_revision
+        self.conditional_update = conditional_update
+        self.archive_enabled = archive
+        self.delete_enabled = delete
+        self.lifecycle_mode = lifecycle_mode
+        self.archived = archived
+        self.deleted = False
         self.search_calls = 0
         self.search_cursors = []
         self.get_calls = 0
@@ -239,6 +251,12 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         self.reconcile_calls = 0
         self.favorite_read_calls = 0
         self.favorite_write_calls = 0
+        self.update_calls = 0
+        self.archive_read_calls = 0
+        self.archive_write_calls = 0
+        self.delete_calls = 0
+        self.lifecycle_reconcile_calls = 0
+        self.principal = f"principal-{library_id}"
         self.outbound = None
         self.operation = None
         self.reference = {
@@ -272,6 +290,15 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
         capabilities["favorite_reconcile"] = (
             self.favorite_state is not None and self.favorite_reconcile_enabled
         )
+        capabilities["conditional_update"] = (
+            self.conditional_update and not self.read_only
+        )
+        capabilities["archive_desired_state"] = (
+            self.archive_enabled and not self.read_only
+        )
+        capabilities["reconcile_archive"] = self.archive_enabled
+        capabilities["delete"] = self.delete_enabled and not self.read_only
+        capabilities["reconcile_delete"] = self.delete_enabled
         return capabilities
 
     def search(self, query, filters, cursor, limit):
@@ -297,6 +324,8 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
 
     def get(self, reference):
         self.get_calls += 1
+        if self.deleted:
+            raise RecipeLibraryExternalMissingError("secret missing detail")
         result = {
             **deepcopy(self.recipe),
             "library_recipe_ref": deepcopy(self.reference),
@@ -306,6 +335,83 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
             if self.favorite_conditional:
                 result["favorite_revision"] = self.favorite_revision
         return result
+
+    def update_recipe(self, reference, replacement, operation):
+        self.update_calls += 1
+        if self.lifecycle_mode == "conflict" or reference.get("version") != self.reference["version"]:
+            raise RecipeLibraryUpdateConflictError("secret stale provider version")
+        if self.lifecycle_mode == "definite":
+            raise RecipeLibraryDefiniteError("secret provider rejection detail")
+        if self.lifecycle_mode == "uncertain_before_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        self.recipe = deepcopy(replacement)
+        self.reference["version"] = "v2"
+        if self.lifecycle_mode == "uncertain_after_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        return {
+            "library_recipe_ref": deepcopy(self.reference),
+            "recipe": deepcopy(self.recipe),
+        }
+
+    def authenticated_principal(self):
+        return self.principal
+
+    def get_archive_state(self, reference):
+        self.archive_read_calls += 1
+        if self.deleted:
+            raise RecipeLibraryExternalMissingError("secret missing detail")
+        return {
+            "library_recipe_ref": deepcopy(self.reference),
+            "archived": self.archived,
+        }
+
+    def set_archive_state(self, reference, archived, operation):
+        self.archive_write_calls += 1
+        if self.lifecycle_mode == "definite":
+            raise RecipeLibraryDefiniteError("secret provider rejection detail")
+        if self.lifecycle_mode == "uncertain_before_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        self.archived = archived
+        self.reference["version"] = "v2"
+        if self.lifecycle_mode == "uncertain_after_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        return {
+            "library_recipe_ref": deepcopy(self.reference),
+            "archived": self.archived,
+        }
+
+    def reconcile_archive(self, reference, archived, operation):
+        self.lifecycle_reconcile_calls += 1
+        if self.lifecycle_mode == "reconcile_unavailable":
+            raise RecipeLibraryError("secret reconcile unavailable")
+        if self.lifecycle_mode == "reconcile_definite":
+            raise RecipeLibraryDefiniteError("secret definite readback detail")
+        if self.lifecycle_mode == "reconcile_missing":
+            raise RecipeLibraryExternalMissingError("secret missing readback detail")
+        return {
+            "library_recipe_ref": deepcopy(self.reference),
+            "archived": self.archived,
+        }
+
+    def delete_recipe(self, reference, operation):
+        self.delete_calls += 1
+        if self.lifecycle_mode == "definite":
+            raise RecipeLibraryDefiniteError("secret provider rejection detail")
+        if self.lifecycle_mode == "uncertain_before_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        self.deleted = True
+        if self.lifecycle_mode == "uncertain_after_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+
+    def reconcile_delete(self, reference, operation):
+        self.lifecycle_reconcile_calls += 1
+        if self.lifecycle_mode == "reconcile_unavailable":
+            raise RecipeLibraryError("secret reconcile unavailable")
+        if self.lifecycle_mode == "reconcile_definite":
+            raise RecipeLibraryDefiniteError("secret definite readback detail")
+        if self.lifecycle_mode == "reconcile_missing":
+            raise RecipeLibraryExternalMissingError("secret missing readback detail")
+        return self.deleted
 
     def create_from_snapshot(self, snapshot, operation):
         self.create_calls += 1
@@ -5239,6 +5345,616 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertIsNone(result["next_eligible_week"])
 
+    def _lifecycle_app(self, adapter, suffix):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [{
+                "library_id": adapter.library_id,
+                "provider": adapter.provider,
+                "base_url": "https://recipes.example",
+                "read_only": adapter.read_only,
+            }],
+        }
+        store = StateStore(Path(self.temp.name) / suffix, settings)
+        app = Application(
+            store,
+            self.oda,
+            self.browser,
+            recipe_library_adapters={adapter.library_id: adapter},
+        )
+        return app, store
+
+    def test_external_lifecycle_capability_gates_send_no_provider_mutation(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Lifecycle gates")
+        )
+        app, _store = self._lifecycle_app(adapter, "lifecycle-gates")
+        reference = deepcopy(adapter.reference)
+        replacement = deepcopy(adapter.recipe)
+        replacement["name"] = "Changed"
+        with self.assertRaisesRegex(RecipeLibraryError, "conditional update"):
+            app.handle({
+                "operation": "recipes", "action": "update",
+                "library_recipe_ref": reference, "recipe": replacement,
+                "idempotency_key": "unsupported-update",
+            })
+        with self.assertRaisesRegex(RecipeLibraryError, "reconcilable archive"):
+            app.handle({
+                "operation": "recipes", "action": "archive_prepare",
+                "library_recipe_ref": reference, "archived": True,
+            })
+        with self.assertRaisesRegex(RecipeLibraryError, "reconcilable delete"):
+            app.handle({
+                "operation": "recipes", "action": "delete_prepare",
+                "library_recipe_ref": reference,
+            })
+        self.assertEqual(
+            (adapter.update_calls, adapter.archive_write_calls, adapter.delete_calls),
+            (0, 0, 0),
+        )
+
+        read_only = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Read only"), read_only=True,
+            conditional_update=True, archive=True, delete=True,
+        )
+        app, _store = self._lifecycle_app(read_only, "lifecycle-read-only")
+        for action, extra in (
+            ("archive_prepare", {"archived": True}),
+            ("delete_prepare", {}),
+        ):
+            with self.subTest(action=action), self.assertRaises(RecipeLibraryError):
+                app.handle({
+                    "operation": "recipes", "action": action,
+                    "library_recipe_ref": deepcopy(read_only.reference), **extra,
+                })
+        self.assertEqual(
+            (read_only.archive_write_calls, read_only.delete_calls), (0, 0)
+        )
+
+    def test_conditional_external_update_is_exact_idempotent_and_preserves_attribution(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Original"), conditional_update=True
+        )
+        app, _store = self._lifecycle_app(adapter, "lifecycle-update")
+        original_ref = deepcopy(adapter.reference)
+        replacement = deepcopy(adapter.recipe)
+        replacement["name"] = "Updated"
+        updated = app.handle({
+            "operation": "recipes", "action": "update",
+            "library_recipe_ref": original_ref, "recipe": replacement,
+            "idempotency_key": "update-one",
+        })
+        self.assertEqual(updated["status"], "confirmed")
+        self.assertTrue(updated["updated"])
+        self.assertEqual(updated["library_recipe_ref"]["version"], "v2")
+        self.assertEqual(adapter.update_calls, 1)
+        adapter.deleted = True
+        repeated = app.handle({
+            "operation": "recipes", "action": "update",
+            "library_recipe_ref": original_ref, "recipe": replacement,
+            "idempotency_key": "update-one",
+        })
+        self.assertEqual(repeated["status"], "confirmed")
+        self.assertEqual(adapter.update_calls, 1)
+        adapter.deleted = False
+
+        changed = deepcopy(replacement)
+        changed["name"] = "Different request"
+        with self.assertRaisesRegex(RecipeError, "idempotency key"):
+            app.handle({
+                "operation": "recipes", "action": "update",
+                "library_recipe_ref": original_ref, "recipe": changed,
+                "idempotency_key": "update-one",
+            })
+        stale = app.handle({
+            "operation": "recipes", "action": "update",
+            "library_recipe_ref": original_ref, "recipe": changed,
+            "idempotency_key": "update-stale",
+        })
+        self.assertEqual(stale["status"], "failed")
+        self.assertEqual(stale["error_code"], "conflict")
+        self.assertEqual(stale["current_library_recipe_ref"]["version"], "v2")
+        self.assertEqual(adapter.update_calls, 1)
+
+        current_ref = deepcopy(adapter.reference)
+        wrong_attribution = deepcopy(adapter.recipe)
+        wrong_attribution["rights"]["credit"] = "Changed credit"
+        rejected = app.handle({
+            "operation": "recipes", "action": "update",
+            "library_recipe_ref": current_ref, "recipe": wrong_attribution,
+            "idempotency_key": "update-attribution",
+        })
+        self.assertEqual(rejected["error_code"], "attribution_conflict")
+        self.assertEqual(adapter.update_calls, 1)
+
+    def test_uncertain_update_reconciles_after_write_capability_is_removed(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Update uncertain"),
+            conditional_update=True, lifecycle_mode="uncertain_after_state",
+        )
+        app, _store = self._lifecycle_app(adapter, "lifecycle-update-uncertain")
+        reference = deepcopy(adapter.reference)
+        replacement = deepcopy(adapter.recipe)
+        replacement["name"] = "Updated despite lost response"
+        request = {
+            "operation": "recipes", "action": "update",
+            "library_recipe_ref": reference,
+            "recipe": replacement,
+            "idempotency_key": "update-uncertain",
+        }
+        self.assertEqual(app.handle(request)["status"], "uncertain")
+        adapter.conditional_update = False
+        adapter.read_only = True
+        reconciled = app.handle(request)
+        self.assertEqual(reconciled["status"], "confirmed")
+        self.assertTrue(reconciled["updated"])
+        self.assertEqual(adapter.update_calls, 1)
+
+    def test_external_delete_requires_exact_preview_and_reconciles_without_repeat(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Delete me"), delete=True,
+            lifecycle_mode="uncertain_after_state",
+        )
+        app, store = self._lifecycle_app(adapter, "lifecycle-delete")
+        state_before = canonical(store.read())
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(adapter.reference),
+        })
+        self.assertTrue(prepared["awaiting_confirmation"])
+        self.assertTrue(prepared["permanent"])
+        self.assertIn("permanently removes", prepared["warning"])
+        self.assertIn("pending checkouts", prepared["retained_snapshots"])
+        self.assertEqual(adapter.delete_calls, 0)
+        first = app.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-one",
+        })
+        self.assertEqual(first["status"], "uncertain")
+        self.assertEqual(adapter.delete_calls, 1)
+        adapter.read_only = True
+
+        restarted = Application(
+            store,
+            self.oda,
+            self.browser,
+            recipe_library_adapters={adapter.library_id: adapter},
+        )
+        reconciled = restarted.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-one",
+        })
+        self.assertEqual(reconciled["status"], "confirmed")
+        self.assertTrue(reconciled["deleted"])
+        self.assertEqual(adapter.delete_calls, 1)
+        self.assertEqual(adapter.lifecycle_reconcile_calls, 1)
+        self.assertEqual(canonical(store.read()), state_before)
+        restarted.recipe_libraries.pop(adapter.library_id)
+        restarted.recipe_library_adapters.pop(adapter.library_id)
+        repeated = restarted.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-one",
+        })
+        self.assertEqual(repeated["status"], "confirmed")
+        self.assertEqual(adapter.delete_calls, 1)
+        with self.assertRaisesRegex(RecipeError, "another idempotency key"):
+            restarted.handle({
+                "operation": "recipes", "action": "delete_confirm",
+                "confirmation_id": prepared["confirmation_id"],
+                "idempotency_key": "delete-different",
+            })
+
+    def test_external_delete_success_still_requires_authoritative_absence(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Delete exactly"), delete=True
+        )
+        app, _store = self._lifecycle_app(adapter, "lifecycle-delete-authoritative")
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(adapter.reference),
+        })
+        confirmed = app.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-authoritative",
+        })
+        self.assertEqual(confirmed["status"], "confirmed")
+        self.assertTrue(confirmed["deleted"])
+        self.assertEqual(adapter.delete_calls, 1)
+        self.assertEqual(adapter.lifecycle_reconcile_calls, 1)
+
+        unavailable = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Delete unresolved"), delete=True,
+            lifecycle_mode="reconcile_unavailable",
+        )
+        app, _store = self._lifecycle_app(
+            unavailable, "lifecycle-delete-unresolved"
+        )
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(unavailable.reference),
+        })
+        request = {
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-unresolved",
+        }
+        self.assertEqual(app.handle(request)["status"], "uncertain")
+        self.assertEqual(app.handle(request)["status"], "uncertain")
+        self.assertEqual(unavailable.delete_calls, 1)
+
+        for mode in ("reconcile_definite", "reconcile_missing"):
+            with self.subTest(readback_failure=mode):
+                adapter = SyntheticLibraryAdapter(
+                    "family-mealie", full_recipe(f"Readback {mode}"),
+                    delete=True, lifecycle_mode=mode,
+                )
+                app, _store = self._lifecycle_app(
+                    adapter, f"lifecycle-delete-{mode}"
+                )
+                prepared = app.handle({
+                    "operation": "recipes", "action": "delete_prepare",
+                    "library_recipe_ref": deepcopy(adapter.reference),
+                })
+                result = app.handle({
+                    "operation": "recipes", "action": "delete_confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                    "idempotency_key": f"delete-{mode}",
+                })
+                self.assertEqual(result["status"], "uncertain")
+                self.assertEqual(adapter.delete_calls, 1)
+
+    def test_external_delete_timeout_before_state_never_repeats_write(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Timeout before state"), delete=True,
+            lifecycle_mode="uncertain_before_state",
+        )
+        app, _store = self._lifecycle_app(adapter, "lifecycle-delete-before")
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(adapter.reference),
+        })
+        request = {
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-before",
+        }
+        self.assertEqual(app.handle(request)["status"], "uncertain")
+        self.assertEqual(app.handle(request)["status"], "uncertain")
+        self.assertEqual(adapter.delete_calls, 1)
+        self.assertEqual(adapter.lifecycle_reconcile_calls, 1)
+
+    def test_external_lifecycle_rejects_conflicting_fields_and_provider_context(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Bound context"), delete=True
+        )
+        app, _store = self._lifecycle_app(adapter, "lifecycle-bound-context")
+        with self.assertRaisesRegex(RecipeLibraryError, "accepts only"):
+            app.handle({
+                "operation": "recipes", "action": "delete_prepare",
+                "library_recipe_ref": deepcopy(adapter.reference),
+                "recipe_id": "different-recipe",
+            })
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(adapter.reference),
+        })
+        with self.assertRaisesRegex(RecipeLibraryError, "accepts only"):
+            app.handle({
+                "operation": "recipes", "action": "delete_confirm",
+                "confirmation_id": prepared["confirmation_id"],
+                "idempotency_key": "delete-conflicting-field",
+                "library_recipe_ref": {
+                    "library_id": adapter.library_id,
+                    "recipe_id": "different-recipe",
+                    "version": "v1",
+                },
+            })
+        self.assertEqual(adapter.delete_calls, 0)
+
+        adapter.principal = "different-provider-principal"
+        changed = app.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-context-change",
+        })
+        self.assertEqual(changed["status"], "failed")
+        self.assertEqual(changed["error_code"], "provider_context_changed")
+        self.assertEqual(adapter.delete_calls, 0)
+
+        clone = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Origin bound"), delete=True
+        )
+        app, _store = self._lifecycle_app(clone, "lifecycle-bound-origin")
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(clone.reference),
+        })
+        app.recipe_libraries[clone.library_id]["base_url"] = (
+            "https://cloned-recipes.example"
+        )
+        changed = app.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-origin-change",
+        })
+        self.assertEqual(changed["error_code"], "provider_context_changed")
+        self.assertEqual(clone.delete_calls, 0)
+
+    def test_concurrent_process_retry_reconciles_in_flight_delete(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("In flight"), delete=True
+        )
+        first, store = self._lifecycle_app(adapter, "lifecycle-in-flight")
+        second = Application(
+            store,
+            self.oda,
+            self.browser,
+            recipe_library_adapters={adapter.library_id: adapter},
+        )
+        second._recover_recipe_library_operations()
+        prepared = first.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(adapter.reference),
+        })
+        operation = first.recipes.confirm_library_lifecycle(
+            prepared["confirmation_id"], idempotency_key="delete-in-flight"
+        )
+        claimed = first.recipes.claim_library_dispatch(operation["operation_id"])
+        self.assertTrue(claimed["claimed"])
+        adapter.deleted = True
+        retried = second.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-in-flight",
+        })
+        self.assertEqual(retried["status"], "confirmed")
+        self.assertTrue(retried["deleted"])
+        self.assertEqual(adapter.delete_calls, 0)
+
+    def test_dispatch_claim_races_are_returned_uncertain_and_never_repeated(self):
+        updater = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Update race"), conditional_update=True
+        )
+        app, store = self._lifecycle_app(updater, "lifecycle-update-claim-race")
+        peer = Application(
+            store,
+            self.oda,
+            self.browser,
+            recipe_library_adapters={updater.library_id: updater},
+        )
+        replacement = deepcopy(updater.recipe)
+        replacement["name"] = "Update race replacement"
+        original_claim = app.recipes.claim_library_dispatch
+
+        def race_update_claim(operation_id):
+            self.assertTrue(
+                peer.recipes.claim_library_dispatch(operation_id)["claimed"]
+            )
+            return original_claim(operation_id)
+
+        with mock.patch.object(
+            app.recipes,
+            "claim_library_dispatch",
+            side_effect=race_update_claim,
+        ):
+            raced = app.handle({
+                "operation": "recipes", "action": "update",
+                "library_recipe_ref": deepcopy(updater.reference),
+                "recipe": replacement,
+                "idempotency_key": "update-claim-race",
+            })
+        self.assertEqual(raced["status"], "uncertain")
+        self.assertEqual(raced["error_code"], "uncertain")
+        self.assertEqual(updater.update_calls, 0)
+
+        deleter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Delete race"), delete=True
+        )
+        app, store = self._lifecycle_app(deleter, "lifecycle-delete-claim-race")
+        peer = Application(
+            store,
+            self.oda,
+            self.browser,
+            recipe_library_adapters={deleter.library_id: deleter},
+        )
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(deleter.reference),
+        })
+        original_claim = app.recipes.claim_library_dispatch
+
+        def race_delete_claim(operation_id):
+            self.assertTrue(
+                peer.recipes.claim_library_dispatch(operation_id)["claimed"]
+            )
+            return original_claim(operation_id)
+
+        with mock.patch.object(
+            app.recipes,
+            "claim_library_dispatch",
+            side_effect=race_delete_claim,
+        ):
+            raced = app.handle({
+                "operation": "recipes", "action": "delete_confirm",
+                "confirmation_id": prepared["confirmation_id"],
+                "idempotency_key": "delete-claim-race",
+            })
+        self.assertEqual(raced["status"], "uncertain")
+        self.assertEqual(raced["error_code"], "uncertain")
+        self.assertEqual(deleter.delete_calls, 0)
+
+    def test_uncertain_delete_cannot_reconcile_under_another_provider_account(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Account bound"), delete=True,
+            lifecycle_mode="uncertain_after_state",
+        )
+        app, _store = self._lifecycle_app(adapter, "lifecycle-account-bound")
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(adapter.reference),
+        })
+        request = {
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-account-bound",
+        }
+        self.assertEqual(app.handle(request)["status"], "uncertain")
+        adapter.principal = "another-valid-account"
+        retried = app.handle(request)
+        self.assertEqual(retried["status"], "uncertain")
+        self.assertEqual(retried["error_code"], "provider_context_changed")
+        self.assertEqual(adapter.delete_calls, 1)
+
+    def test_confirmed_delete_removes_mapping_and_never_recreates_saved_identity(self):
+        adapter = SyntheticLibraryAdapter(
+            "family-mealie",
+            full_recipe("Mapped deletion", external_id="mapped-deletion"),
+            delete=True,
+        )
+        app, store = self._lifecycle_app(adapter, "lifecycle-mapped-delete")
+        discovery_ref = app.recipes.persist_discovery(
+            adapter.recipe
+        )["discovery_ref"]
+        saved = app.handle({
+            "operation": "recipes", "action": "save",
+            "discovery_ref": discovery_ref,
+            "library_id": adapter.library_id,
+            "idempotency_key": "save-before-delete",
+        })
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": saved["library_recipe_ref"],
+        })
+        deleted = app.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-mapped",
+        })
+        self.assertEqual(deleted["status"], "confirmed")
+        with sqlite3.connect(store.directory / "recipes.sqlite3") as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM library_mappings WHERE library_id=? "
+                    "AND recipe_id=?",
+                    (adapter.library_id, adapter.reference["recipe_id"]),
+                ).fetchone()[0],
+                0,
+            )
+        with self.assertRaisesRegex(RecipeError, "permanently deleted"):
+            app.recipes.begin_library_create(
+                discovery_ref,
+                adapter.library_id,
+                idempotency_key="do-not-recreate",
+            )
+
+    def test_external_lifecycle_drift_expiry_and_archive_desired_state(self):
+        drifting = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Drift"), delete=True
+        )
+        app, _store = self._lifecycle_app(drifting, "lifecycle-drift")
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(drifting.reference),
+        })
+        drifting.recipe["name"] = "Changed after preview"
+        conflict = app.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-drift",
+        })
+        self.assertEqual(conflict["error_code"], "conflict")
+        self.assertEqual(drifting.delete_calls, 0)
+
+        expiring = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Expires"), delete=True
+        )
+        app, store = self._lifecycle_app(expiring, "lifecycle-expiry")
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(expiring.reference),
+        })
+        with sqlite3.connect(store.directory / "recipes.sqlite3") as connection:
+            connection.execute(
+                "UPDATE library_operations SET created_at=? WHERE operation_id=?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),
+                    prepared["confirmation_id"],
+                ),
+            )
+        expired = app.handle({
+            "operation": "recipes", "action": "delete_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "delete-expired",
+        })
+        self.assertEqual(expired["error_code"], "confirmation_expired")
+        self.assertEqual(expiring.delete_calls, 0)
+
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(expiring.reference),
+        })
+        bound = app.recipes.confirm_library_lifecycle(
+            prepared["confirmation_id"], idempotency_key="delete-expired-at-dispatch"
+        )
+        with sqlite3.connect(store.directory / "recipes.sqlite3") as connection:
+            connection.execute(
+                "UPDATE library_operations SET created_at=? WHERE operation_id=?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),
+                    prepared["confirmation_id"],
+                ),
+            )
+        unclaimed = app.recipes.claim_library_dispatch(bound["operation_id"])
+        self.assertEqual(unclaimed["error_code"], "confirmation_expired")
+        self.assertFalse(unclaimed["claimed"])
+
+        prepared = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(expiring.reference),
+        })
+        app.recipes.confirm_library_lifecycle(
+            prepared["confirmation_id"], idempotency_key="bound-before-expiry"
+        )
+        with sqlite3.connect(store.directory / "recipes.sqlite3") as connection:
+            connection.execute(
+                "UPDATE library_operations SET created_at=? WHERE operation_id=?",
+                (
+                    (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat(),
+                    prepared["confirmation_id"],
+                ),
+            )
+        renewed = app.handle({
+            "operation": "recipes", "action": "delete_prepare",
+            "library_recipe_ref": deepcopy(expiring.reference),
+        })
+        self.assertNotEqual(renewed["confirmation_id"], prepared["confirmation_id"])
+        old = app.recipes.library_operation_snapshot(prepared["confirmation_id"])
+        self.assertEqual(old["status"], "failed")
+        self.assertEqual(old["error_code"], "confirmation_expired")
+
+        archiver = SyntheticLibraryAdapter(
+            "family-mealie", full_recipe("Archive"), archive=True
+        )
+        app, _store = self._lifecycle_app(archiver, "lifecycle-archive")
+        prepared = app.handle({
+            "operation": "recipes", "action": "archive_prepare",
+            "library_recipe_ref": deepcopy(archiver.reference), "archived": True,
+        })
+        self.assertFalse(prepared["current_archived"])
+        confirmed = app.handle({
+            "operation": "recipes", "action": "archive_confirm",
+            "confirmation_id": prepared["confirmation_id"],
+            "idempotency_key": "archive-one",
+        })
+        self.assertEqual(confirmed["status"], "confirmed")
+        self.assertTrue(confirmed["archived"])
+        self.assertEqual(archiver.archive_write_calls, 1)
+        self.assertEqual(archiver.lifecycle_reconcile_calls, 1)
+
     def _label_app(self, adapter, suffix):
         settings = {
             **CONFIG,
@@ -5614,6 +6330,21 @@ class MealieAdapterTests(unittest.TestCase):
             "status": "pending",
         }
 
+    def delete_operation(self):
+        return {
+            "operation_id": "libop:v1:deleteabcdefghijkl",
+            "kind": "delete",
+            "library_id": "family-mealie",
+            "target_recipe_id": self.recipe_id,
+            "provider_principal": canonical({
+                "group_id": self.fixture["authenticated_user"]["groupId"],
+                "household_id": self.fixture["authenticated_user"]["householdId"],
+                "user_id": self.fixture["authenticated_user"]["id"],
+            }),
+            "snapshot_digest": "a" * 64,
+            "status": "pending",
+        }
+
     def patched_recipe(self, adapter, snapshot, operation):
         payload, _document = adapter._native_payload(snapshot, operation)
         return {
@@ -5682,13 +6413,14 @@ class MealieAdapterTests(unittest.TestCase):
         self.assertEqual(capabilities["server_version"], "v3.24.0")
         for name in (
             "search", "get", "create_from_discovery", "reconcile_create",
+            "delete", "reconcile_delete",
             "favorite_read", "favorite_write_desired_state", "favorite_reconcile",
             "label_read", "label_create",
         ):
             self.assertTrue(capabilities[name])
         for name in (
-            "conditional_update", "archive_desired_state", "delete",
-            "favorite_conditional_write", "reconcile_archive", "reconcile_delete",
+            "conditional_update", "archive_desired_state",
+            "favorite_conditional_write", "reconcile_archive",
             "label_apply_existing", "label_remove", "label_conditional_write",
             "label_reconcile",
         ):
@@ -5713,9 +6445,84 @@ class MealieAdapterTests(unittest.TestCase):
         self.assertTrue(checked["label_read"])
         self.assertFalse(checked["create_from_discovery"])
         self.assertFalse(checked["reconcile_create"])
+        self.assertFalse(checked["delete"])
+        self.assertTrue(checked["reconcile_delete"])
         self.assertFalse(checked["favorite_write_desired_state"])
         self.assertFalse(checked["favorite_conditional_write"])
         self.assertFalse(checked["label_create"])
+
+    def test_exact_delete_and_authenticated_absence_reconciliation(self):
+        reference = {
+            "library_id": "family-mealie",
+            "recipe_id": self.recipe_id,
+            "version": self.fixture["recipe_get"]["updatedAt"],
+        }
+        operation = self.delete_operation()
+        adapter, opener = self.adapter((200, self.fixture["recipe_get"]))
+        adapter.delete_recipe(reference, operation)
+        request = opener.requests[0][0]
+        self.assertEqual(request.method, "DELETE")
+        self.assertTrue(request.full_url.endswith(f"/api/recipes/{self.recipe_id}"))
+        self.assertIsNone(request.data)
+
+        adapter, opener = self.adapter(
+            (200, self.fixture["authenticated_user"]),
+            (404, None),
+        )
+        self.assertTrue(adapter.reconcile_delete(reference, operation))
+        self.assertEqual(
+            [request.method for request, _timeout in opener.requests],
+            ["GET", "GET"],
+        )
+        self.assertTrue(opener.requests[0][0].full_url.endswith("/api/users/self"))
+        self.assertTrue(
+            opener.requests[1][0].full_url.endswith(f"/api/recipes/{self.recipe_id}")
+        )
+        wrong_principal = {**operation, "provider_principal": "different-account"}
+        adapter, opener = self.adapter((200, self.fixture["authenticated_user"]))
+        with self.assertRaisesRegex(RecipeLibraryError, "principal changed"):
+            adapter.reconcile_delete(reference, wrong_principal)
+        self.assertEqual(len(opener.requests), 1)
+
+    def test_delete_timeout_malformed_and_non_authoritative_absence_stay_uncertain(self):
+        reference = {
+            "library_id": "family-mealie",
+            "recipe_id": self.recipe_id,
+            "version": self.fixture["recipe_get"]["updatedAt"],
+        }
+        operation = self.delete_operation()
+        for response in (
+            URLError("fixture timeout"),
+            (404, None),
+            (200, {"id": "22222222-2222-4222-8222-222222222222"}),
+        ):
+            with self.subTest(delete_response=response):
+                adapter, _opener = self.adapter(response)
+                with self.assertRaises(RecipeLibraryUncertainError):
+                    adapter.delete_recipe(reference, operation)
+
+        for responses in (
+            ((401, None),),
+            ((429, None),),
+            ((200, {}),),
+            (
+                (200, self.fixture["authenticated_user"]),
+                (200, {
+                    **self.fixture["recipe_get"],
+                    "id": "22222222-2222-4222-8222-222222222222",
+                }),
+            ),
+        ):
+            with self.subTest(reconciliation=responses):
+                adapter, _opener = self.adapter(*responses)
+                with self.assertRaises(RecipeLibraryError):
+                    adapter.reconcile_delete(reference, operation)
+
+        adapter, _opener = self.adapter(
+            (200, self.fixture["authenticated_user"]),
+            (200, self.fixture["recipe_get"]),
+        )
+        self.assertFalse(adapter.reconcile_delete(reference, operation))
 
     def test_incompatible_version_authentication_and_redirects_fail_without_following(self):
         old = {**self.fixture["app_about"], "version": "v3.23.1"}
@@ -6280,19 +7087,71 @@ class MealieLiveContractTest(unittest.TestCase):
             "source_identity": f"hermes-live:{unique}", "status": "pending",
         }
         confirmed = None
-        try:
+        deletion = None
+        confirmation_request = None
+        with tempfile.TemporaryDirectory() as directory:
+            app = Application(
+                StateStore(Path(directory), {
+                    **CONFIG,
+                    "recipe_libraries": [connection],
+                }),
+                FakeOda(),
+                FakeBrowser(),
+                recipe_library_adapters={"live-mealie": adapter},
+            )
             try:
-                confirmed = adapter.create_from_snapshot(snapshot, operation)
-            except RecipeLibraryUncertainError:
-                confirmed = adapter.reconcile_create(snapshot, operation)
-                if confirmed is None:
-                    self.fail("Mealie live create is uncertain and requires inspection; create was not repeated")
-            recipe_id = confirmed["library_recipe_ref"]["recipe_id"]
-            self.assertEqual(adapter.get(confirmed["library_recipe_ref"])["name"], snapshot["name"])
-        finally:
-            if confirmed is not None:
-                recipe_id = confirmed["library_recipe_ref"]["recipe_id"]
-                adapter._request("DELETE", f"/api/recipes/{recipe_id}", expected=(200, 204))
+                try:
+                    confirmed = adapter.create_from_snapshot(snapshot, operation)
+                except RecipeLibraryUncertainError:
+                    confirmed = adapter.reconcile_create(snapshot, operation)
+                    if confirmed is None:
+                        self.fail(
+                            "Mealie live create is uncertain and requires inspection; "
+                            "create was not repeated"
+                        )
+                reference = confirmed["library_recipe_ref"]
+                self.assertEqual(adapter.get(reference)["name"], snapshot["name"])
+                prepared = app.handle({
+                    "operation": "recipes",
+                    "action": "delete_prepare",
+                    "library_recipe_ref": reference,
+                })
+                confirmation_request = {
+                    "operation": "recipes",
+                    "action": "delete_confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                    "idempotency_key": f"live-delete-{unique[:24]}",
+                }
+                deletion = app.handle(confirmation_request)
+                if deletion["status"] == "uncertain":
+                    deletion = app.handle(confirmation_request)
+                self.assertEqual(deletion["status"], "confirmed")
+                self.assertTrue(deletion["deleted"])
+            finally:
+                if confirmed is not None and (
+                    deletion is None or deletion.get("status") != "confirmed"
+                ):
+                    if confirmation_request is None:
+                        prepared = app.handle({
+                            "operation": "recipes",
+                            "action": "delete_prepare",
+                            "library_recipe_ref": confirmed["library_recipe_ref"],
+                        })
+                        confirmation_request = {
+                            "operation": "recipes",
+                            "action": "delete_confirm",
+                            "confirmation_id": prepared["confirmation_id"],
+                            "idempotency_key": f"live-delete-{unique[:24]}",
+                        }
+                    deletion = app.handle(confirmation_request)
+                    if deletion["status"] == "uncertain":
+                        deletion = app.handle(confirmation_request)
+                    if deletion.get("status") != "confirmed":
+                        self.fail(
+                            "Mealie cleanup is uncertain; inspect confirmed recipe "
+                            f"{confirmed['library_recipe_ref']['recipe_id']} manually; "
+                            "delete was not repeated"
+                        )
 
 
 class RecipeSageAdapterTests(unittest.TestCase):
@@ -6331,6 +7190,17 @@ class RecipeSageAdapterTests(unittest.TestCase):
             "library_id": "family-recipesage",
             "snapshot_digest": "a" * 64,
             "source_identity": "familien:fixture-recipe",
+            "status": "pending",
+        }
+
+    def delete_operation(self):
+        return {
+            "operation_id": "libop:v1:deleteabcdefghijkl",
+            "kind": "delete",
+            "library_id": "family-recipesage",
+            "target_recipe_id": self.recipe_id,
+            "provider_principal": self.fixture["authenticated_user"]["id"],
+            "snapshot_digest": "a" * 64,
             "status": "pending",
         }
 
@@ -6394,13 +7264,14 @@ class RecipeSageAdapterTests(unittest.TestCase):
         self.assertEqual(capabilities["server_version"], HOSTED_VERIFIED_VERSION)
         for name in (
             "search", "get", "create_from_discovery", "reconcile_create",
+            "delete", "reconcile_delete",
             "label_read", "label_create",
         ):
             self.assertTrue(capabilities[name])
         for name in (
-            "conditional_update", "archive_desired_state", "delete", "favorite_read",
+            "conditional_update", "archive_desired_state", "favorite_read",
             "favorite_write_desired_state", "favorite_conditional_write",
-            "reconcile_archive", "reconcile_delete", "favorite_reconcile",
+            "reconcile_archive", "favorite_reconcile",
             "label_apply_existing", "label_remove", "label_conditional_write",
             "label_reconcile",
         ):
@@ -6424,9 +7295,89 @@ class RecipeSageAdapterTests(unittest.TestCase):
         self.assertTrue(checked["search"])
         self.assertTrue(checked["get"])
         self.assertFalse(checked["create_from_discovery"])
+        self.assertFalse(checked["delete"])
+        self.assertTrue(checked["reconcile_delete"])
         self.assertTrue(checked["label_read"])
         self.assertFalse(checked["label_create"])
         self.assertFalse(checked["reconcile_create"])
+
+    def test_exact_delete_and_authenticated_absence_reconciliation(self):
+        reference = {
+            "library_id": "family-recipesage",
+            "recipe_id": self.recipe_id,
+            "version": self.fixture["recipe_get"]["updatedAt"],
+        }
+        operation = self.delete_operation()
+        adapter, opener = self.adapter((200, "Ok"))
+        adapter.delete_recipe(reference, operation)
+        request = opener.requests[0][0]
+        self.assertEqual(request.method, "POST")
+        self.assertTrue(request.full_url.endswith("/compat/v2/recipes/deleteRecipe"))
+        self.assertEqual(json.loads(request.data), {"id": self.recipe_id})
+
+        adapter, opener = self.adapter(
+            (200, "Valid"),
+            (200, self.fixture["authenticated_user"]),
+            (404, None),
+        )
+        self.assertTrue(adapter.reconcile_delete(reference, operation))
+        self.assertEqual(
+            [request.method for request, _timeout in opener.requests],
+            ["GET", "GET", "GET"],
+        )
+        self.assertTrue(
+            opener.requests[0][0].full_url.endswith(
+                "/compat/v2/users/validateSession"
+            )
+        )
+        self.assertTrue(
+            opener.requests[2][0].full_url.endswith(
+                f"/compat/v2/recipes/getRecipe?id={self.recipe_id}"
+            )
+        )
+        wrong_principal = {**operation, "provider_principal": "different-account"}
+        adapter, opener = self.adapter(
+            (200, "Valid"),
+            (200, self.fixture["authenticated_user"]),
+        )
+        with self.assertRaisesRegex(RecipeLibraryError, "principal changed"):
+            adapter.reconcile_delete(reference, wrong_principal)
+        self.assertEqual(len(opener.requests), 2)
+
+    def test_delete_timeout_malformed_and_non_authoritative_absence_stay_uncertain(self):
+        reference = {
+            "library_id": "family-recipesage",
+            "recipe_id": self.recipe_id,
+            "version": self.fixture["recipe_get"]["updatedAt"],
+        }
+        operation = self.delete_operation()
+        for response in (
+            URLError("fixture timeout"),
+            (404, None),
+            (200, {"unexpected": "object"}),
+        ):
+            with self.subTest(delete_response=response):
+                adapter, _opener = self.adapter(response)
+                with self.assertRaises(RecipeLibraryUncertainError):
+                    adapter.delete_recipe(reference, operation)
+
+        for responses in (
+            ((401, None),),
+            ((429, None),),
+            ((200, "Invalid"),),
+            ((200, "Valid"), (200, {})),
+        ):
+            with self.subTest(reconciliation=responses):
+                adapter, _opener = self.adapter(*responses)
+                with self.assertRaises(RecipeLibraryError):
+                    adapter.reconcile_delete(reference, operation)
+
+        adapter, _opener = self.adapter(
+            (200, "Valid"),
+            (200, self.fixture["authenticated_user"]),
+            (200, self.fixture["recipe_get"]),
+        )
+        self.assertFalse(adapter.reconcile_delete(reference, operation))
 
     def test_exact_label_read_and_explicit_create_shapes_without_recipe_replacement(self):
         adapter, opener = self.adapter(
@@ -7229,54 +8180,73 @@ class RecipeSageLiveContractTest(unittest.TestCase):
             "status": "pending",
         }
         confirmed = None
-        try:
+        deletion = None
+        confirmation_request = None
+        with tempfile.TemporaryDirectory() as directory:
+            app = Application(
+                StateStore(Path(directory), {
+                    **CONFIG,
+                    "recipe_libraries": [connection],
+                }),
+                FakeOda(),
+                FakeBrowser(),
+                recipe_library_adapters={"live-recipesage": adapter},
+            )
             try:
-                confirmed = adapter.create_from_snapshot(snapshot, operation)
-            except RecipeLibraryUncertainError:
-                confirmed = adapter.reconcile_create(snapshot, operation)
-                if confirmed is None:
-                    self.fail(
-                        "RecipeSage live create is uncertain and requires inspection; create was not repeated"
-                    )
-            self.assertEqual(
-                adapter.get(confirmed["library_recipe_ref"])["name"], snapshot["name"]
-            )
-            reconciled = adapter.reconcile_create(snapshot, operation)
-            self.assertIsNotNone(reconciled)
-            self.assertEqual(
-                reconciled["library_recipe_ref"], confirmed["library_recipe_ref"]
-            )
-        finally:
-            if confirmed is not None:
-                recipe_id = confirmed["library_recipe_ref"]["recipe_id"]
                 try:
-                    adapter._request(
-                        "POST",
-                        adapter._api_path("/recipes/deleteRecipe"),
-                        body={"id": recipe_id},
-                    )
-                except Exception:
-                    try:
-                        adapter._request(
-                            "GET",
-                            adapter._api_path("/recipes/getRecipe"),
-                            query=[("id", recipe_id)],
+                    confirmed = adapter.create_from_snapshot(snapshot, operation)
+                except RecipeLibraryUncertainError:
+                    confirmed = adapter.reconcile_create(snapshot, operation)
+                    if confirmed is None:
+                        self.fail(
+                            "RecipeSage live create is uncertain and requires inspection; "
+                            "create was not repeated"
                         )
-                    except _RecipeSageHTTPStatus as lookup_error:
-                        if lookup_error.status != 404:
-                            self.fail(
-                                "RecipeSage cleanup is uncertain; inspect confirmed recipe "
-                                f"{recipe_id} manually and do not repeat delete"
-                            )
-                    except Exception:
+                reference = confirmed["library_recipe_ref"]
+                self.assertEqual(adapter.get(reference)["name"], snapshot["name"])
+                reconciled = adapter.reconcile_create(snapshot, operation)
+                self.assertIsNotNone(reconciled)
+                self.assertEqual(reconciled["library_recipe_ref"], reference)
+                prepared = app.handle({
+                    "operation": "recipes",
+                    "action": "delete_prepare",
+                    "library_recipe_ref": reference,
+                })
+                confirmation_request = {
+                    "operation": "recipes",
+                    "action": "delete_confirm",
+                    "confirmation_id": prepared["confirmation_id"],
+                    "idempotency_key": f"live-delete-{unique[:24]}",
+                }
+                deletion = app.handle(confirmation_request)
+                if deletion["status"] == "uncertain":
+                    deletion = app.handle(confirmation_request)
+                self.assertEqual(deletion["status"], "confirmed")
+                self.assertTrue(deletion["deleted"])
+            finally:
+                if confirmed is not None and (
+                    deletion is None or deletion.get("status") != "confirmed"
+                ):
+                    if confirmation_request is None:
+                        prepared = app.handle({
+                            "operation": "recipes",
+                            "action": "delete_prepare",
+                            "library_recipe_ref": confirmed["library_recipe_ref"],
+                        })
+                        confirmation_request = {
+                            "operation": "recipes",
+                            "action": "delete_confirm",
+                            "confirmation_id": prepared["confirmation_id"],
+                            "idempotency_key": f"live-delete-{unique[:24]}",
+                        }
+                    deletion = app.handle(confirmation_request)
+                    if deletion["status"] == "uncertain":
+                        deletion = app.handle(confirmation_request)
+                    if deletion.get("status") != "confirmed":
                         self.fail(
                             "RecipeSage cleanup is uncertain; inspect confirmed recipe "
-                            f"{recipe_id} manually and do not repeat delete"
-                        )
-                    else:
-                        self.fail(
-                            "RecipeSage cleanup delete failed and the confirmed recipe still "
-                            f"exists as {recipe_id}; delete was not repeated"
+                            f"{confirmed['library_recipe_ref']['recipe_id']} manually; "
+                            "delete was not repeated"
                         )
 
 

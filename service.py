@@ -61,6 +61,7 @@ from recipe_libraries import (
     RecipeLibraryFavoriteConflictError,
     RecipeLibraryLabelConflictError,
     RecipeLibraryUncertainError,
+    RecipeLibraryUpdateConflictError,
     library_recipe_key,
     library_recipe_key_aliases,
     load_library_secret,
@@ -792,6 +793,8 @@ class Application:
         self.recipe_favorite_locks_guard = threading.Lock()
         self.recipe_label_locks: dict[tuple[str, str], threading.Lock] = {}
         self.recipe_label_locks_guard = threading.Lock()
+        self.recipe_lifecycle_locks: dict[tuple[str, str], threading.Lock] = {}
+        self.recipe_lifecycle_locks_guard = threading.Lock()
         self.oda = provider_client
         self.provider = str(store.config.get("provider") or "oda").casefold()
         self.email_provider_clients = {**dict(email_provider_clients or {}), self.provider: provider_client}
@@ -1672,6 +1675,167 @@ class Application:
         key = (reference["library_id"], reference["recipe_id"])
         with self.recipe_favorite_locks_guard:
             return self.recipe_favorite_locks.setdefault(key, threading.Lock())
+
+    def _recipe_lifecycle_lock(
+        self, reference: Mapping[str, str]
+    ) -> threading.Lock:
+        key = (reference["library_id"], reference["recipe_id"])
+        with self.recipe_lifecycle_locks_guard:
+            return self.recipe_lifecycle_locks.setdefault(key, threading.Lock())
+
+    def _recover_recipe_library_operations(self) -> None:
+        if not self._recipe_operations_recovered:
+            self.recipes.recover_library_operations()
+            self._recipe_operations_recovered = True
+
+    @staticmethod
+    def _recipe_lifecycle_digest(recipe: Mapping[str, Any]) -> str:
+        return hashlib.sha256(canonical(normalize_recipe(recipe)).encode()).hexdigest()
+
+    def _recipe_library_context(
+        self, library_id: str, adapter: RecipeLibraryAdapter
+    ) -> tuple[str, str]:
+        try:
+            value = adapter.authenticated_principal()
+        except Exception as exc:
+            if self._library_needs_auth(exc):
+                raise RecipeLibraryError("recipe library needs_auth") from None
+            raise RecipeLibraryError(
+                "recipe library authenticated principal is unavailable"
+            ) from exc
+        principal = self._provider_text(
+            value, "recipe library authenticated principal", 300, required=True
+        ) or ""
+        connection = self.recipe_libraries[library_id]
+        binding = hashlib.sha256(canonical({
+            "provider": connection.get("provider"),
+            "base_url": connection.get("base_url"),
+            "principal": principal,
+        }).encode()).hexdigest()
+        return principal, binding
+
+    def _read_external_lifecycle(
+        self,
+        adapter: RecipeLibraryAdapter,
+        reference: Mapping[str, str],
+        *,
+        archive_state: bool = False,
+        enforce_version: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, str], bool | None]:
+        expected = validate_library_recipe_ref(reference)
+        try:
+            raw = adapter.get({
+                "library_id": expected["library_id"],
+                "recipe_id": expected["recipe_id"],
+            })
+        except RecipeLibraryExternalMissingError:
+            raise
+        except Exception as exc:
+            if self._library_needs_auth(exc):
+                raise RecipeLibraryError("recipe library needs_auth") from None
+            raise RecipeLibraryError("recipe library exact recipe read is unavailable") from exc
+        if not isinstance(raw, Mapping):
+            raise RecipeLibraryError("recipe library exact recipe read returned invalid data")
+        returned = validate_library_recipe_ref(raw.get("library_recipe_ref"))
+        if (
+            returned["library_id"] != expected["library_id"]
+            or returned["recipe_id"] != expected["recipe_id"]
+            or "version" not in returned
+        ):
+            raise RecipeLibraryError("recipe library exact recipe read returned the wrong identity")
+        if (
+            enforce_version
+            and expected.get("version") is not None
+            and returned["version"] != expected["version"]
+        ):
+            raise RecipeLibraryUpdateConflictError(
+                "the external recipe changed after its exact reference was read"
+            )
+        recipe = normalize_recipe(raw)
+        archived = None
+        if archive_state:
+            try:
+                state = adapter.get_archive_state(deepcopy(returned))
+            except RecipeLibraryExternalMissingError:
+                raise
+            except Exception as exc:
+                if self._library_needs_auth(exc):
+                    raise RecipeLibraryError("recipe library needs_auth") from None
+                raise RecipeLibraryError("recipe library archive state is unavailable") from exc
+            if not isinstance(state, Mapping) or not isinstance(
+                state.get("archived"), bool
+            ):
+                raise RecipeLibraryError("recipe library archive state is invalid")
+            state_reference = validate_library_recipe_ref(
+                state.get("library_recipe_ref")
+            )
+            if state_reference != returned:
+                raise RecipeLibraryError(
+                    "recipe library archive state returned a changed identity"
+                )
+            archived = state["archived"]
+        return recipe, returned, archived
+
+    @staticmethod
+    def _outbound_lifecycle_operation(
+        operation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            key: deepcopy(operation[key])
+            for key in (
+                "operation_id", "kind", "action", "library_id",
+                "target_recipe_id", "request_digest", "idempotency_key",
+                "snapshot_digest", "provider_binding", "provider_principal",
+                "current_archived", "requested_archived",
+                "dispatched_at", "created_at", "updated_at",
+            )
+            if key in operation
+        }
+
+    @staticmethod
+    def _lifecycle_operation_response(
+        operation: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        result = {
+            "library_id": operation.get("library_id"),
+            "status": operation.get("status"),
+            "operation_id": operation.get("operation_id"),
+            "action": operation.get("action"),
+            "library_recipe_ref": deepcopy(operation.get("library_recipe_ref")),
+        }
+        if operation.get("confirmation_id") is not None:
+            result["confirmation_id"] = operation["confirmation_id"]
+        if operation.get("expires_at") is not None:
+            result["expires_at"] = operation["expires_at"]
+        if operation.get("name") is not None:
+            result["name"] = operation["name"]
+        if operation.get("current_archived") is not None:
+            result["current_archived"] = operation["current_archived"]
+            result["requested_archived"] = operation["requested_archived"]
+        if operation.get("result") is not None:
+            result.update(deepcopy(operation["result"]))
+        if operation.get("error_code") is not None:
+            result["error_code"] = operation["error_code"]
+        if operation.get("error") is not None:
+            result["error"] = operation["error"]
+        if (
+            operation.get("kind") in {"archive", "delete"}
+            and operation.get("idempotency_key") is None
+            and operation.get("status") == "pending"
+        ):
+            result["awaiting_confirmation"] = True
+        if operation.get("kind") == "delete":
+            result["permanent"] = True
+            result["warning"] = (
+                "confirmation permanently removes this exact external provider "
+                "recipe; frozen local menu, checkout, order and email snapshots remain"
+            )
+            result["retained_snapshots"] = (
+                "active menus, pending checkouts, confirmed orders and recipe emails"
+            )
+        elif operation.get("kind") == "archive":
+            result["reversible"] = True
+        return result
 
     def _external_library_get(self, reference: Mapping[str, str]) -> dict[str, Any]:
         expected_reference = deepcopy(dict(reference))
@@ -2806,6 +2970,721 @@ class Application:
                 })
             return response
 
+    def _prepare_external_lifecycle(
+        self, request: Mapping[str, Any], kind: str
+    ) -> dict[str, Any]:
+        if any(
+            request.get(field) is not None
+            for field in (
+                "library_id", "recipe_id", "confirmation_id", "idempotency_key",
+                "recipe", "expected_revision", "status",
+            )
+        ):
+            raise RecipeLibraryError(
+                f"{kind}_prepare accepts only one exact library_recipe_ref"
+            )
+        reference = validate_library_recipe_ref(request.get("library_recipe_ref"))
+        library_id = reference["library_id"]
+        if library_id == "builtin" or library_id not in self.recipe_libraries:
+            raise RecipeLibraryError(
+                f"{kind}_prepare requires one configured external library_recipe_ref"
+            )
+        capabilities = self._library_capabilities(library_id)
+        capability = "delete" if kind == "delete" else "archive_desired_state"
+        reconciliation = "reconcile_delete" if kind == "delete" else "reconcile_archive"
+        if not capabilities[capability] or not capabilities[reconciliation]:
+            raise RecipeLibraryError(
+                f"this recipe library does not support safely reconcilable {kind}"
+            )
+        requested_archived = request.get("archived")
+        if kind == "archive" and not isinstance(requested_archived, bool):
+            raise RecipeLibraryError("archive_prepare requires archived=true or false")
+        if kind == "delete" and requested_archived is not None:
+            raise RecipeLibraryError("delete_prepare does not accept archived")
+        adapter = self.recipe_library_adapters[library_id]
+        with self._recipe_lifecycle_lock(reference):
+            self._recover_recipe_library_operations()
+            try:
+                provider_principal, provider_binding = (
+                    self._recipe_library_context(library_id, adapter)
+                )
+                recipe, returned, current_archived = self._read_external_lifecycle(
+                    adapter,
+                    reference,
+                    archive_state=kind == "archive",
+                    enforce_version="version" in reference,
+                )
+            except RecipeLibraryExternalMissingError:
+                raise RecipeLibraryError(
+                    "the exact external recipe is missing; no lifecycle action was prepared"
+                ) from None
+            operation = self.recipes.prepare_library_lifecycle(
+                kind,
+                returned,
+                recipe["name"],
+                self._recipe_lifecycle_digest(recipe),
+                provider_binding=provider_binding,
+                provider_principal=provider_principal,
+                current_archived=current_archived,
+                requested_archived=requested_archived,
+            )
+            return self._lifecycle_operation_response(operation)
+
+    def _reconcile_external_update(
+        self,
+        operation: Mapping[str, Any],
+        adapter: RecipeLibraryAdapter,
+    ) -> dict[str, Any]:
+        try:
+            current, returned, _archived = self._read_external_lifecycle(
+                adapter, operation["library_recipe_ref"]
+            )
+        except RecipeLibraryExternalMissingError:
+            failed = self.recipes.finish_library_lifecycle(
+                operation["operation_id"], "failed",
+                error_code="external_missing",
+                error="the exact external recipe is missing",
+            )
+            return self._lifecycle_operation_response(failed)
+        except Exception as exc:
+            response = self._lifecycle_operation_response(operation)
+            if self._library_needs_auth(exc):
+                response.update({
+                    "error_code": "needs_auth",
+                    "error": "recipe library needs_auth before update reconciliation",
+                })
+            return response
+        if canonical(current) != canonical(operation["replacement"]):
+            return self._lifecycle_operation_response(operation)
+        confirmed = self.recipes.finish_library_lifecycle(
+            operation["operation_id"], "confirmed",
+            result={"library_recipe_ref": returned, "updated": True},
+        )
+        return self._lifecycle_operation_response(confirmed)
+
+    def _update_external_recipe(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        if request.get("library_id") is not None or request.get("recipe_id") is not None:
+            raise RecipeLibraryError(
+                "external update requires only one exact library_recipe_ref identity"
+            )
+        reference = validate_library_recipe_ref(request.get("library_recipe_ref"))
+        library_id = reference["library_id"]
+        if library_id == "builtin" or "version" not in reference:
+            raise RecipeLibraryError(
+                "external update requires one configured versioned library_recipe_ref"
+            )
+        replacement = normalize_recipe(request.get("recipe"))
+        request_digest = hashlib.sha256(canonical({
+            "kind": "conditional_update",
+            "library_recipe_ref": reference,
+            "replacement": replacement,
+        }).encode()).hexdigest()
+        existing = self.recipes.library_operation_for_idempotency(
+            request.get("idempotency_key")
+        )
+        if existing is not None:
+            if (
+                existing.get("kind") != "conditional_update"
+                or existing.get("library_id") != library_id
+                or existing.get("target_recipe_id") != reference["recipe_id"]
+                or existing.get("request_digest") != request_digest
+            ):
+                raise RecipeError(
+                    "idempotency key was already used for another library operation"
+                )
+            if existing["status"] in {"confirmed", "failed"}:
+                return self._lifecycle_operation_response(existing)
+        if library_id not in self.recipe_libraries:
+            raise RecipeLibraryError(
+                "external update requires one configured versioned library_recipe_ref"
+            )
+        adapter = self.recipe_library_adapters.get(library_id)
+        if adapter is None:
+            raise RecipeLibraryError("optional recipe library is unavailable")
+        with self._recipe_lifecycle_lock(reference):
+            self._recover_recipe_library_operations()
+            if existing is not None:
+                existing = self.recipes.library_operation_snapshot(
+                    existing["operation_id"]
+                )
+            try:
+                provider_principal, provider_binding = (
+                    self._recipe_library_context(library_id, adapter)
+                )
+            except Exception as exc:
+                if existing is None:
+                    raise
+                response = self._lifecycle_operation_response(existing)
+                response.update({
+                    "error_code": (
+                        "needs_auth" if self._library_needs_auth(exc) else "unavailable"
+                    ),
+                    "error": (
+                        "recipe library needs_auth before update reconciliation"
+                        if self._library_needs_auth(exc)
+                        else "recipe library provider context is unavailable"
+                    ),
+                })
+                return response
+            if existing is not None and (
+                existing["provider_principal"] != provider_principal
+                or existing["provider_binding"] != provider_binding
+            ):
+                if existing["status"] == "pending" and existing.get(
+                    "dispatched_at"
+                ) is None:
+                    existing = self.recipes.finish_library_lifecycle(
+                        existing["operation_id"], "failed",
+                        error_code="provider_context_changed",
+                        error="recipe library provider context changed before dispatch",
+                    )
+                response = self._lifecycle_operation_response(existing)
+                response.update({
+                    "error_code": "provider_context_changed",
+                    "error": "recipe library provider context changed; original outcome must be resolved there",
+                })
+                return response
+            if existing is not None and existing.get("dispatched_at") is not None:
+                if existing["status"] == "pending":
+                    existing = self.recipes.finish_library_lifecycle(
+                        existing["operation_id"], "uncertain",
+                        error_code="uncertain",
+                        error="conditional update may be in flight; reconcile before retry",
+                    )
+                return self._reconcile_external_update(existing, adapter)
+            if existing is not None and existing["status"] == "uncertain":
+                return self._reconcile_external_update(existing, adapter)
+            capabilities = self._library_capabilities(library_id)
+            if not capabilities["conditional_update"]:
+                if existing is not None:
+                    failed = self.recipes.finish_library_lifecycle(
+                        existing["operation_id"], "failed",
+                        error_code="unsupported",
+                        error="recipe library no longer supports conditional update",
+                    )
+                    return self._lifecycle_operation_response(failed)
+                raise RecipeLibraryError(
+                    "this recipe library has no provider-enforced conditional update"
+                )
+            try:
+                current, returned, _archived = self._read_external_lifecycle(
+                    adapter, reference
+                )
+            except RecipeLibraryExternalMissingError:
+                raise RecipeLibraryError("the exact external recipe is missing") from None
+            operation = self.recipes.begin_library_conditional_update(
+                reference,
+                replacement,
+                self._recipe_lifecycle_digest(current),
+                provider_binding=provider_binding,
+                provider_principal=provider_principal,
+                idempotency_key=request.get("idempotency_key"),
+            )
+            if operation["status"] in {"confirmed", "failed"}:
+                return self._lifecycle_operation_response(operation)
+            if (
+                operation["provider_principal"] != provider_principal
+                or operation["provider_binding"] != provider_binding
+            ):
+                if operation["status"] == "pending" and operation.get(
+                    "dispatched_at"
+                ) is None:
+                    operation = self.recipes.finish_library_lifecycle(
+                        operation["operation_id"], "failed",
+                        error_code="provider_context_changed",
+                        error="recipe library provider context changed before dispatch",
+                    )
+                return self._lifecycle_operation_response(operation)
+            if operation.get("dispatched_at") is not None:
+                if operation["status"] == "pending":
+                    operation = self.recipes.finish_library_lifecycle(
+                        operation["operation_id"], "uncertain",
+                        error_code="uncertain",
+                        error="conditional update may be in flight; reconcile before retry",
+                    )
+                return self._reconcile_external_update(operation, adapter)
+            if operation["status"] == "uncertain":
+                return self._reconcile_external_update(operation, adapter)
+            if (
+                returned.get("version") != reference["version"]
+                or self._recipe_lifecycle_digest(current)
+                != operation["snapshot_digest"]
+            ):
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="conflict",
+                    error="the external recipe changed before conditional update",
+                )
+                response = self._lifecycle_operation_response(failed)
+                response["current_library_recipe_ref"] = returned
+                return response
+            if (
+                canonical(current.get("source"))
+                != canonical(replacement.get("source"))
+                or canonical(current.get("rights"))
+                != canonical(replacement.get("rights"))
+            ):
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="attribution_conflict",
+                    error="conditional update must preserve source, rights and attribution",
+                )
+                return self._lifecycle_operation_response(failed)
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            if not claimed.get("claimed"):
+                if claimed["status"] == "pending" and claimed.get(
+                    "dispatched_at"
+                ) is not None:
+                    claimed = self.recipes.finish_library_lifecycle(
+                        claimed["operation_id"], "uncertain",
+                        error_code="uncertain",
+                        error="conditional update may be in flight; reconcile before retry",
+                    )
+                if claimed["status"] == "uncertain":
+                    return self._reconcile_external_update(claimed, adapter)
+                return self._lifecycle_operation_response(claimed)
+            outbound = self._outbound_lifecycle_operation(claimed)
+            try:
+                raw = adapter.update_recipe(
+                    deepcopy(reference), deepcopy(replacement), outbound
+                )
+                if not isinstance(raw, Mapping) or not isinstance(
+                    raw.get("recipe"), Mapping
+                ):
+                    raise RecipeLibraryError(
+                        "recipe library update did not provide semantic readback"
+                    )
+                result_reference = validate_library_recipe_ref(
+                    raw.get("library_recipe_ref")
+                )
+                result_recipe = normalize_recipe(raw["recipe"])
+                if (
+                    result_reference["library_id"] != library_id
+                    or result_reference["recipe_id"] != reference["recipe_id"]
+                    or "version" not in result_reference
+                    or canonical(result_recipe) != canonical(replacement)
+                ):
+                    raise RecipeLibraryError(
+                        "recipe library update readback changed identity or content"
+                    )
+                confirmed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "confirmed",
+                    result={
+                        "library_recipe_ref": result_reference,
+                        "updated": True,
+                    },
+                )
+                return self._lifecycle_operation_response(confirmed)
+            except RecipeLibraryUpdateConflictError:
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="conflict",
+                    error="the provider rejected a stale conditional update",
+                )
+                response = self._lifecycle_operation_response(failed)
+                try:
+                    _current, current_reference, _archived = (
+                        self._read_external_lifecycle(adapter, reference)
+                    )
+                    response["current_library_recipe_ref"] = current_reference
+                except Exception:
+                    pass
+                return response
+            except RecipeLibraryExternalMissingError:
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="external_missing",
+                    error="the exact external recipe is missing",
+                )
+                return self._lifecycle_operation_response(failed)
+            except RecipeLibraryDefiniteError as exc:
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code=(
+                        "needs_auth" if self._library_needs_auth(exc)
+                        else "provider_rejected"
+                    ),
+                    error=(
+                        "recipe library needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "recipe library rejected conditional update"
+                    ),
+                )
+                return self._lifecycle_operation_response(failed)
+            except Exception:
+                uncertain = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "uncertain",
+                    error_code="uncertain",
+                    error="conditional update may have been dispatched; reconcile before retry",
+                )
+                return self._lifecycle_operation_response(uncertain)
+
+    def _reconcile_external_lifecycle(
+        self,
+        operation: Mapping[str, Any],
+        adapter: RecipeLibraryAdapter,
+        capabilities: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        kind = operation["kind"]
+        capability = "reconcile_delete" if kind == "delete" else "reconcile_archive"
+        if not capabilities[capability]:
+            return self._lifecycle_operation_response(operation)
+        outbound = self._outbound_lifecycle_operation(operation)
+        try:
+            if kind == "delete":
+                absent = adapter.reconcile_delete(
+                    deepcopy(operation["library_recipe_ref"]), outbound
+                )
+                if absent is not True:
+                    return self._lifecycle_operation_response(operation)
+                result = {
+                    "library_recipe_ref": operation["library_recipe_ref"],
+                    "deleted": True,
+                }
+            else:
+                raw = adapter.reconcile_archive(
+                    deepcopy(operation["library_recipe_ref"]),
+                    operation["requested_archived"],
+                    outbound,
+                )
+                if not isinstance(raw, Mapping) or raw.get("archived") is not operation[
+                    "requested_archived"
+                ]:
+                    return self._lifecycle_operation_response(operation)
+                returned = validate_library_recipe_ref(
+                    raw.get("library_recipe_ref")
+                )
+                if (
+                    returned["library_id"] != operation["library_id"]
+                    or returned["recipe_id"] != operation["target_recipe_id"]
+                    or "version" not in returned
+                ):
+                    return self._lifecycle_operation_response(operation)
+                result = {
+                    "library_recipe_ref": returned,
+                    "archived": operation["requested_archived"],
+                }
+            confirmed = self.recipes.finish_library_lifecycle(
+                operation["operation_id"], "confirmed", result=result
+            )
+            return self._lifecycle_operation_response(confirmed)
+        except Exception as exc:
+            response = self._lifecycle_operation_response(operation)
+            if self._library_needs_auth(exc):
+                response.update({
+                    "error_code": "needs_auth",
+                    "error": f"recipe library needs_auth before {kind} reconciliation",
+                })
+            return response
+
+    def _confirm_external_lifecycle(
+        self, request: Mapping[str, Any], kind: str
+    ) -> dict[str, Any]:
+        if any(
+            request.get(field) is not None
+            for field in (
+                "library_id", "recipe_id", "library_recipe_ref", "archived",
+                "recipe", "expected_revision", "status",
+            )
+        ):
+            raise RecipeLibraryError(
+                f"{kind}_confirm accepts only confirmation_id and idempotency_key"
+            )
+        initial = self.recipes.library_operation_snapshot(
+            request.get("confirmation_id")
+        )
+        if initial.get("kind") != kind:
+            raise RecipeLibraryError(
+                f"{kind}_confirm requires a matching {kind}_prepare confirmation"
+            )
+        if initial["status"] in {"confirmed", "failed"}:
+            terminal = self.recipes.confirm_library_lifecycle(
+                initial["confirmation_id"],
+                idempotency_key=request.get("idempotency_key"),
+            )
+            return self._lifecycle_operation_response(terminal)
+        reference = initial["library_recipe_ref"]
+        library_id = reference["library_id"]
+        if library_id not in self.recipe_libraries:
+            raise RecipeLibraryError(
+                "lifecycle confirmation names an unconfigured recipe library"
+            )
+        with self._recipe_lifecycle_lock(reference):
+            self._recover_recipe_library_operations()
+            operation = self.recipes.confirm_library_lifecycle(
+                initial["confirmation_id"],
+                idempotency_key=request.get("idempotency_key"),
+            )
+            if operation["status"] in {"confirmed", "failed"}:
+                return self._lifecycle_operation_response(operation)
+            adapter = self.recipe_library_adapters.get(library_id)
+            if adapter is None:
+                response = self._lifecycle_operation_response(operation)
+                response.update({
+                    "error_code": "adapter_unavailable",
+                    "error": "optional recipe library is unavailable before dispatch",
+                })
+                return response
+            try:
+                capabilities = self._library_capabilities(library_id)
+            except Exception as exc:
+                response = self._lifecycle_operation_response(operation)
+                response.update({
+                    "error_code": (
+                        "needs_auth" if self._library_needs_auth(exc) else "unavailable"
+                    ),
+                    "error": (
+                        "recipe library needs_auth before lifecycle dispatch"
+                        if self._library_needs_auth(exc)
+                        else "recipe library capability probe is unavailable"
+                    ),
+                })
+                return response
+            try:
+                provider_principal, provider_binding = (
+                    self._recipe_library_context(library_id, adapter)
+                )
+            except Exception as exc:
+                response = self._lifecycle_operation_response(operation)
+                response.update({
+                    "error_code": (
+                        "needs_auth" if self._library_needs_auth(exc) else "unavailable"
+                    ),
+                    "error": (
+                        "recipe library needs_auth before lifecycle reconciliation"
+                        if self._library_needs_auth(exc)
+                        else "recipe library provider context is unavailable"
+                    ),
+                })
+                return response
+            if (
+                operation["provider_principal"] != provider_principal
+                or operation["provider_binding"] != provider_binding
+            ):
+                if operation["status"] == "pending" and operation.get(
+                    "dispatched_at"
+                ) is None:
+                    operation = self.recipes.finish_library_lifecycle(
+                        operation["operation_id"], "failed",
+                        error_code="provider_context_changed",
+                        error="recipe library provider context changed before dispatch",
+                    )
+                response = self._lifecycle_operation_response(operation)
+                response.update({
+                    "error_code": "provider_context_changed",
+                    "error": "recipe library provider context changed; original outcome must be resolved there",
+                })
+                return response
+            if operation.get("dispatched_at") is not None:
+                if operation["status"] == "pending":
+                    operation = self.recipes.finish_library_lifecycle(
+                        operation["operation_id"], "uncertain",
+                        error_code="uncertain",
+                        error=f"{kind} may be in flight; reconcile before retry",
+                    )
+                return self._reconcile_external_lifecycle(
+                    operation, adapter, capabilities
+                )
+            if operation["status"] == "uncertain":
+                return self._reconcile_external_lifecycle(
+                    operation, adapter, capabilities
+                )
+            capability = "delete" if kind == "delete" else "archive_desired_state"
+            reconciliation = (
+                "reconcile_delete" if kind == "delete" else "reconcile_archive"
+            )
+            if not capabilities[capability] or not capabilities[reconciliation]:
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="unsupported",
+                    error=f"recipe library no longer supports safely reconcilable {kind}",
+                )
+                return self._lifecycle_operation_response(failed)
+            try:
+                current, returned, current_archived = self._read_external_lifecycle(
+                    adapter,
+                    operation["library_recipe_ref"],
+                    archive_state=kind == "archive",
+                )
+            except RecipeLibraryExternalMissingError:
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="external_missing",
+                    error="the exact external recipe disappeared before dispatch",
+                )
+                return self._lifecycle_operation_response(failed)
+            except Exception as exc:
+                response = self._lifecycle_operation_response(operation)
+                if self._library_needs_auth(exc):
+                    response.update({
+                        "error_code": "needs_auth",
+                        "error": "recipe library needs_auth before lifecycle dispatch",
+                    })
+                return response
+            if (
+                returned != operation["library_recipe_ref"]
+                or self._recipe_lifecycle_digest(current)
+                != operation["snapshot_digest"]
+                or (
+                    kind == "archive"
+                    and current_archived is not operation["current_archived"]
+                )
+            ):
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="conflict",
+                    error="the external recipe changed after lifecycle prepare",
+                )
+                return self._lifecycle_operation_response(failed)
+            if kind == "archive" and current_archived is operation["requested_archived"]:
+                confirmed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "confirmed",
+                    result={
+                        "library_recipe_ref": returned,
+                        "archived": current_archived,
+                    },
+                )
+                return self._lifecycle_operation_response(confirmed)
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            if not claimed.get("claimed"):
+                if claimed["status"] == "pending" and claimed.get(
+                    "dispatched_at"
+                ) is not None:
+                    claimed = self.recipes.finish_library_lifecycle(
+                        claimed["operation_id"], "uncertain",
+                        error_code="uncertain",
+                        error=f"{kind} may be in flight; reconcile before retry",
+                    )
+                if claimed["status"] == "uncertain":
+                    return self._reconcile_external_lifecycle(
+                        claimed, adapter, capabilities
+                    )
+                return self._lifecycle_operation_response(claimed)
+            outbound = self._outbound_lifecycle_operation(claimed)
+            mutation_returned = False
+            try:
+                if kind == "delete":
+                    adapter.delete_recipe(deepcopy(returned), outbound)
+                    mutation_returned = True
+                    if adapter.reconcile_delete(deepcopy(returned), outbound) is not True:
+                        raise RecipeLibraryUncertainError(
+                            "recipe deletion has not reached authoritative absence"
+                        )
+                    result = {
+                        "library_recipe_ref": returned,
+                        "deleted": True,
+                    }
+                else:
+                    raw = adapter.set_archive_state(
+                        deepcopy(returned),
+                        operation["requested_archived"],
+                        outbound,
+                    )
+                    mutation_returned = True
+                    if not isinstance(raw, Mapping) or raw.get("archived") is not operation[
+                        "requested_archived"
+                    ]:
+                        raise RecipeLibraryError(
+                            "recipe library archive response is incompatible"
+                        )
+                    result_reference = validate_library_recipe_ref(
+                        raw.get("library_recipe_ref")
+                    )
+                    if (
+                        result_reference["library_id"] != library_id
+                        or result_reference["recipe_id"] != reference["recipe_id"]
+                        or "version" not in result_reference
+                    ):
+                        raise RecipeLibraryError(
+                            "recipe library archive response changed identity"
+                        )
+                    observed = adapter.reconcile_archive(
+                        deepcopy(result_reference),
+                        operation["requested_archived"],
+                        outbound,
+                    )
+                    if (
+                        not isinstance(observed, Mapping)
+                        or observed.get("archived")
+                        is not operation["requested_archived"]
+                    ):
+                        raise RecipeLibraryUncertainError(
+                            "recipe archive desired state is not authoritative"
+                        )
+                    observed_reference = validate_library_recipe_ref(
+                        observed.get("library_recipe_ref")
+                    )
+                    if (
+                        observed_reference["library_id"] != library_id
+                        or observed_reference["recipe_id"] != reference["recipe_id"]
+                        or "version" not in observed_reference
+                    ):
+                        raise RecipeLibraryUncertainError(
+                            "recipe archive reconciliation changed identity"
+                        )
+                    result = {
+                        "library_recipe_ref": observed_reference,
+                        "archived": operation["requested_archived"],
+                    }
+                confirmed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "confirmed", result=result
+                )
+                return self._lifecycle_operation_response(confirmed)
+            except RecipeLibraryExternalMissingError:
+                if mutation_returned:
+                    uncertain = self.recipes.finish_library_lifecycle(
+                        operation["operation_id"], "uncertain",
+                        error_code="uncertain",
+                        error=f"{kind} may have succeeded; authoritative readback failed",
+                    )
+                    return self._lifecycle_operation_response(uncertain)
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code="external_missing",
+                    error="the exact external recipe is missing",
+                )
+                return self._lifecycle_operation_response(failed)
+            except RecipeLibraryDefiniteError as exc:
+                if mutation_returned:
+                    uncertain = self.recipes.finish_library_lifecycle(
+                        operation["operation_id"], "uncertain",
+                        error_code="uncertain",
+                        error=f"{kind} may have succeeded; authoritative readback failed",
+                    )
+                    response = self._lifecycle_operation_response(uncertain)
+                    if self._library_needs_auth(exc):
+                        response.update({
+                            "error_code": "needs_auth",
+                            "error": f"recipe library needs_auth before {kind} reconciliation",
+                        })
+                    return response
+                failed = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "failed",
+                    error_code=(
+                        "needs_auth" if self._library_needs_auth(exc)
+                        else "provider_rejected"
+                    ),
+                    error=(
+                        "recipe library needs_auth"
+                        if self._library_needs_auth(exc)
+                        else f"recipe library rejected {kind}"
+                    ),
+                )
+                return self._lifecycle_operation_response(failed)
+            except Exception as exc:
+                uncertain = self.recipes.finish_library_lifecycle(
+                    operation["operation_id"], "uncertain",
+                    error_code="uncertain",
+                    error=f"{kind} may have been dispatched; reconcile before retry",
+                )
+                response = self._lifecycle_operation_response(uncertain)
+                if self._library_needs_auth(exc):
+                    response.update({
+                        "error_code": "needs_auth",
+                        "error": f"recipe library needs_auth before {kind} reconciliation",
+                    })
+                return response
+
     def _recipes(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "search")
         if action == "discover":
@@ -3221,9 +4100,21 @@ class Application:
                 "library_id": "builtin",
                 "recipe": self.recipes.save(value, status=status, idempotency_key=key),
             }
+        if action == "archive_prepare":
+            return self._prepare_external_lifecycle(request, "archive")
+        if action == "delete_prepare":
+            return self._prepare_external_lifecycle(request, "delete")
+        if action == "archive_confirm":
+            return self._confirm_external_lifecycle(request, "archive")
+        if action == "delete_confirm":
+            return self._confirm_external_lifecycle(request, "delete")
         if action == "update":
+            if request.get("library_recipe_ref") is not None:
+                return self._update_external_recipe(request)
             if request.get("library_id") not in {None, "builtin"}:
-                raise RecipeLibraryError("external recipe lifecycle is not implemented")
+                raise RecipeLibraryError(
+                    "external update requires one exact library_recipe_ref"
+                )
             value = normalize_recipe(request.get("recipe"))
             recipe_id = str(request.get("recipe_id") or "")
             expected = request.get("expected_revision")
