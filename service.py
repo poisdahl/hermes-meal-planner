@@ -5080,16 +5080,21 @@ class Application:
             comparison["unavailable"] = deepcopy(result.get("issues", []))
             return {"plan": result, "cost_comparison": comparison}
         menus = [self._materialize_planner_menu(h, resolved) for h in result["save_handoffs"]]
-        requirements = [exact_menu_requirements(menu)[0] for menu in menus]
+        requirement_error = None
+        try:
+            requirements = [exact_menu_requirements(menu)[0] for menu in menus]
+        except HouseholdError as exc:
+            requirements = []
+            requirement_error = str(exc)
         ids = {r["requirement_id"] for rows in requirements for r in rows}
         queries = {r["identity"] for rows in requirements for r in rows}
-        if len(ids) > MAX_REQUIREMENTS or len(queries) > MAX_REQUIREMENTS:
+        if requirement_error or len(ids) > MAX_REQUIREMENTS or len(queries) > MAX_REQUIREMENTS:
             comparison["alternatives"] = [{"original_rank": rank, "selection_digest": h["selection_digest"],
                 "non_price_selection": deepcopy(h["selection"]), "save_handoff": deepcopy(h),
                 "product_plan": None, "cost_status": "comparison_work_budget_exceeded"}
                 for rank, h in enumerate(result["save_handoffs"], 1)]
             comparison["selected_handoff"] = deepcopy(result["save_handoff"])
-            comparison["unavailable"] = [{"reason": "comparison_work_budget_exceeded"}]
+            comparison["unavailable"] = [{"reason": "comparison_work_budget_exceeded", "detail": requirement_error}]
             return {"plan": result, "cost_comparison": comparison}
         approvals = normalize_approvals(request.get("candidate_approvals"), ids)
         profile = self.store.read()["profile"]

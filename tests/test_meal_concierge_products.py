@@ -1253,6 +1253,7 @@ class MenuCostComparisonTests(unittest.TestCase):
         self.calls = []
         self.prices = {"gulrot": 300, "potet": 200, "ris": 100}
         self.stamp = OBSERVED_AT
+        self.custom_products = {}
         self.unknown = None
         self.bad_scope = False
         self.bad_size = False
@@ -1266,7 +1267,7 @@ class MenuCostComparisonTests(unittest.TestCase):
                 opts = [option(owner.prices[query])]
                 if query == owner.unknown:
                     opts[0]["price_kind"] = "from"
-                result = observation(query, [product(query, query, 200, "g", opts)], observed_at=owner.stamp)
+                result = observation(query, [owner.custom_products.get(query, product(query, query, 200, "g", opts))], observed_at=owner.stamp)
                 if owner.bad_scope:
                     result["scope"]["page"] = 2
                 if owner.bad_size:
@@ -1347,3 +1348,32 @@ class MenuCostComparisonTests(unittest.TestCase):
         self.request["planner_input"]["alternatives"] = 4
         with self.assertRaises(HouseholdError):
             self.compare()
+
+
+    def test_deposit_offer_and_package_ranking(self):
+        self.custom_products = {
+            "gulrot": product("gulrot", "gulrot", 100, "g", [option(50), option(70, packages=2, offer_kind="multibuy")]),
+            "potet": product("potet", "potet", 200, "g", [option(70, deposit=50)]),
+            "ris": product("ris", "ris", 300, "g", [option(70)]),
+        }
+        result = self.compare()
+        rows = result["alternatives"]
+        self.assertEqual([r["product_plan"]["totals"]["total_payable_ore"] for r in rows], [70, 70, 120])
+        # Two exact packages beat one overlarge package by excess before count.
+        self.assertEqual(rows[0]["product_plan"]["totals"]["package_count"], 2)
+        self.assertEqual(rows[2]["product_plan"]["totals"]["mandatory_deposit_ore"], 50)
+
+    def test_per_menu_budget_and_nonconvertible_requirements(self):
+        from test_meal_concierge_planner import recipe
+        for count, unit in ((21, "g"), (1, "pinch")):
+            raw = recipe("many", f"many-{count}", unit=unit)
+            raw["ingredients"] = [{"raw": f"1 {unit} item{i}", "item": f"item{i}", "quantity": 1, "unit": unit, "scalable": True} for i in range(count)]
+            saved = self.app.handle({"operation": "recipes", "action": "save", "recipe": raw, "idempotency_key": f"many-{count}"})["recipe"]
+            self.request["planner_input"]["candidates"] = [{"recipe_ref": {"id": saved["id"], "revision": saved["revision"]}}]
+            self.request["candidate_approvals"] = []
+            self.calls.clear()
+            result = self.compare()
+            self.assertEqual(result["status"], "unavailable")
+            self.assertIsNone(result["comparison_claim"])
+            self.assertEqual(len(result["alternatives"]), 1)
+            self.assertEqual(self.calls, [])
