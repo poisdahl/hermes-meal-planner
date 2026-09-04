@@ -115,6 +115,29 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(self.app._usage_summary(self.store.read(),source['recipe_key'],menu['week'])['blocked_by']),1)
         self.assertEqual(self.fixture.provider.calls,[])
 
+    def test_past_invalid_leftovers_do_not_block_remaining_week(self):
+        menu=self.apply(self.prepare())['menu']; source=menu['slots'][0]
+        self.cook(menu,source,action='mark_not_cooked')
+        with mock.patch.object(Application,'_household_today',return_value=date(2026,9,9)):
+            prepared=self.app.handle({'operation':'menu','action':'replan_prepare','menu_ref':mp.menu_ref(menu),
+                'remaining_dates':['2026-09-09'],'planner_input':{'candidates':self.candidates[3:]}})['replan']
+            self.assertEqual(prepared['status'],'prepared')
+            successor=self.app.handle({'operation':'menu','action':'replan_apply','replan':prepared})['menu']
+        self.assertEqual(successor['slots'][:2],menu['slots'][:2])
+        self.assertEqual(len(mp.shopping_menu(successor)['dishes']),1)
+
+    def test_historical_leftover_context_cannot_be_removed_with_conflicting_source(self):
+        menu=self.apply(self.prepare())['menu']; source,leftover,_=menu['slots']
+        self.cook(menu,source,actual_batch={'prepared_portions':'5','consumed_at_source':'2'})
+        self.cook(menu,leftover)
+        self.cook(menu,source,action='mark_not_cooked')
+        prepared=self.app.handle({'operation':'menu','action':'replan_prepare','menu_ref':mp.menu_ref(menu),
+            'remaining_dates':['2026-09-07','2026-09-09'],'planner_input':{'candidates':self.candidates}})['replan']
+        self.assertEqual(prepared['status'],'needs_input')
+        correction=self.cook(menu,leftover,action='mark_not_cooked')
+        self.assertFalse(correction['cooked'])
+        self.assertEqual(mp.slot_outcome(self.store.read(),menu,leftover),'not_cooked')
+
     def test_source_replacement_removes_all_future_dependencies_and_stale_never_writes(self):
         prepared=self.prepare(); stale=deepcopy(prepared); stale['successor']['batch']['prepared_portions']={'numerator':9,'denominator':1}
         stale['batch_digest']=mp.digest({k:v for k,v in stale.items() if k!='batch_digest'})

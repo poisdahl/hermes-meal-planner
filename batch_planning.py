@@ -137,7 +137,10 @@ def dependency_status(state,menu):
 
 def record_outcome(state,menu,slot,request):
     batch=menu.get('batch')
-    if not batch: return False
+    if not batch:
+        if slot.get('kind')=='leftover':
+            raise HouseholdError('historical leftover source context is unavailable; no outcome changed')
+        return False
     source_id=batch['source_slot_id']; cooked=request['action']=='mark_cooked'
     data=state['batch_outcomes']
     if slot['slot_id']==source_id:

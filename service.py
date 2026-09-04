@@ -4512,11 +4512,13 @@ class Application:
         if batch:
             component = {batch["source_slot_id"]} | {s["slot_id"] for s in slots if s.get("source_slot_id") == batch["source_slot_id"] and s["slot_id"] not in historical}
             changed = {s["slot_id"] for s in replacing}
-            invalid = {s["slot_id"] for s in bp.dependency_status(state,current) if s["status"]=="needs_replan"}
+            invalid = {s["slot_id"] for s in bp.dependency_status(state,current) if s["status"]=="needs_replan" and s["slot_id"] not in historical}
             if invalid.difference(changed):
                 return {"status":"needs_input", "reason":"all invalid future leftovers must be replanned together"}
             if changed & component and set(locks) & component:
                 return {"status":"needs_input", "reason":"locked batch component cannot be partially replanned"}
+            if batch["source_slot_id"] in changed and any(s.get("source_slot_id")==batch["source_slot_id"] and s["slot_id"] in historical for s in slots):
+                return {"status":"needs_input", "reason":"a source with historical leftovers must retain its exact context; correct the conflicting source outcome first"}
             if batch["source_slot_id"] in changed and not component <= changed:
                 return {"status":"needs_input", "reason":"source replacement requires every future dependent date in the same replan"}
         planning_state = deepcopy(state)
