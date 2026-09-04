@@ -39,7 +39,7 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(self.event('inspect')['events'], [])
         event = self.event('accept', planner_handoff=handoff, idempotency_key='accept')['event']
         self.assertEqual(event, self.event('accept', planner_handoff=handoff, idempotency_key='accept')['event'])
-        self.assertEqual(self.event('inspect')['effective']['signals'], {})
+        self.assertEqual(self.event('inspect')['signals'], {})
         self.assertEqual(self.plan()['input_digest'], plan['input_digest'])
         self.app.handle({'operation':'menu','action':'save','planner_handoff':handoff})
         self.assertEqual(self.store.read()['profile'], before['profile'])
@@ -66,13 +66,13 @@ class FeedbackTests(unittest.TestCase):
         menu = self.app.handle({'operation':'menu','action':'save','planner_handoff':self.plan()['save_handoff']})['menu']
         target = self.target(menu); before = self.store.read()
         for i in range(8): self.event('reject',target=target,idempotency_key=f'reject-{i}')
-        self.assertEqual(self.event('inspect')['effective']['signals'][target['recipe_key']],-6)
+        self.assertEqual(self.event('inspect')['signals'][target['recipe_key']],-6)
         reset = self.event('reset',scope='recipe',recipe_key=target['recipe_key'],idempotency_key='reset')['event']
-        self.assertEqual(self.event('inspect')['effective']['signals'],{})
+        self.assertEqual(self.event('inspect')['signals'],{})
         undo = self.event('undo',event_id=reset['event_id'],idempotency_key='undo-reset')['event']
-        self.assertEqual(self.event('inspect')['effective']['signals'][target['recipe_key']],-6)
+        self.assertEqual(self.event('inspect')['signals'][target['recipe_key']],-6)
         self.event('undo',event_id=undo['event_id'],idempotency_key='redo-reset')
-        self.assertEqual(self.event('inspect')['effective']['signals'],{})
+        self.assertEqual(self.event('inspect')['signals'],{})
         after = self.store.read()
         for field in ('profile','recipe_usage','menu','order_snapshots'):
             self.assertEqual(before[field],after[field])
@@ -93,9 +93,9 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(len(result['event']['contributions']),2)
         self.assertEqual(result['effective']['signals'],{former['recipe_key']:-2,latter['recipe_key']:2})
         self.event('reset',scope='recipe',recipe_key=former['recipe_key'],idempotency_key='reset-former')
-        self.assertEqual(self.event('inspect')['effective']['signals'],{latter['recipe_key']:2})
+        self.assertEqual(self.event('inspect')['signals'],{latter['recipe_key']:2})
         self.event('reset',scope='all',idempotency_key='reset-all')
-        self.assertEqual(self.event('inspect')['effective']['signals'],{})
+        self.assertEqual(self.event('inspect')['signals'],{})
 
     def test_no_implicit_feedback_ambiguity_and_hard_constraints(self):
         plan=self.plan()
@@ -111,6 +111,28 @@ class FeedbackTests(unittest.TestCase):
             state['profile']['diet']['allergies_or_sensitivities']=['milk']
         self.assertNotEqual(self.plan()['status'],'planned')
         self.assertEqual(self.fixture.provider.calls,[])
+
+    def test_inspection_pages_fit_actual_wire_and_stale_cursor_fails(self):
+        handoff = self.plan()['save_handoff']
+        for i in range(260):
+            self.event('accept',planner_handoff=handoff,reason='😀'*500,idempotency_key=str(i)+'😀'*190)
+        seen = []
+        request = {'operation':'feedback','action':'inspect','limit':25}
+        first_cursor = None
+        while True:
+            result = self.fixture.socket_call(request)
+            self.assertTrue(result['ok'])
+            self.assertLess(len(json.dumps(result,ensure_ascii=True).encode()),2*1024*1024)
+            page=result['result']; seen.extend(e['event_id'] for e in page['events'])
+            cursor=page['next_cursor']
+            if first_cursor is None: first_cursor=cursor
+            if cursor is None: break
+            request['cursor']=cursor
+        self.assertEqual(len(seen),260)
+        self.assertEqual(len(set(seen)),260)
+        self.event('accept',planner_handoff=handoff,idempotency_key='next')
+        with self.assertRaises(HouseholdError): self.event('inspect',cursor=first_cursor)
+        self.assertEqual(self.event('inspect',view='signals')['signals'],{})
 
     def test_decay_bound_date_and_compaction_dependency_integrity(self):
         events=[]

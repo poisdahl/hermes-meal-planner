@@ -4314,14 +4314,35 @@ class Application:
     def _feedback(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "inspect")
         allowed = {"operation", "action", "planner_handoff", "target", "from_target", "to_target",
-                   "recipe_key", "reference", "event_id", "scope", "reason", "idempotency_key"}
+                   "recipe_key", "reference", "event_id", "scope", "reason", "idempotency_key", "view", "limit", "cursor"}
         if set(request).difference(allowed):
             raise HouseholdError("feedback request has unknown fields")
         snapshot = self.store.read()
         today = self._household_today(snapshot).isoformat()
         events = snapshot["planning_feedback"]
         if action == "inspect":
-            return {"events": deepcopy(events), "effective": pf.effective(events, today),
+            view = request.get("view") or "events"
+            if view not in {"events", "signals"}:
+                raise HouseholdError("feedback inspect view must be events or signals")
+            limit = request.get("limit", 20)
+            if type(limit) is not int or not 1 <= limit <= 25:
+                raise HouseholdError("feedback inspect limit must be one to 25")
+            effective = pf.effective(events, today)
+            digest = mp.digest({"events": events, "as_of_date": today})
+            keys = [e["event_id"] for e in events] if view == "events" else sorted(effective["signals"])
+            start = 0
+            cursor = request.get("cursor")
+            if cursor is not None:
+                if not isinstance(cursor, Mapping) or set(cursor) != {"digest", "view", "after"} or cursor["digest"] != digest or cursor["view"] != view or cursor["after"] not in keys:
+                    raise HouseholdError("feedback cursor changed or expired; restart inspection")
+                start = keys.index(cursor["after"]) + 1
+            page_keys = keys[start:start+limit]
+            page = events[start:start+limit] if view == "events" else []
+            recipe_keys = {c["recipe_key"] for e in page for c in e["contributions"]} if view == "events" else set(page_keys)
+            return {"events": deepcopy(page), "effective": {k: deepcopy(v) for k,v in effective.items() if k not in {"events", "signals"}},
+                    "signals": {k:effective["signals"][k] for k in sorted(recipe_keys) if k in effective["signals"]},
+                    "signal_scope": "page_recipe_keys", "view": view,
+                    "next_cursor": {"digest":digest, "view":view, "after":page_keys[-1]} if start+limit < len(keys) else None,
                     "policy": {"version": pf.POLICY_VERSION, "maximum_events": pf.MAX_EVENTS,
                                "retention_days": pf.RETENTION_DAYS, "decay_days": [30, 60], "per_recipe_cap": 6}}
         if action not in {"accept", "reject", "swap", "undo", "reset"}:
@@ -4392,7 +4413,11 @@ class Application:
             event = pf.append(state["planning_feedback"], kind=action, binding=binding,
                 contributions=contributions, reason=reason, key=key, signature=signature, as_of_date=today,
                 targets=targets, recipe_key=recipe_scope)
-            return {"event": event, "effective": pf.effective(state["planning_feedback"], today)}
+            effective = pf.effective(state["planning_feedback"], today)
+            affected = {c["recipe_key"] for c in contributions}
+            summary = {k: v for k, v in effective.items() if k not in {"events", "signals"}}
+            summary["signals"] = {k: effective["signals"][k] for k in sorted(affected) if k in effective["signals"]}
+            return {"event": event, "effective": summary, "signal_scope": "event_recipe_keys"}
 
     def _mark_slot(self, request: Mapping[str, Any]) -> dict[str, Any]:
         with self.store.locked() as state:

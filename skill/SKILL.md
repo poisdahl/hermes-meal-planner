@@ -429,7 +429,11 @@ into the score but never override hard/unknown constraints, product eligibility
 or profile weights. The effective event set and one exact `as_of_date` are bound
 into canonical input; ranking/save never reevaluate decay from the wall clock.
 
-`inspect` shows events and effective signals. `undo(event_id=...)` appends one
+`inspect` pages events and effective signals with `view="events"` or `"signals"`,
+`limit` 1–25 (default 20), and an unchanged `next_cursor`. Cursors bind the
+history/date; restart inspection after a write or date rollover. Returned
+signal values cover only the page's recipe keys; all signals are accessible
+through the signals view. `undo(event_id=...)` appends one
 exact correction, including undoing an earlier undo/reset. Reset requires
 `scope="recipe"` and an exact feedback recipe key or `scope="all"`; a recipe
 reset removes only that recipe's contribution even from a paired swap. Neither
