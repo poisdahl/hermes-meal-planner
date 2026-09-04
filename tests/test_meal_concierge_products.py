@@ -1255,6 +1255,7 @@ class MenuCostComparisonTests(unittest.TestCase):
         self.stamp = OBSERVED_AT
         self.unknown = None
         self.bad_scope = False
+        self.bad_size = False
         owner = self
         class Provider:
             def call(self, tool, arguments, **kwargs):
@@ -1268,6 +1269,8 @@ class MenuCostComparisonTests(unittest.TestCase):
                 result = observation(query, [product(query, query, 200, "g", opts)], observed_at=owner.stamp)
                 if owner.bad_scope:
                     result["scope"]["page"] = 2
+                if owner.bad_size:
+                    result["scope"]["requested_size"] = 1
                 return result
         self.app.oda = Provider()
         self.request = {"operation": "products", "action": "lowest_cost",
@@ -1308,6 +1311,12 @@ class MenuCostComparisonTests(unittest.TestCase):
         self.assertEqual([a["original_rank"] for a in result["alternatives"]], [1, 2, 3])
         self.unknown = None
         self.bad_scope = True
+        result = self.compare()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["comparison_claim"])
+
+    def test_inconsistent_declared_size_is_unavailable(self):
+        self.bad_size = True
         result = self.compare()
         self.assertEqual(result["status"], "unavailable")
         self.assertIsNone(result["comparison_claim"])

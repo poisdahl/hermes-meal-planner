@@ -947,7 +947,10 @@ class Application:
         if action is not None and (not isinstance(action, str) or not 1 <= len(action) <= 40):
             raise HouseholdError("action must be bounded text")
         try:
-            if operation == "products":
+            if operation == "products" and action == "lowest_cost":
+                with self._recipe_planner_operation(), self.product_plan_lock:
+                    result = self._handle(request)
+            elif operation == "products":
                 with self.product_plan_lock:
                     result = self._handle(request)
             elif operation == "cart" and action in {"sync", "reconcile"}:
@@ -4924,7 +4927,10 @@ class Application:
             normalized["query"] = query
             scope = normalized.get("scope")
             if (not isinstance(scope, Mapping) or scope.get("semantics") != "bounded_relevance_ranked"
-                or scope.get("kind") != "provider_search" or scope.get("page") != 1):
+                or scope.get("kind") != "provider_search"
+                or type(scope.get("page")) is not int or scope["page"] != 1
+                or type(scope.get("requested_size")) is not int
+                or scope["requested_size"] != MAX_CANDIDATES_PER_REQUIREMENT):
                 raise HouseholdError("provider product search scope changed")
             products = normalized.get("products")
             returned = scope.get("returned")
@@ -5142,8 +5148,7 @@ class Application:
         action = request.get("action", "prepare")
         deadline = request.get("_deadline")
         if action == "lowest_cost":
-            with self._recipe_planner_operation():
-                return self._compare_menu_costs(request)
+            return self._compare_menu_costs(request)
         if action == "prepare":
             binding, menu, _saved_ref = self._product_binding(
                 menu_ref=request.get("menu_ref"),
