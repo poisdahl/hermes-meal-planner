@@ -1093,3 +1093,32 @@ structure.
 ## License
 
 MIT
+
+
+### Explicit menu cost comparison
+
+`meal_concierge_products(action="lowest_cost", planner_input=..., candidate_approvals=...)`
+compares at most three deterministic alternatives from one exact planner input.
+The default planner and scheduled strategy are unchanged. The comparison shares
+at most 20 unique ingredient/unit requirements and 20 canonical ingredient
+searches, each page 1 with at most five results, across all alternatives. It
+preflights the whole union before searching; no partial budget prefix is ranked.
+Each product plan retains its existing limit of 10,000 combinations per
+requirement (at most three plans). Exact user-approved candidate refs remain
+required; missing approvals, unknown amounts/eligibility or incompatible units
+keep the original non-price order and prevent a cheapest-menu claim.
+
+A complete comparison ranks total payable product amounts including mandatory
+deposits, then exact dimensionless excess, package count, original rank and
+selection digest. The result includes the original scores/reasons, every product
+plan and its totals/scope/digest, and the unchanged selected save handoff. Pass
+that handoff to menu save. The claim is only “lowest verified product cost among
+these N exact menu alternatives and their declared provider candidate scopes”.
+Meal Concierge never locks a price. Later product/cart preparation reads current
+facts again; pass the chosen comparison `product_plan` as `previous_product_plan`
+to `products.prepare` with the exact saved `menu_ref` to receive explicit
+`observation_drift` (`changed`/`unchanged`). This baseline is recommendation
+provenance only, never apply authority. It never changes saved recipes implicitly.
+Delivery, cart-level bags and fees are excluded. The later provider-authoritative
+checkout summary remains the final price authority. Comparison performs only
+bounded product observations; it never authorizes cart, order or payment changes.
