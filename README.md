@@ -114,7 +114,7 @@ set `HERMES_PYTHON`, `MEAL_CONCIERGE_AGENT_BROWSER` or
 `MEAL_CONCIERGE_BROWSER_EXECUTABLE` while running the installer; their resolved
 values are saved in the private service definition.
 
-Clean installations create household state v9 with only the
+Clean installations create household state v10 with only the
 `product_favorites` list and expose the
 `meal_concierge_product_favorites` tool. When rerun for an existing installation,
 the installer stops only the meal-concierge service, creates the non-overwriting
@@ -1166,3 +1166,52 @@ never overwritten; migration is atomic/idempotent and newer versions fail closed
 Planning metadata is bounded to 2,000 menus; reaching the bound stops new
 successors without deleting historical or unresolved state. The default remains
 one different dinner per day with no inferred leftovers or batch capability.
+
+
+### Explicit planning feedback
+
+`meal_concierge_feedback` supports `inspect`, `accept`, `reject`, `swap`, `undo`
+and `reset`. Every write needs its explicit action and a bounded stable
+`idempotency_key`; optional user reasons are at most 500 characters. Ask one
+short clarification before recording ambiguous natural-language feedback.
+A displayed proposal, silence, timeout, ordering, cancellation, cart removal,
+cooking or `not_cooked` never creates a feedback event. Favorites remain the
+existing native recipe favorites; durable avoid/prefer changes remain explicit
+profile edits.
+
+Acceptance and proposal rejection require the complete unchanged current
+`planner_handoff`; rejection additionally names its exact `recipe_key` and
+`reference`. The service recomputes planner/input/selection digests before any
+write. Saved rejection takes `target={menu_ref, slot_id, recipe_key, reference}`.
+A swap is one atomic event with exact `from_target` in the direct immutable
+predecessor and `to_target` in its current successor, on the same date/meal type.
+First apply the explicit recipe replan, then record its explicit swap context.
+Names, list positions and legacy guessed schedules cannot target feedback.
+
+The versioned `explicit-feedback-v1` policy in planner v2 contributes −2 for
+rejection/swapped-away and +2 for swapped-to during days 0–29, ±1 during days
+30–59, and zero afterward. Per-recipe sums are capped at −6/+6. Plan acceptance
+has no per-recipe ranking contribution, so accepting a proposal does not itself
+invalidate its save handoff. No signal propagates to ingredients, cuisine,
+protein or other facets. These ordinary inspectable reason contributions sum
+into the score but never override hard/unknown constraints, product eligibility
+or profile weights. The effective event set and one exact `as_of_date` are bound
+into canonical input; ranking/save never reevaluate decay from the wall clock.
+
+`inspect` shows events and effective signals. `undo(event_id=...)` appends one
+exact correction, including undoing an earlier undo/reset. Reset requires
+`scope="recipe"` and an exact feedback recipe key or `scope="all"`; a recipe
+reset removes only that recipe's contribution even from a paired swap. Neither
+a correction nor a reset changes recipes, favorites, menus, orders or cooking
+history. Storage is private per household, with no external telemetry/training.
+At most 500 events are retained. On writes, a connected original/correction
+component expires only when every member is at least 180 days old. Otherwise
+all members remain; the bound rejects a new write rather than discarding live
+dependencies. Retried retained keys are idempotent; their expiry follows their
+whole component. Expired corrections never leave dangling references or
+resurrect retained events.
+
+Because PR #26 already used state v8 and slot planning uses v9, feedback is the
+additive v9→v10 migration. Existing v9 state receives one atomic private 0600
+`state-v9.backup.json`, never overwritten. Failed migration leaves its source
+usable and unknown newer versions fail closed.

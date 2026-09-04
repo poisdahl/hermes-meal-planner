@@ -66,6 +66,7 @@ from product_planner import (
 )
 from product_observations import MAX_PRODUCTS
 import menu_planning as mp
+import planning_feedback as pf
 from recipe_libraries import (
     CAPABILITY_NAMES,
     MAX_LIBRARY_RECIPE_KEY,
@@ -973,7 +974,7 @@ class Application:
                         result = self._handle(request)
                 else:
                     result = self._handle(request)
-            elif operation == "recipes" or (
+            elif operation in {"recipes", "feedback"} or (
                 operation == "menu" and (
                     action == "plan"
                 )
@@ -1032,6 +1033,8 @@ class Application:
             return self._recipes(request)
         if operation == "menu":
             return self._menu(request)
+        if operation == "feedback":
+            return self._feedback(request)
         if operation == "schedule":
             return self._schedule(request)
         action = request.get("action")
@@ -4289,6 +4292,108 @@ class Application:
                 return result
         raise HouseholdError("unknown recipe action")
 
+    @staticmethod
+    def _feedback_slot(state: Mapping[str, Any], value: Any, *, allow_predecessor: bool = False) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) != {"menu_ref", "slot_id", "recipe_key", "reference"}:
+            raise HouseholdError("feedback target needs exact menu_ref, slot_id, recipe_key and reference")
+        menu = state.get("menu")
+        if not isinstance(menu, Mapping):
+            raise HouseholdError("feedback has no active structured menu")
+        if canonical(mp.menu_ref(menu)) != canonical(value["menu_ref"]):
+            if not allow_predecessor or canonical(menu.get("supersedes")) != canonical(value["menu_ref"]):
+                raise HouseholdError("feedback target is not the exact current menu or direct predecessor")
+            source = value["menu_ref"]
+            menu = state["menu_planning"]["history"].get(f'{source["menu_id"]}:{source["revision"]}')
+            if not isinstance(menu, Mapping) or canonical(mp.menu_ref(menu)) != canonical(source):
+                raise HouseholdError("feedback predecessor snapshot is unavailable")
+        slot = mp.slot_by_id(menu, value["slot_id"])
+        if value["recipe_key"] != slot["recipe_key"] or canonical(value["reference"]) != canonical(slot["reference"]):
+            raise HouseholdError("feedback recipe reference does not match its exact slot")
+        return deepcopy(slot)
+
+    def _feedback(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        action = request.get("action", "inspect")
+        allowed = {"operation", "action", "planner_handoff", "target", "from_target", "to_target",
+                   "recipe_key", "reference", "event_id", "scope", "reason", "idempotency_key"}
+        if set(request).difference(allowed):
+            raise HouseholdError("feedback request has unknown fields")
+        snapshot = self.store.read()
+        today = self._household_today(snapshot).isoformat()
+        events = snapshot["planning_feedback"]
+        if action == "inspect":
+            return {"events": deepcopy(events), "effective": pf.effective(events, today),
+                    "policy": {"version": pf.POLICY_VERSION, "maximum_events": pf.MAX_EVENTS,
+                               "retention_days": pf.RETENTION_DAYS, "decay_days": [30, 60], "per_recipe_cap": 6}}
+        if action not in {"accept", "reject", "swap", "undo", "reset"}:
+            raise HouseholdError("feedback action must be explicit: accept, reject, swap, undo or reset")
+        key = request.get("idempotency_key")
+        reason = request.get("reason")
+        if not isinstance(key, str) or not 1 <= len(key) <= 200:
+            raise HouseholdError("feedback writes require a bounded idempotency_key")
+        if reason is not None and (not isinstance(reason, str) or len(reason) > 500):
+            raise HouseholdError("feedback reason must be at most 500 characters")
+        signature = mp.digest({k:v for k,v in request.items() if v is not None})
+        existing = pf.prior(events, key, signature)
+        if existing is not None:
+            return {"event": existing, "idempotent": True}
+        contributions = []
+        targets = None
+        recipe_scope = None
+        binding = {}
+        if action in {"accept", "reject"}:
+            handoff = request.get("planner_handoff")
+            if handoff is not None:
+                self._verify_planner_handoff(handoff)
+                if handoff["request"]["as_of_date"] != today:
+                    raise HouseholdError("feedback proposal is stale; prepare a current proposal")
+                if request.get("target") is not None:
+                    raise HouseholdError("feedback requires one exact proposal or saved-menu target")
+                binding = {k:deepcopy(handoff[k]) for k in ("planner_version", "input_digest", "selection_digest")}
+                if action == "reject":
+                    matches = [s for s in handoff["selection"]["slots"] if s["recipe_key"] == request.get("recipe_key") and canonical(s["reference"]) == canonical(request.get("reference"))]
+                    if len(matches) != 1:
+                        raise HouseholdError("proposal rejection needs its exact recipe key and reference")
+                    binding["recipe"] = {"recipe_key":matches[0]["recipe_key"], "reference":deepcopy(matches[0]["reference"])}
+                    contributions = [{"recipe_key":matches[0]["recipe_key"], "direction":-1}]
+            else:
+                if action == "accept":
+                    raise HouseholdError("plan acceptance needs the complete unchanged planner_handoff")
+                slot = self._feedback_slot(snapshot, request.get("target"))
+                binding = {"target":deepcopy(request["target"])}
+                contributions = [{"recipe_key":slot["recipe_key"], "direction":-1}]
+        elif action == "swap":
+            former = self._feedback_slot(snapshot, request.get("from_target"), allow_predecessor=True)
+            latter = self._feedback_slot(snapshot, request.get("to_target"))
+            current = snapshot["menu"]
+            if canonical(request["from_target"]["menu_ref"]) != canonical(current.get("supersedes")) or former["slot_id"] == latter["slot_id"] or former["recipe_key"] == latter["recipe_key"] or (former["date"], former["meal_type"]) != (latter["date"], latter["meal_type"]):
+                raise HouseholdError("swap feedback requires one exact replaced predecessor slot and its successor on the same date/type")
+            binding = {"from_target":deepcopy(request["from_target"]), "to_target":deepcopy(request["to_target"])}
+            contributions = [{"recipe_key":former["recipe_key"], "direction":-1}, {"recipe_key":latter["recipe_key"], "direction":1}]
+        elif action == "undo":
+            event_id = request.get("event_id")
+            if not isinstance(event_id, str) or not any(e["event_id"] == event_id for e in events):
+                raise HouseholdError("undo requires one exact retained event_id")
+            targets = [event_id]
+        else:
+            scope = request.get("scope")
+            if scope not in {"recipe", "all"}:
+                raise HouseholdError("reset requires explicit scope recipe or all")
+            if scope == "recipe":
+                recipe_scope = request.get("recipe_key")
+                if not isinstance(recipe_scope, str) or not any(c["recipe_key"] == recipe_scope for e in events for c in e["contributions"]):
+                    raise HouseholdError("recipe reset requires one exact feedback recipe_key")
+            elif request.get("recipe_key") is not None:
+                raise HouseholdError("all-feedback reset cannot also target one recipe")
+            targets = [e["event_id"] for e in events if e["kind"] in {"accept", "reject", "swap"} and
+                       (recipe_scope is None or any(c["recipe_key"] == recipe_scope for c in e["contributions"]))]
+        with self.store.locked() as state:
+            if canonical(state) != canonical(snapshot):
+                raise HouseholdError("feedback target changed before write; inspect again")
+            event = pf.append(state["planning_feedback"], kind=action, binding=binding,
+                contributions=contributions, reason=reason, key=key, signature=signature, as_of_date=today,
+                targets=targets, recipe_key=recipe_scope)
+            return {"event": event, "effective": pf.effective(state["planning_feedback"], today)}
+
     def _mark_slot(self, request: Mapping[str, Any]) -> dict[str, Any]:
         with self.store.locked() as state:
             menu = state.get("menu")
@@ -4331,7 +4436,7 @@ class Application:
 
     @staticmethod
     def _replan_state_digest(state: Mapping[str, Any]) -> str:
-        return mp.digest({key: state.get(key) for key in ("menu", "profile", "recipe_usage", "menu_planning")})
+        return mp.digest({key: state.get(key) for key in ("menu", "profile", "recipe_usage", "menu_planning", "planning_feedback")})
 
     def _prepare_replan(self, request: Mapping[str, Any]) -> dict[str, Any]:
         state = self.store.read()
@@ -4712,18 +4817,22 @@ class Application:
             raise PlannerError(
                 f"planner history exceeds {MAX_HISTORY_RECORDS} records"
             )
+        feedback = pf.effective(state["planning_feedback"], request["as_of_date"])
         refreshed = []
         for candidate in resolved:
             item = deepcopy(dict(candidate))
             item["usage"] = self._usage_summary(
                 state, item["recipe_key"], request["week"]
             )
+            if item["recipe_key"] in feedback["signals"]:
+                item["planning_feedback"] = {"weight": feedback["signals"][item["recipe_key"]],
+                    "policy_version": pf.POLICY_VERSION, "events": [e for e in feedback["events"] if e["recipe_key"] == item["recipe_key"]]}
             refreshed.append(item)
         profile = state.get("profile")
         if not isinstance(profile, Mapping):
             raise PlannerError("household profile is invalid")
         return plan_week(
-            request, profile=profile, candidates=refreshed, history=history
+            request, profile=profile, candidates=refreshed, history=history, feedback=feedback
         )
 
     def _plan_menu(
