@@ -114,7 +114,7 @@ set `HERMES_PYTHON`, `MEAL_CONCIERGE_AGENT_BROWSER` or
 `MEAL_CONCIERGE_BROWSER_EXECUTABLE` while running the installer; their resolved
 values are saved in the private service definition.
 
-Clean installations create household state v8 with only the
+Clean installations create household state v9 with only the
 `product_favorites` list and expose the
 `meal_concierge_product_favorites` tool. When rerun for an existing installation,
 the installer stops only the meal-concierge service, creates the non-overwriting
@@ -1122,3 +1122,47 @@ provenance only, never apply authority. It never changes saved recipes implicitl
 Delivery, cart-level bags and fees are excluded. The later provider-authoritative
 checkout summary remains the final price authority. Comparison performs only
 bounded product observations; it never authorizes cart, order or payment changes.
+
+
+### Exact meal slots and remaining-week replanning
+
+Planner saves create opaque stable `slot_id` values with exact date, dinner type,
+recipe reference/key and snapshot digest. `recipes.mark_cooked` and
+`mark_not_cooked` require exact current `menu_id`, `expected_revision` and
+`slot_id` for structured menus. Only these explicit actions record cooking.
+Ordering, elapsed time and silence do not. Legacy schedules remain readable;
+no migration guesses their recipe/date mapping. Create a new structured plan
+before using slot actions.
+
+Use `menu.lock` with the exact `menu_ref` (ID, revision, digest), `slot_id` and
+explicit desired `locked` boolean. Locks are separate metadata. Historical or
+ordered menus cannot have their locks edited; `replan_prepare` may instead take
+exact `locked_slot_ids` for its active source. Prepare takes exact
+`remaining_dates` plus bounded `planner_input` candidates. The household's one
+current `as_of_date` is bound into the result; including today in the requested
+set is explicit. Past, explicitly cooked, locked and unrequested slots are
+carried byte-for-byte. Only the requested unlocked dates enter the deterministic
+planner; strict targets are evaluated for that replacement scope, and hard or
+unknown constraints are never relaxed. Impossible replacements return
+`needs_input`, without a partial successor.
+
+Pass the complete unchanged `replan` to `menu.replan_apply`. A stale date, menu,
+profile, usage, lock or recipe selection requires fresh preparation; pending
+checkout/cancellation/order-change state blocks apply. Apply is idempotent and
+creates an exact `supersedes` successor. Predecessor menu/order/email and usage
+snapshots remain unchanged. Carried past/cooked slots are historical display,
+not remaining shopping. Future locked/new slots contribute once; slot ownership
+keeps carried cooldown/cooking once, and replaced future planned use is retired.
+`shopping_comparison` is structural normalized recipe requirements, with raw,
+non-scalable and incompatible rows explicitly unresolved; it is never a provider
+product/cart quantity delta. Cart sync or order changes require their separate
+explicit reconciliation path. These actions call no provider.
+
+State v8 was already used by the project rename in PR #26. The permanent v7→v8
+migration is retained; slot metadata is therefore the additive v8→v9 step, with
+one private atomic `state-v8.backup.json` before upgrading an existing v8 file.
+Direct v7 upgrades retain their own `state-v7.backup.json`. Backups are 0600,
+never overwritten; migration is atomic/idempotent and newer versions fail closed.
+Planning metadata is bounded to 2,000 menus; reaching the bound stops new
+successors without deleting historical or unresolved state. The default remains
+one different dinner per day with no inferred leftovers or batch capability.

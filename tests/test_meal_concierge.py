@@ -368,6 +368,8 @@ class MutableFakeMeny(MutableCartMixin, FakeMeny):
 class CoreTestsBase:
     @staticmethod
     def write_state(directory, state):
+        if state.get("version", 1) < 9:
+            state.pop("menu_planning", None)
         path = Path(directory) / "state.json"
         path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return path
@@ -1470,7 +1472,7 @@ class CoreTestsBase:
             "history": [{"old": True}],
         }}
         state = migrate(CONFIG, planning, {"schedules": []})
-        self.assertEqual(state["version"], 8)
+        self.assertEqual(state["version"], 9)
         self.assertEqual(len(state["product_favorites"]), 1)
         self.assertNotIn("favorites", state)
         self.assertEqual(len(state["recurring_items"]), 1)
@@ -1481,7 +1483,7 @@ class CoreTestsBase:
     def test_clean_state_and_skill_expose_only_product_favorites(self):
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
-        self.assertEqual(state["version"], 8)
+        self.assertEqual(state["version"], 9)
         self.assertEqual(state["schedule"]["delivery"]["strategy"], "cheapest")
         self.assertIsNone(state["delivery_selection"])
         self.assertEqual(state["product_favorites"], [])
@@ -1498,6 +1500,7 @@ class CoreTestsBase:
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
             state["version"] = 5
+            state.pop("menu_planning", None)
             state["favorites"] = deepcopy(items)
             del state["product_favorites"]
             state_path = self.write_state(temp, state)
@@ -1510,7 +1513,7 @@ class CoreTestsBase:
 
             self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(backup_before), state)
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertEqual(migrated["schedule"]["delivery"]["strategy"], "keep_selected")
             self.assertEqual(migrated["product_favorites"], items)
             self.assertNotIn("favorites", migrated)
@@ -1573,7 +1576,7 @@ class CoreTestsBase:
 
             self.assertEqual(json.loads(backup), state)
             self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertEqual(migrated["schedule"]["delivery"]["strategy"], "keep_selected")
             self.assertIsNone(migrated["delivery_selection"])
 
@@ -1624,7 +1627,7 @@ class CoreTestsBase:
 
             self.assertEqual(json.loads(backup), state)
             self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertEqual(
                 migrated["email_jobs"][0]["automation_key"],
                 "meal-concierge-email-0123456789abcdef",
@@ -1652,14 +1655,14 @@ class CoreTestsBase:
             del state["product_favorites"]
             self.write_state(temp, state)
             migrated = StateStore(Path(temp), CONFIG).read()
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertEqual(migrated["product_favorites"], state["favorites"])
             self.assertTrue((Path(temp) / "state-v4.backup.json").exists())
             self.assertTrue((Path(temp) / "state-v5.backup.json").exists())
 
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
-            state["version"] = 9
+            state["version"] = 10
             self.write_state(temp, state)
             with self.assertRaisesRegex(HouseholdError, "newer than"):
                 StateStore(Path(temp), CONFIG)
@@ -1686,7 +1689,7 @@ class CoreTestsBase:
             state = json.loads((root / "output" / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(report["product_favorites_count"], 1)
             self.assertNotIn("favorites", report)
-            self.assertEqual(state["version"], 8)
+            self.assertEqual(state["version"], 9)
             self.assertEqual(state["product_favorites"][0]["product_id"], "1")
             self.assertNotIn("favorites", state)
 
@@ -1763,6 +1766,7 @@ class CoreTests(CoreTestsBase, unittest.TestCase):
             state = state_store.read()
             product_items = [{"product_id": MENY_PRODUCT, "product_name": "Brokkoli", "quantity": 2}]
             state["version"] = 5
+            state.pop("menu_planning", None)
             state["favorites"] = deepcopy(product_items)
             del state["product_favorites"]
             if conflicting:
@@ -1788,7 +1792,7 @@ if arguments and arguments[0] == \"-\":
     if 'status = rpc(\"status\")' in source:
         state_path = Path(os.environ[\"MEAL_CONCIERGE_HOME\"]) / \"state\" / \"state.json\"
         state = json.loads(state_path.read_text(encoding=\"utf-8\"))
-        if state.get(\"version\") != 8 or \"product_favorites\" not in state or \"favorites\" in state:
+        if state.get(\"version\") != 9 or \"product_favorites\" not in state or \"favorites\" in state:
             raise SystemExit(1)
         with open({str(python_log)!r}, \"a\", encoding=\"utf-8\") as handle:
             handle.write(\"status-probe\\n\")
@@ -1898,7 +1902,7 @@ else:
             self.assertEqual(completed.returncode, 0, completed.stderr)
             migrated = json.loads(state_path.read_text(encoding="utf-8"))
             backup = private_root / "state" / "state-v5.backup.json"
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertEqual(migrated["product_favorites"], product_items)
             self.assertNotIn("favorites", migrated)
             self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), old_state)
@@ -1941,7 +1945,7 @@ else:
             self.assertIsNone(old_state)
             self.assertEqual(product_items, [])
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(state["version"], 8)
+            self.assertEqual(state["version"], 9)
             self.assertEqual(state["product_favorites"], [])
             self.assertNotIn("favorites", state)
             self.assertFalse((private_root / "state" / "state-v5.backup.json").exists())
@@ -5735,7 +5739,7 @@ class FlowTests(unittest.TestCase):
 
     def test_status_exposes_the_fresh_confirmation_default(self):
         status = self.app.handle({"operation": "status"})
-        self.assertEqual(status["state_version"], 8)
+        self.assertEqual(status["state_version"], 9)
         self.assertEqual(status["confirmation_policy"], "fresh")
         self.assertEqual(status["product_favorites_count"], 0)
         self.assertNotIn("favorites", status)

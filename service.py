@@ -65,6 +65,7 @@ from product_planner import (
     validate_product_plan, product_plan_digest,
 )
 from product_observations import MAX_PRODUCTS
+import menu_planning as mp
 from recipe_libraries import (
     CAPABILITY_NAMES,
     MAX_LIBRARY_RECIPE_KEY,
@@ -963,6 +964,9 @@ class Application:
             ):
                 with self.product_plan_lock:
                     result = self._handle(request)
+            elif operation == "menu" and action in {"lock", "replan_prepare", "replan_apply"}:
+                with self._recipe_planner_operation(), self.product_plan_lock:
+                    result = self._handle(request)
             elif operation == "menu" and action in {"save", "clear"}:
                 if action == "save" and request.get("planner_handoff") is not None:
                     with self._recipe_planner_operation():
@@ -1302,6 +1306,8 @@ class Application:
         blockers = []
         for menu_id, record in (state.get("recipe_usage") or {}).items():
             if menu_id == ignore_menu_id or not isinstance(record, Mapping) or not identity_keys.intersection(record.get("recipe_keys", [])):
+                continue
+            if identity_keys.intersection(state.get("menu_planning", {}).get("retired", {}).get(menu_id, [])) and not identity_keys.intersection(record.get("cooked_keys", [])):
                 continue
             record_week = record.get("week")
             try:
@@ -4193,6 +4199,13 @@ class Application:
             key = request.get("idempotency_key")
             return {"recipe": self.recipes.archive(recipe_id, expected, idempotency_key=key)}
         if action in {"mark_cooked", "mark_not_cooked"}:
+            if request.get("slot_id") is not None:
+                return self._mark_slot(request)
+            snapshot = self.store.read()
+            current = snapshot.get("menu")
+            exact_record = snapshot.get("recipe_usage", {}).get(request.get("menu_id"), {})
+            if exact_record.get("slots") or (isinstance(current, Mapping) and current.get("slots") and (not request.get("menu_id") or request.get("menu_id") == current.get("menu_id"))):
+                raise HouseholdError("structured cooking requires exact menu revision and slot_id")
             week = validate_week(request.get("week"))
             recipe_identity = str(request.get("recipe_key") or "")
             if request.get("recipe_id"):
@@ -4260,6 +4273,180 @@ class Application:
                     self._store_usage_request(state, request_key, digest, result)
                 return result
         raise HouseholdError("unknown recipe action")
+
+    def _mark_slot(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        with self.store.locked() as state:
+            menu = state.get("menu")
+            if not isinstance(menu, Mapping) or request.get("menu_id") != menu.get("menu_id") or type(request.get("expected_revision")) is not int or request["expected_revision"] != menu["revision"]:
+                raise HouseholdError("cooking requires the exact current menu ID and revision")
+            slot = mp.slot_by_id(menu, request.get("slot_id"))
+            if request.get("recipe_key") not in {None, slot["recipe_key"]}:
+                raise HouseholdError("recipe_key does not match slot_id")
+            action = request["action"]
+            key = request.get("idempotency_key")
+            if key is not None and (not isinstance(key, str) or not 1 <= len(key) <= 200):
+                raise HouseholdError("idempotency_key must be bounded text")
+            signature = canonical({"menu": mp.menu_ref(menu), "slot_id": slot["slot_id"], "action": action})
+            if key and (existing := self._usage_request(state, key, signature)):
+                return existing
+            owner = menu.get("slot_owners", {}).get(slot["slot_id"], menu["menu_id"])
+            record = state["recipe_usage"].get(owner)
+            if not isinstance(record, dict) or slot not in record.get("slots", []):
+                raise HouseholdError("exact slot usage owner is unavailable")
+            cooked = action == "mark_cooked"
+            for field, value in (("cooked_slot_ids", slot["slot_id"]), ("cooked_keys", slot["recipe_key"]),
+                                 ("not_cooked_slot_ids", slot["slot_id"]), ("not_cooked_keys", slot["recipe_key"])):
+                values = record.setdefault(field, [])
+                wanted = cooked == field.startswith("cooked")
+                if wanted and value not in values:
+                    values.append(value)
+                if not wanted and value in values:
+                    values.remove(value)
+            result = {"menu_id": menu["menu_id"], "slot_id": slot["slot_id"], "recipe_key": slot["recipe_key"], "cooked": cooked}
+            if key:
+                self._store_usage_request(state, key, signature, result)
+            return result
+
+    @staticmethod
+    def _replan_state_digest(state: Mapping[str, Any]) -> str:
+        return mp.digest({key: state.get(key) for key in ("menu", "profile", "recipe_usage", "menu_planning")})
+
+    def _prepare_replan(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        state = self.store.read()
+        current = mp.exact_menu(state, request.get("menu_ref"))
+        slots = mp.slots(current)
+        today = self._household_today(state).isoformat()
+        if request.get("as_of_date") not in {None, today}:
+            raise HouseholdError("replan as_of_date changed; prepare again")
+        dates = request.get("remaining_dates")
+        if not isinstance(dates, list) or not 1 <= len(dates) <= 7 or any(not isinstance(day, str) for day in dates) or len(set(dates)) != len(dates):
+            raise HouseholdError("remaining_dates must be one to seven exact distinct slot dates")
+        by_date = {s["date"]: s for s in slots}
+        if len(by_date) != len(slots) or any(day not in by_date or day < today for day in dates):
+            raise HouseholdError("remaining_dates must name exact current slots on or after as_of_date")
+        stored_locks = state["menu_planning"]["locks"].get(mp.lock_key(current), [])
+        explicit = request.get("locked_slot_ids")
+        if explicit is None:
+            explicit = []
+        if not isinstance(explicit, list) or len(explicit) > 7 or any(not isinstance(v, str) for v in explicit) or len(set(explicit)) != len(explicit):
+            raise HouseholdError("locked_slot_ids must be exact distinct slot IDs")
+        for value in explicit:
+            mp.slot_by_id(current, value)
+        locks = sorted(set(stored_locks) | set(explicit))
+        historical = {s["slot_id"] for s in slots if s["date"] < today or mp.slot_outcome(state, current, s) == "cooked"}
+        replacing = [s for s in slots if s["date"] in dates and s["slot_id"] not in historical and s["slot_id"] not in locks]
+        if not replacing:
+            return {"status": "needs_input", "reason": "no requested unlocked future slots"}
+        carried = [s for s in slots if s not in replacing]
+        planning_state = deepcopy(state)
+        for slot in replacing:
+            owner = current.get("slot_owners", {}).get(slot["slot_id"], current["menu_id"])
+            planning_state["menu_planning"]["retired"].setdefault(owner, []).append(slot["recipe_key"])
+        planner_input = request.get("planner_input")
+        if not isinstance(planner_input, Mapping):
+            raise HouseholdError("replan requires bounded planner_input candidates")
+        planner_input = deepcopy(dict(planner_input))
+        if planner_input.get("week", current["week"]) != current["week"]:
+            raise HouseholdError("replan must remain in the exact source week")
+        replacement_dates = sorted(s["date"] for s in replacing)
+        if planner_input.get("dates", replacement_dates) != replacement_dates:
+            raise HouseholdError("planner dates must exactly match the unlocked remaining dates")
+        planner_input.update({"week": current["week"], "dates": replacement_dates, "as_of_date": today, "alternatives": 1})
+        effective = self._effective_planner_request(planner_input, planning_state, anchor_current_date=True)
+        candidates = self._resolve_planner_candidates(effective, planning_state)
+        carried_keys = {s["recipe_key"] for s in carried}
+        candidates = [c for c in candidates if c["recipe_key"] not in carried_keys]
+        if not candidates:
+            return {"status": "needs_input", "reason": "no distinct replacement candidates"}
+        effective["candidates"] = [{**c["reference"], "facts": c["supplied_facts"]} for c in candidates]
+        result = self._run_planner(effective, candidates, planning_state)
+        if result["status"] != "planned":
+            return {"status": "needs_input", "plan": result}
+        replacement = self._materialize_planner_menu(result["save_handoff"], candidates)
+        # Stable IDs are scoped to this exact predecessor; only carried slots keep IDs.
+        for slot in replacement["slots"]:
+            slot["slot_id"] = "slot_" + mp.digest({"source": mp.menu_ref(current), "replacement": slot})[:32]
+        successor = {"week": current["week"], "dishes": [], "salads": [],
+                     "slots": sorted(deepcopy(carried) + replacement["slots"], key=lambda s: (s["date"], s["meal_type"])),
+                     "historical_slot_ids": sorted(historical), "supersedes": mp.menu_ref(current),
+                     "replan_selection": deepcopy(result["save_handoff"])}
+        successor["slot_owners"] = {s["slot_id"]: current.get("slot_owners", {}).get(s["slot_id"], current["menu_id"]) for s in carried}
+        recipes = {r["recipe_key"]: r for r in current["dishes"] + current["salads"] + replacement["dishes"]}
+        successor["dishes"] = [deepcopy(recipes[s["recipe_key"]]) for s in successor["slots"]]
+        successor["schedule"] = [{"day": s["date"], "meal": recipes[s["recipe_key"]]["name"], "recipe_key": s["recipe_key"], "slot_id": s["slot_id"]} for s in successor["slots"]]
+        before = deepcopy(current)
+        before["historical_slot_ids"] = sorted(historical)
+        prepared = {"status": "prepared", "source": mp.menu_ref(current), "as_of_date": today,
+                    "remaining_dates": sorted(dates), "locked_slot_ids": sorted(explicit),
+                    "planner_input": planner_input, "state_digest": self._replan_state_digest(state),
+                    "successor": successor, "replaced_slot_ids": sorted(s["slot_id"] for s in replacing),
+                    "shopping_comparison": mp.shopping_comparison(before, successor)}
+        prepared["replan_digest"] = mp.digest(prepared)
+        if len(canonical(prepared).encode()) > MAX_MENU_BYTES or len(json.dumps({"ok": True, "result": {"replan": prepared}}, ensure_ascii=True).encode()) > MAX_REQUEST - 4096:
+            raise HouseholdError("replan exceeds bounded response size")
+        return prepared
+
+    def _replanning(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        action = request["action"]
+        if action == "lock":
+            desired = request.get("locked")
+            if not isinstance(desired, bool):
+                raise HouseholdError("locked must be an explicit desired boolean")
+            with self.store.locked() as state:
+                current = mp.exact_menu(state, request.get("menu_ref"))
+                slot = mp.slot_by_id(current, request.get("slot_id"))
+                usage = state["recipe_usage"].get(current["menu_id"], {})
+                if current.get("phase") == "ordered" or usage.get("status") == "ordered":
+                    raise HouseholdError("ordered/historical locks are immutable; pass exact preparation locks instead")
+                values = state["menu_planning"]["locks"].setdefault(mp.lock_key(current), [])
+                if desired and slot["slot_id"] not in values:
+                    values.append(slot["slot_id"])
+                    values.sort()
+                elif not desired and slot["slot_id"] in values:
+                    values.remove(slot["slot_id"])
+                return {"menu_ref": mp.menu_ref(current), "slot_id": slot["slot_id"], "locked": desired}
+        if action == "replan_prepare":
+            return {"replan": self._prepare_replan(request)}
+        supplied = request.get("replan")
+        if not isinstance(supplied, Mapping) or supplied.get("status") != "prepared" or supplied.get("replan_digest") != mp.digest({k: v for k, v in supplied.items() if k != "replan_digest"}):
+            raise HouseholdError("replan_apply requires the complete unchanged prepared replan")
+        state = self.store.read()
+        applied = state["menu_planning"]["applied"].get(supplied["replan_digest"])
+        if applied is not None:
+            return {"menu_ref": deepcopy(applied), "idempotent": True}
+        fresh = self._prepare_replan({"menu_ref": supplied["source"], "as_of_date": supplied["as_of_date"],
+            "remaining_dates": supplied["remaining_dates"], "locked_slot_ids": supplied["locked_slot_ids"], "planner_input": supplied["planner_input"]})
+        if canonical(fresh) != canonical(supplied):
+            raise HouseholdError("replan is stale or altered; prepare again")
+        with self.store.locked() as state:
+            if any(state.get(k) for k in ("pending_checkout", "pending_cancellation", "order_change")):
+                raise HouseholdError("reconcile pending protected operations before replan apply")
+            if self._household_today(state).isoformat() != supplied["as_of_date"] or self._replan_state_digest(state) != supplied["state_digest"]:
+                raise HouseholdError("replan date or state changed; prepare again")
+            planning = state["menu_planning"]
+            if any(len(v) >= mp.MAX_PLANNING_MENUS for v in planning.values()):
+                raise HouseholdError("planning history limit reached")
+            current = state["menu"]
+            successor = deepcopy(supplied["successor"])
+            successor.update({"menu_id": "menu_" + secrets.token_hex(12), "revision": 1, "phase": "draft"})
+            successor["digest"] = menu_digest(successor)
+            planning["history"][mp.lock_key(current)] = deepcopy(current)
+            for slot in current["slots"]:
+                if slot["slot_id"] in supplied["replaced_slot_ids"]:
+                    owner = current.get("slot_owners", {}).get(slot["slot_id"], current["menu_id"])
+                    values = planning["retired"].setdefault(owner, [])
+                    if slot["recipe_key"] not in values:
+                        values.append(slot["recipe_key"])
+            owned = [s for s in successor["slots"] if s["slot_id"] not in successor["slot_owners"]]
+            state["recipe_usage"][successor["menu_id"]] = {"week": successor["week"], "status": "planned",
+                "recipe_keys": [s["recipe_key"] for s in owned], "slots": deepcopy(owned),
+                "cooked_keys": [], "not_cooked_keys": [], "cooked_slot_ids": [], "not_cooked_slot_ids": [],
+                "cooldown_overrides": deepcopy(supplied["planner_input"].get("cooldown_overrides", {})), "order_id": None}
+            carried_locks = [s["slot_id"] for s in successor["slots"] if s["slot_id"] in set(planning["locks"].get(mp.lock_key(current), [])) | set(supplied["locked_slot_ids"])]
+            planning["locks"][mp.lock_key(successor)] = carried_locks
+            planning["applied"][supplied["replan_digest"]] = mp.menu_ref(successor)
+            state["menu"] = successor
+            return {"menu": deepcopy(successor), "shopping_comparison": deepcopy(supplied["shopping_comparison"])}
 
     def _materialize_menu(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, Mapping):
@@ -4604,6 +4791,11 @@ class Application:
             "salads": [],
             "schedule": schedule,
         })
+        menu["slots"] = [{
+            "slot_id": "slot_" + mp.digest({"selection": handoff["selection_digest"], "date": slot["date"]})[:32],
+            "date": slot["date"], "meal_type": "dinner", "recipe_key": slot["recipe_key"],
+            "reference": deepcopy(slot["reference"]), "snapshot_digest": mp.digest(recipe),
+        } for slot, recipe in zip(slots, menu["dishes"], strict=True)]
         menu["planner_selection"] = {
             "planner_version": handoff["planner_version"],
             "input_digest": handoff["input_digest"],
@@ -4633,7 +4825,12 @@ class Application:
     def _menu(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "get")
         if action == "get":
-            return {"menu": deepcopy(self.store.read().get("menu"))}
+            state = self.store.read()
+            current = state.get("menu")
+            return {"menu": deepcopy(current), "slot_replan_available": bool(current and current.get("slots")),
+                    "locks": deepcopy(state["menu_planning"]["locks"].get(mp.lock_key(current), [])) if current else []}
+        if action in {"lock", "replan_prepare", "replan_apply"}:
+            return self._replanning(request)
         if action == "plan":
             setup_gate = self._setup_gate(request)
             if setup_gate is not None:
@@ -4796,6 +4993,7 @@ class Application:
                         if matched_override(key) is not None
                     },
                     "order_id": None, "updated_at": now().isoformat(),
+                    "slots": deepcopy(menu.get("slots", [])), "cooked_slot_ids": [], "not_cooked_slot_ids": [],
                 }
                 return {"menu": deepcopy(menu)}
         raise HouseholdError("unknown menu action")
@@ -4901,7 +5099,7 @@ class Application:
         self, menu: Mapping[str, Any], *, deadline: float | None,
         search_cache: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, dict[str, Any]]:
-        requirements, _unresolved = exact_menu_requirements(menu)
+        requirements, _unresolved = exact_menu_requirements(mp.shopping_menu(menu))
         observations = {}
         cache = search_cache if search_cache is not None else {}
         for requirement in requirements:
@@ -5054,7 +5252,7 @@ class Application:
         return build_product_plan(
             provider=self.provider,
             binding=binding,
-            menu=menu,
+            menu=mp.shopping_menu(menu),
             observations=observations,
             candidate_approvals=candidate_approvals,
             hard_product_constraints=hard_constraints,
