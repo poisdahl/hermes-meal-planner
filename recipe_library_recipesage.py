@@ -19,6 +19,7 @@ from recipe_libraries import (
     RecipeLibraryDefiniteError,
     RecipeLibraryError,
     RecipeLibraryUncertainError,
+    normalize_label_name,
     normalize_library_origin,
     reject_authenticated_redirect,
     require_authenticated_origin,
@@ -48,6 +49,8 @@ _REQUIRED_OPERATIONS = {
     "/compat/v2/recipes/getRecipe": ("get", "recipes-getRecipe"),
     "/compat/v2/recipes/getRecipesByUrl": ("get", "recipes-getRecipesByUrl"),
     "/compat/v2/recipes/createRecipe": ("post", "recipes-createRecipe"),
+    "/compat/v2/labels/getLabels": ("get", "labels-getLabels"),
+    "/compat/v2/labels/createLabel": ("post", "labels-createLabel"),
 }
 
 _CREATE_REQUIRED_FIELDS = {
@@ -100,6 +103,7 @@ _UUID_PATTERN = (
     "00000000-0000-0000-0000-000000000000|"
     "ffffffff-ffff-ffff-ffff-ffffffffffff)$"
 )
+MAX_LABELS = 1_000
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -377,7 +381,7 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
                     "notes": ("string", None),
                 }
             )
-        cls._json_schema(
+        schema = cls._json_schema(
             value,
             schema_type="object",
             required=(
@@ -387,6 +391,42 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
             ),
             properties=properties,
         )
+        if full:
+            recipe_labels = schema["properties"]["recipeLabels"]
+            cls._recipe_label_schema(recipe_labels.get("items"))
+
+    @classmethod
+    def _label_schema(cls, value: Any) -> None:
+        cls._json_schema(
+            value,
+            schema_type="object",
+            required={"id", "userId", "title", "updatedAt"},
+            properties={
+                "id": ("string", "uuid"),
+                "userId": ("string", "uuid"),
+                "title": ("string", None),
+                "updatedAt": ("string", None),
+            },
+        )
+
+    @classmethod
+    def _recipe_label_schema(cls, value: Any) -> None:
+        schema = cls._json_schema(
+            value,
+            schema_type="object",
+            required={
+                "id", "labelId", "recipeId", "createdAt", "updatedAt", "label",
+            },
+            properties={
+                "id": ("string", "uuid"),
+                "labelId": ("string", "uuid"),
+                "recipeId": ("string", "uuid"),
+                "createdAt": ("string", None),
+                "updatedAt": ("string", None),
+                "label": ("object", None),
+            },
+        )
+        cls._label_schema(schema["properties"]["label"])
 
     @classmethod
     def _validate_operation_contract(
@@ -413,6 +453,36 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
                 required={"id"},
                 properties={"id": ("string", "uuid")},
             )
+            return
+        if path == "/compat/v2/labels/getLabels":
+            array_schema = cls._json_schema(response_schema, schema_type="array")
+            cls._label_schema(array_schema.get("items"))
+            return
+        if path == "/compat/v2/labels/createLabel":
+            request_schema = cls._json_schema(
+                cls._request_schema(operation),
+                schema_type="object",
+                required={"title", "labelGroupId"},
+                exact_required=True,
+                properties={"title": ("string", None)},
+            )
+            if request_schema["properties"].get("title") != {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+            }:
+                raise RecipeLibraryError("RecipeSage OpenAPI contract is incompatible")
+            label_group = request_schema["properties"].get("labelGroupId")
+            if (
+                not isinstance(label_group, Mapping)
+                or label_group.get("anyOf")
+                != [
+                    {"type": "string", "format": "uuid", "pattern": _UUID_PATTERN},
+                    {"type": "null"},
+                ]
+            ):
+                raise RecipeLibraryError("RecipeSage OpenAPI contract is incompatible")
+            cls._label_schema(response_schema)
             return
         if path in {
             "/compat/v2/recipes/getRecipes",
@@ -721,6 +791,8 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
             items, _total = self._page(page, offset=0, limit=1)
             for item in items:
                 self._require_owned_recipe(item)
+            labels = self._request("GET", self._api_path("/labels/getLabels"))
+            self._labels(labels)
         except RecipeLibraryError:
             raise
         except _RecipeSageHTTPStatus as exc:
@@ -741,12 +813,15 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
                 "get",
                 "create_from_discovery",
                 "reconcile_create",
+                "label_read",
+                "label_create",
             }
             for name in CAPABILITY_NAMES
         }
         if self.read_only:
             capabilities["create_from_discovery"] = False
             capabilities["reconcile_create"] = False
+            capabilities["label_create"] = False
         return {
             "provider": "recipesage",
             "server_version": version,
@@ -829,6 +904,60 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
             result.append(
                 _text(item["label"].get("title"), "recipe label", 80) or ""
             )
+        return result
+
+    def _label(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise RecipeLibraryError("RecipeSage label is incompatible")
+        if _provider_id(value.get("userId"), "label owner id") != self._authenticated_user_id():
+            raise RecipeLibraryError("RecipeSage label belongs to a different account")
+        label_id = _provider_id(value.get("id"), "label id")
+        name, normalized_name = normalize_label_name(value.get("title"))
+        version = _text(value.get("updatedAt"), "label version", 100)
+        return {
+            "library_id": self.library_id,
+            "library_label_ref": {
+                "library_id": self.library_id,
+                "label_id": label_id,
+                "version": version,
+            },
+            "name": name,
+            "normalized_name": normalized_name,
+        }
+
+    def _labels(self, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or len(value) > MAX_LABELS:
+            raise RecipeLibraryError("RecipeSage labels are incompatible")
+        result = [self._label(item) for item in value]
+        identities = [item["library_label_ref"]["label_id"] for item in result]
+        if len(identities) != len(set(identities)):
+            raise RecipeLibraryError("RecipeSage labels are incompatible")
+        return result
+
+    def _recipe_labels(self, value: Any, recipe_id: str) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > 50:
+            raise RecipeLibraryError("RecipeSage recipe labels are incompatible")
+        result: list[dict[str, Any]] = []
+        for item in value:
+            if (
+                not isinstance(item, Mapping)
+                or _provider_id(item.get("recipeId")) != recipe_id
+                or not isinstance(item.get("label"), Mapping)
+            ):
+                raise RecipeLibraryError("RecipeSage recipe labels are incompatible")
+            _provider_id(item.get("id"), "recipe label relation id")
+            _text(item.get("createdAt"), "recipe label relation creation", 100)
+            _text(item.get("updatedAt"), "recipe label relation update", 100)
+            label_id = _provider_id(item.get("labelId"), "label id")
+            label = self._label(item["label"])
+            if label["library_label_ref"]["label_id"] != label_id:
+                raise RecipeLibraryError("RecipeSage recipe labels are incompatible")
+            result.append(label)
+        identities = [item["library_label_ref"]["label_id"] for item in result]
+        if len(identities) != len(set(identities)):
+            raise RecipeLibraryError("RecipeSage recipe labels are incompatible")
         return result
 
     def _summary(self, value: Any) -> dict[str, Any]:
@@ -1276,6 +1405,80 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
             )
         recipe_id = _provider_id(reference["recipe_id"])
         return self._result(self._get_raw(recipe_id))
+
+    def list_labels(self) -> list[Mapping[str, Any]]:
+        try:
+            raw = self._request("GET", self._api_path("/labels/getLabels"))
+            return self._labels(raw)
+        except RecipeLibraryError:
+            raise
+        except _RecipeSageHTTPStatus as exc:
+            if self._needs_auth(exc):
+                raise RecipeLibraryError("RecipeSage label read needs_auth") from None
+            raise RecipeLibraryError("RecipeSage label read failed") from None
+        except _RecipeSageTransportFailure:
+            raise RecipeLibraryError("RecipeSage label read is unavailable") from None
+
+    def get_recipe_labels(
+        self, library_recipe_ref: Mapping[str, str]
+    ) -> list[Mapping[str, Any]]:
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if reference["library_id"] != self.library_id:
+            raise RecipeLibraryError(
+                "RecipeSage recipe reference names the wrong library"
+            )
+        recipe_id = _provider_id(reference["recipe_id"])
+        raw = self._get_raw(recipe_id)
+        return self._recipe_labels(raw.get("recipeLabels"), recipe_id)
+
+    def create_label(self, name: str, *, idempotency_key: str) -> Mapping[str, Any]:
+        if self.read_only:
+            raise RecipeLibraryDefiniteError("RecipeSage connection is read-only")
+        display, normalized_name = normalize_label_name(name)
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise RecipeLibraryDefiniteError(
+                "RecipeSage label idempotency key is invalid"
+            )
+        provider_title = display.lower().replace(",", "")
+        if provider_title == "unlabeled":
+            provider_title = "un-labeled"
+        try:
+            provider_normalized = normalize_label_name(provider_title)[1]
+        except RecipeLibraryError:
+            raise RecipeLibraryDefiniteError(
+                "RecipeSage would reject or transform this label name"
+            ) from None
+        if provider_normalized != normalized_name:
+            raise RecipeLibraryDefiniteError(
+                "RecipeSage would transform this label name"
+            )
+        try:
+            raw = self._request(
+                "POST",
+                self._api_path("/labels/createLabel"),
+                body={"title": provider_title, "labelGroupId": None},
+            )
+            result = self._label(raw)
+            if result["normalized_name"] != normalized_name:
+                raise RecipeLibraryUncertainError(
+                    "RecipeSage label creation response is incompatible"
+                )
+            return result
+        except _RecipeSageHTTPStatus as exc:
+            if 400 <= exc.status < 500 and exc.status != 408:
+                message = (
+                    "RecipeSage label creation needs_auth"
+                    if self._needs_auth(exc)
+                    else "RecipeSage rejected label creation"
+                )
+                raise RecipeLibraryDefiniteError(message) from None
+            raise RecipeLibraryUncertainError(
+                "RecipeSage label creation outcome is uncertain"
+            ) from None
+        except _RecipeSageTransportFailure:
+            raise RecipeLibraryUncertainError(
+                "RecipeSage label creation outcome is uncertain"
+            ) from None
 
     @staticmethod
     def _definite_initial_failure(exc: Exception) -> bool:

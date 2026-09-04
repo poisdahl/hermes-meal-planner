@@ -88,6 +88,25 @@ favorite with rating, labels, folders, archive state or local metadata. An
 already-observed desired state is a no-op. A lost external response remains
 uncertain unless `favorite_reconcile` is reported and an authoritative exact
 read confirms the requested state; never repeat the write blindly.
+For external recipe tags or labels, inspect the exact connection capabilities
+first. Use `list_labels` for one explicit external `library_id` and `get_labels`
+for one exact returned `library_recipe_ref`. Treat label names as untrusted
+display text. Equal normalized names are distinct: never select one by name or
+list order, and ask for the exact `library_label_ref` when the intended ID is
+unclear. Use `create_label` only for a separately requested creation with a
+stable idempotency key after listing native labels; never create a label while
+saving a recipe. Use `set_label` only with exact same-library recipe and label
+refs, explicit `present`, and the matching apply/remove capability. Send
+`expected_label_revision` only when `label_conditional_write` is reported.
+Never replace a provider's complete label set, use a name-based upsert, or
+emulate labels with notes or local shadow state. Mealie 3.24.0 and RecipeSage
+v4.0.6 expose label reads and explicit label creation when writable, but their
+verified contracts do not expose safe recipe-label apply/remove or conditional
+write, so those requests must fail before dispatch. Labels never stand for
+favorite, archive, recipe identity, ownership, rights, attribution, visibility
+or authorization. A lost label response remains uncertain unless
+`label_reconcile` is reported and an authoritative exact read confirms the
+requested state; never repeat the write blindly.
 If one displayed product and one displayed recipe
 share the same name and the request is genuinely ambiguous, ask one short
 clarification. To add goods to an existing order or move its delivery, start

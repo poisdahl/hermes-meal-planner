@@ -59,12 +59,16 @@ from recipe_libraries import (
     RecipeLibraryError,
     RecipeLibraryExternalMissingError,
     RecipeLibraryFavoriteConflictError,
+    RecipeLibraryLabelConflictError,
+    RecipeLibraryUncertainError,
     library_recipe_key,
     library_recipe_key_aliases,
     load_library_secret,
     load_optional_adapter,
     normalize_library_configuration,
+    normalize_label_name,
     validate_library_id,
+    validate_library_label_ref,
     validate_library_recipe_ref,
     verified_capabilities,
     secret_path,
@@ -786,6 +790,8 @@ class Application:
         self.recipe_library_adapters = dict(recipe_library_adapters or {})
         self.recipe_favorite_locks: dict[tuple[str, str], threading.Lock] = {}
         self.recipe_favorite_locks_guard = threading.Lock()
+        self.recipe_label_locks: dict[tuple[str, str], threading.Lock] = {}
+        self.recipe_label_locks_guard = threading.Lock()
         self.oda = provider_client
         self.provider = str(store.config.get("provider") or "oda").casefold()
         self.email_provider_clients = {**dict(email_provider_clients or {}), self.provider: provider_client}
@@ -2033,6 +2039,595 @@ class Application:
             )
             return self._favorite_operation_response(confirmed)
 
+    def _normalize_external_label(
+        self, value: Any, library_id: str
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) - {
+            "library_id",
+            "library_label_ref",
+            "name",
+            "normalized_name",
+        }:
+            raise RecipeLibraryError("recipe library label returned invalid data")
+        reference = validate_library_label_ref(value.get("library_label_ref"))
+        name, normalized_name = normalize_label_name(value.get("name"))
+        if (
+            reference["library_id"] != library_id
+            or value.get("library_id") != library_id
+            or value.get("normalized_name") != normalized_name
+        ):
+            raise RecipeLibraryError("recipe library label returned the wrong identity")
+        return {
+            "library_id": library_id,
+            "library_label_ref": reference,
+            "name": name,
+            "normalized_name": normalized_name,
+        }
+
+    def _read_external_labels(
+        self, adapter: RecipeLibraryAdapter, library_id: str
+    ) -> list[dict[str, Any]]:
+        raw = adapter.list_labels()
+        if not isinstance(raw, list) or len(raw) > 1_000:
+            raise RecipeLibraryError("recipe library label list returned invalid data")
+        labels = [self._normalize_external_label(item, library_id) for item in raw]
+        ids = [item["library_label_ref"]["label_id"] for item in labels]
+        if len(ids) != len(set(ids)):
+            raise RecipeLibraryError("recipe library label list returned duplicate identities")
+        return labels
+
+    def _read_external_recipe_labels(
+        self,
+        adapter: RecipeLibraryAdapter,
+        reference: Mapping[str, str],
+    ) -> list[dict[str, Any]]:
+        raw = adapter.get_recipe_labels(deepcopy(dict(reference)))
+        if not isinstance(raw, list) or len(raw) > 1_000:
+            raise RecipeLibraryError("recipe library recipe labels returned invalid data")
+        labels = [
+            self._normalize_external_label(item, reference["library_id"])
+            for item in raw
+        ]
+        ids = [item["library_label_ref"]["label_id"] for item in labels]
+        if len(ids) != len(set(ids)):
+            raise RecipeLibraryError(
+                "recipe library recipe labels returned duplicate identities"
+            )
+        return labels
+
+    def _recipe_label_lock(self, library_id: str, target: str) -> threading.Lock:
+        key = (library_id, target)
+        with self.recipe_label_locks_guard:
+            return self.recipe_label_locks.setdefault(key, threading.Lock())
+
+    @staticmethod
+    def _label_operation_response(operation: Mapping[str, Any]) -> dict[str, Any]:
+        result = {
+            "library_id": operation.get("library_id"),
+            "status": operation.get("status"),
+            "operation_id": operation.get("operation_id"),
+            "action": operation.get("action"),
+        }
+        if operation.get("library_recipe_ref") is not None:
+            result["library_recipe_ref"] = deepcopy(operation["library_recipe_ref"])
+        if operation.get("library_label_ref") is not None:
+            result["library_label_ref"] = deepcopy(operation["library_label_ref"])
+        if operation.get("result") is not None:
+            result.update(deepcopy(operation["result"]))
+        if operation.get("error_code") is not None:
+            result["error_code"] = operation["error_code"]
+        if operation.get("error") is not None:
+            result["error"] = operation["error"]
+        return result
+
+    @staticmethod
+    def _label_result(
+        label: Mapping[str, Any],
+        *,
+        recipe_ref: Mapping[str, str] | None = None,
+        present: bool | None = None,
+        idempotent: bool = False,
+        reconciled: bool = False,
+    ) -> dict[str, Any]:
+        result = deepcopy(dict(label))
+        if recipe_ref is not None:
+            result["library_recipe_ref"] = deepcopy(dict(recipe_ref))
+        if present is not None:
+            result["present"] = present
+        if idempotent:
+            result["idempotent"] = True
+        if reconciled:
+            result["reconciled"] = True
+        return result
+
+    def _reconcile_external_label_change(
+        self,
+        operation: Mapping[str, Any],
+        adapter: RecipeLibraryAdapter,
+        label: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            attached = self._read_external_recipe_labels(
+                adapter, operation["library_recipe_ref"]
+            )
+        except RecipeLibraryExternalMissingError:
+            failed = self.recipes.finish_library_label(
+                operation["operation_id"],
+                "failed",
+                error_code="external_missing",
+                error="the exact external recipe is missing",
+            )
+            return self._label_operation_response(failed)
+        except Exception as exc:
+            response = self._label_operation_response(operation)
+            response["error"] = (
+                "recipe library needs_auth before label reconciliation"
+                if self._library_needs_auth(exc)
+                else "native label state is unavailable for reconciliation"
+            )
+            return response
+        present = any(
+            item["library_label_ref"]["label_id"]
+            == label["library_label_ref"]["label_id"]
+            for item in attached
+        )
+        desired = operation["action"] == "apply"
+        if present != desired:
+            return self._label_operation_response(operation)
+        confirmed = self.recipes.finish_library_label(
+            operation["operation_id"],
+            "confirmed",
+            result=self._label_result(
+                label,
+                recipe_ref=operation["library_recipe_ref"],
+                present=desired,
+                reconciled=True,
+            ),
+        )
+        return self._label_operation_response(confirmed)
+
+    def _set_external_label(
+        self,
+        recipe_reference: Any,
+        label_reference: Any,
+        present: Any,
+        *,
+        expected_label_revision: Any,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        recipe_ref = validate_library_recipe_ref(recipe_reference)
+        label_ref = validate_library_label_ref(label_reference)
+        library_id = recipe_ref["library_id"]
+        if (
+            library_id == "builtin"
+            or label_ref["library_id"] != library_id
+            or library_id not in self.recipe_libraries
+        ):
+            raise RecipeLibraryError(
+                "label operation requires exact refs from one configured external library"
+            )
+        with self._recipe_label_lock(library_id, recipe_ref["recipe_id"]):
+            if not self._recipe_operations_recovered:
+                self.recipes.recover_library_operations()
+                self._recipe_operations_recovered = True
+            operation = self.recipes.begin_library_label_change(
+                recipe_ref,
+                label_ref,
+                present,
+                expected_label_revision=expected_label_revision,
+                idempotency_key=idempotency_key,
+            )
+            if operation["status"] in {"confirmed", "failed"}:
+                return self._label_operation_response(operation)
+            adapter = self.recipe_library_adapters.get(library_id)
+            if adapter is None:
+                if operation["status"] == "uncertain":
+                    response = self._label_operation_response(operation)
+                    response.update({
+                        "error_code": "adapter_unavailable",
+                        "error": "optional recipe library is unavailable for label reconciliation",
+                    })
+                    return response
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="unsupported",
+                    error="optional recipe library adapter is not installed",
+                )
+                return self._label_operation_response(failed)
+            try:
+                capabilities = self._library_capabilities(library_id)
+            except Exception as exc:
+                if operation["status"] == "uncertain":
+                    response = self._label_operation_response(operation)
+                    response.update({
+                        "error_code": "needs_auth" if self._library_needs_auth(exc) else "unavailable",
+                        "error": (
+                            "recipe library needs_auth before label reconciliation"
+                            if self._library_needs_auth(exc)
+                            else "optional recipe library is unavailable for label reconciliation"
+                        ),
+                    })
+                    return response
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="needs_auth" if self._library_needs_auth(exc) else "unavailable",
+                    error=(
+                        "recipe library needs_auth before label dispatch"
+                        if self._library_needs_auth(exc)
+                        else "optional recipe library is unavailable before label dispatch"
+                    ),
+                )
+                return self._label_operation_response(failed)
+            if operation["status"] == "uncertain":
+                if not capabilities["label_reconcile"]:
+                    return self._label_operation_response(operation)
+                try:
+                    matches = [
+                        item
+                        for item in self._read_external_labels(adapter, library_id)
+                        if item["library_label_ref"]["label_id"] == label_ref["label_id"]
+                    ]
+                    if len(matches) != 1:
+                        return self._label_operation_response(operation)
+                    return self._reconcile_external_label_change(
+                        operation, adapter, matches[0]
+                    )
+                except Exception as exc:
+                    response = self._label_operation_response(operation)
+                    if self._library_needs_auth(exc):
+                        response.update({
+                            "error_code": "needs_auth",
+                            "error": "recipe library needs_auth before label reconciliation",
+                        })
+                    return response
+            capability = "label_apply_existing" if present is True else "label_remove"
+            if not capabilities["label_read"] or not capabilities[capability]:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="unsupported",
+                    error="this recipe library does not support native desired-state label mutation",
+                )
+                return self._label_operation_response(failed)
+            if (
+                operation.get("expected_label_revision") is not None
+                and not capabilities["label_conditional_write"]
+            ):
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="unsupported_conditional",
+                    error="this recipe library does not support conditional label mutation",
+                )
+                return self._label_operation_response(failed)
+            try:
+                library_labels = self._read_external_labels(adapter, library_id)
+                matches = [
+                    item
+                    for item in library_labels
+                    if item["library_label_ref"]["label_id"] == label_ref["label_id"]
+                ]
+                if len(matches) != 1:
+                    raise RecipeLibraryExternalMissingError(
+                        "the exact provider label is missing"
+                    )
+                label = matches[0]
+                attached = self._read_external_recipe_labels(adapter, recipe_ref)
+            except RecipeLibraryExternalMissingError:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="external_missing",
+                    error="the exact external recipe or label is missing",
+                )
+                return self._label_operation_response(failed)
+            except Exception as exc:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="needs_auth" if self._library_needs_auth(exc) else "unavailable",
+                    error=(
+                        "recipe library needs_auth before label dispatch"
+                        if self._library_needs_auth(exc)
+                        else "native label state is unavailable before dispatch"
+                    ),
+                )
+                return self._label_operation_response(failed)
+            current = next(
+                (
+                    item
+                    for item in attached
+                    if item["library_label_ref"]["label_id"] == label_ref["label_id"]
+                ),
+                None,
+            )
+            if operation.get("expected_label_revision") is not None:
+                if (
+                    current is None
+                    or current["library_label_ref"].get("version")
+                    != operation["expected_label_revision"]
+                ):
+                    failed = self.recipes.finish_library_label(
+                        operation["operation_id"],
+                        "failed",
+                        error_code="label_conflict",
+                        error="label revision conflict",
+                    )
+                    return self._label_operation_response(failed)
+            if (current is not None) == (present is True):
+                confirmed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "confirmed",
+                    result=self._label_result(
+                        current or label,
+                        recipe_ref=recipe_ref,
+                        present=present is True,
+                        idempotent=True,
+                    ),
+                )
+                return self._label_operation_response(confirmed)
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            if not claimed.get("claimed"):
+                return self._label_operation_response(claimed)
+            try:
+                adapter.set_label(
+                    deepcopy(recipe_ref),
+                    deepcopy(label_ref),
+                    present is True,
+                    expected_label_revision=operation.get("expected_label_revision"),
+                )
+            except RecipeLibraryLabelConflictError:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="label_conflict",
+                    error="label revision conflict",
+                )
+                return self._label_operation_response(failed)
+            except RecipeLibraryExternalMissingError:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="external_missing",
+                    error="the exact external recipe or label is missing",
+                )
+                return self._label_operation_response(failed)
+            except RecipeLibraryDefiniteError as exc:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="needs_auth" if self._library_needs_auth(exc) else "provider_rejected",
+                    error=(
+                        "recipe library label mutation needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "recipe library definitely rejected label mutation"
+                    ),
+                )
+                return self._label_operation_response(failed)
+            except Exception:
+                uncertain = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "uncertain",
+                    error_code="provider_uncertain",
+                    error="recipe library label mutation may have been dispatched; do not retry",
+                )
+                if capabilities["label_reconcile"]:
+                    return self._reconcile_external_label_change(
+                        uncertain, adapter, label
+                    )
+                return self._label_operation_response(uncertain)
+            try:
+                attached = self._read_external_recipe_labels(adapter, recipe_ref)
+            except Exception:
+                uncertain = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "uncertain",
+                    error_code="provider_uncertain",
+                    error="label write was sent but native readback is unavailable",
+                )
+                return self._label_operation_response(uncertain)
+            desired = present is True
+            confirmed_present = any(
+                item["library_label_ref"]["label_id"] == label_ref["label_id"]
+                for item in attached
+            )
+            if confirmed_present != desired:
+                uncertain = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "uncertain",
+                    error_code="provider_uncertain",
+                    error="label write was sent but native readback did not confirm it",
+                )
+                return self._label_operation_response(uncertain)
+            confirmed_label = next(
+                (
+                    item
+                    for item in attached
+                    if item["library_label_ref"]["label_id"] == label_ref["label_id"]
+                ),
+                label,
+            )
+            confirmed = self.recipes.finish_library_label(
+                operation["operation_id"],
+                "confirmed",
+                result=self._label_result(
+                    confirmed_label,
+                    recipe_ref=recipe_ref,
+                    present=desired,
+                ),
+            )
+            return self._label_operation_response(confirmed)
+
+    def _create_external_label(
+        self, library_id: Any, name: Any, *, idempotency_key: Any
+    ) -> dict[str, Any]:
+        library = validate_library_id(library_id, allow_builtin=False)
+        if library not in self.recipe_libraries:
+            raise RecipeLibraryError(
+                "library_id must name one exact configured external recipe library"
+            )
+        display, normalized_name = normalize_label_name(name)
+        with self._recipe_label_lock(library, f"create:{normalized_name}"):
+            if not self._recipe_operations_recovered:
+                self.recipes.recover_library_operations()
+                self._recipe_operations_recovered = True
+            operation = self.recipes.begin_library_label_create(
+                library,
+                display,
+                idempotency_key=idempotency_key,
+            )
+            if operation["status"] in {"confirmed", "failed"}:
+                return self._label_operation_response(operation)
+            adapter = self.recipe_library_adapters.get(library)
+            if adapter is None:
+                if operation["status"] == "uncertain":
+                    response = self._label_operation_response(operation)
+                    response.update({
+                        "error_code": "adapter_unavailable",
+                        "error": "optional recipe library is unavailable for label reconciliation",
+                    })
+                    return response
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="unsupported",
+                    error="optional recipe library adapter is not installed",
+                )
+                return self._label_operation_response(failed)
+            try:
+                capabilities = self._library_capabilities(library)
+            except Exception as exc:
+                if operation["status"] == "uncertain":
+                    response = self._label_operation_response(operation)
+                    response.update({
+                        "error_code": "needs_auth" if self._library_needs_auth(exc) else "unavailable",
+                        "error": (
+                            "recipe library needs_auth before label reconciliation"
+                            if self._library_needs_auth(exc)
+                            else "optional recipe library is unavailable for label reconciliation"
+                        ),
+                    })
+                    return response
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="needs_auth" if self._library_needs_auth(exc) else "unavailable",
+                    error=(
+                        "recipe library needs_auth before label creation"
+                        if self._library_needs_auth(exc)
+                        else "optional recipe library is unavailable before label creation"
+                    ),
+                )
+                return self._label_operation_response(failed)
+            if operation["status"] == "uncertain":
+                if not capabilities["label_reconcile"]:
+                    return self._label_operation_response(operation)
+                try:
+                    raw = adapter.reconcile_label_create(
+                        display, self._outbound_library_operation(operation)
+                    )
+                    if raw is None:
+                        return self._label_operation_response(operation)
+                    label = self._normalize_external_label(raw, library)
+                    if label["normalized_name"] != normalized_name:
+                        return self._label_operation_response(operation)
+                    confirmed = self.recipes.finish_library_label(
+                        operation["operation_id"],
+                        "confirmed",
+                        result=self._label_result(label, reconciled=True),
+                    )
+                    return self._label_operation_response(confirmed)
+                except Exception as exc:
+                    response = self._label_operation_response(operation)
+                    if self._library_needs_auth(exc):
+                        response.update({
+                            "error_code": "needs_auth",
+                            "error": "recipe library needs_auth before label reconciliation",
+                        })
+                    return response
+            if not capabilities["label_read"] or not capabilities["label_create"]:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="unsupported",
+                    error="this recipe library does not support explicit native label creation",
+                )
+                return self._label_operation_response(failed)
+            try:
+                labels = self._read_external_labels(adapter, library)
+            except Exception as exc:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="needs_auth" if self._library_needs_auth(exc) else "unavailable",
+                    error=(
+                        "recipe library needs_auth before label creation"
+                        if self._library_needs_auth(exc)
+                        else "label identities are unavailable before creation"
+                    ),
+                )
+                return self._label_operation_response(failed)
+            if any(item["normalized_name"] == normalized_name for item in labels):
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="label_name_conflict",
+                    error="an equal normalized label name already exists; use its exact label ID",
+                )
+                return self._label_operation_response(failed)
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            if not claimed.get("claimed"):
+                return self._label_operation_response(claimed)
+            try:
+                raw = adapter.create_label(display, idempotency_key=operation["idempotency_key"])
+                label = self._normalize_external_label(raw, library)
+                if label["normalized_name"] != normalized_name:
+                    raise RecipeLibraryUncertainError(
+                        "provider returned a different label identity"
+                    )
+            except RecipeLibraryDefiniteError as exc:
+                failed = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "failed",
+                    error_code="needs_auth" if self._library_needs_auth(exc) else "provider_rejected",
+                    error=(
+                        "recipe library label creation needs_auth"
+                        if self._library_needs_auth(exc)
+                        else "recipe library definitely rejected label creation"
+                    ),
+                )
+                return self._label_operation_response(failed)
+            except Exception:
+                uncertain = self.recipes.finish_library_label(
+                    operation["operation_id"],
+                    "uncertain",
+                    error_code="provider_uncertain",
+                    error="recipe library label creation may have been dispatched; do not retry",
+                )
+                if capabilities["label_reconcile"]:
+                    try:
+                        raw = adapter.reconcile_label_create(
+                            display, self._outbound_library_operation(uncertain)
+                        )
+                        if raw is not None:
+                            label = self._normalize_external_label(raw, library)
+                            if label["normalized_name"] == normalized_name:
+                                confirmed = self.recipes.finish_library_label(
+                                    operation["operation_id"],
+                                    "confirmed",
+                                    result=self._label_result(label, reconciled=True),
+                                )
+                                return self._label_operation_response(confirmed)
+                    except Exception:
+                        pass
+                return self._label_operation_response(uncertain)
+            confirmed = self.recipes.finish_library_label(
+                operation["operation_id"], "confirmed", result=label
+            )
+            return self._label_operation_response(confirmed)
+
     def _save_discovery_to_library(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not self._recipe_operations_recovered:
             self.recipes.recover_library_operations()
@@ -2518,6 +3113,73 @@ class Application:
             if request.get("week"):
                 result["usage"] = self._usage_summary(self.store.read(), result["recipe_key"], validate_week(request["week"]))
             return {"recipe": result}
+        if action == "list_labels":
+            if request.get("library_id") is None:
+                raise RecipeLibraryError(
+                    "list_labels requires one exact external library_id"
+                )
+            library_id = validate_library_id(
+                request.get("library_id"), allow_builtin=False
+            )
+            if library_id not in self.recipe_libraries:
+                raise RecipeLibraryError(
+                    "library_id must name one exact configured external recipe library"
+                )
+            capabilities = self._library_capabilities(library_id)
+            if not capabilities["label_read"]:
+                raise RecipeLibraryError(
+                    "this recipe library does not support native label reads"
+                )
+            labels = self._read_external_labels(
+                self.recipe_library_adapters[library_id], library_id
+            )
+            return {"library_id": library_id, "labels": labels}
+        if action == "get_labels":
+            reference = validate_library_recipe_ref(
+                request.get("library_recipe_ref")
+            )
+            if request.get("library_id") is not None:
+                raise RecipeLibraryError(
+                    "get_labels requires only one exact library_recipe_ref identity"
+                )
+            if (
+                reference["library_id"] == "builtin"
+                or reference["library_id"] not in self.recipe_libraries
+            ):
+                raise RecipeLibraryError(
+                    "get_labels requires one configured external library_recipe_ref"
+                )
+            capabilities = self._library_capabilities(reference["library_id"])
+            if not capabilities["label_read"]:
+                raise RecipeLibraryError(
+                    "this recipe library does not support native label reads"
+                )
+            labels = self._read_external_recipe_labels(
+                self.recipe_library_adapters[reference["library_id"]], reference
+            )
+            return {
+                "library_id": reference["library_id"],
+                "library_recipe_ref": reference,
+                "labels": labels,
+            }
+        if action == "set_label":
+            if request.get("library_id") is not None:
+                raise RecipeLibraryError(
+                    "set_label requires exact recipe and label refs, not library_id"
+                )
+            return self._set_external_label(
+                request.get("library_recipe_ref"),
+                request.get("library_label_ref"),
+                request.get("present"),
+                expected_label_revision=request.get("expected_label_revision"),
+                idempotency_key=request.get("idempotency_key"),
+            )
+        if action == "create_label":
+            return self._create_external_label(
+                request.get("library_id"),
+                request.get("label_name"),
+                idempotency_key=request.get("idempotency_key"),
+            )
         if action == "set_favorite":
             reference = validate_library_recipe_ref(request.get("library_recipe_ref"))
             if request.get("recipe_id") is not None:

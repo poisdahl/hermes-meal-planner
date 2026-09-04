@@ -393,9 +393,11 @@ For Mealie, enter exactly `{"token":"<long-lived Mealie API token>"}` at the
 hidden credential prompt. The adapter supports Mealie `3.24.0` and newer when
 the probed response schemas remain compatible. Its read-only connection test
 checks `/api/app/about`, authenticated `/api/users/self`, one bounded recipe
-list page and the favorite-read response shape. It reports `search`, `get`,
-`create_from_discovery`, `reconcile_create`, `favorite_read`,
-`favorite_write_desired_state` and `favorite_reconcile`. Native favorite writes
+list page, the favorite-read response shape and one bounded organizer-tag page.
+It reports `search`, `get`, `create_from_discovery`, `reconcile_create`,
+`favorite_read`, `favorite_write_desired_state`, `favorite_reconcile`,
+`label_read` and, when the authenticated user may organize and the connection
+is writable, `label_create`. Native favorite writes
 use Mealie's exact recipe UUID add/remove routes, then read the exact native
 state back. Mealie exposes no ETag or favorite revision for these routes, so
 `favorite_conditional_write` is false and `expected_favorite_revision` is
@@ -409,8 +411,9 @@ namespaced `library_recipe_ref`; the current slug is display-only
 is the version token when Mealie supplies it. Saving uses only the already
 frozen discovery document. The create flow installs native Mealie fields plus a
 deterministic attribution block and private `hermes_origin`/`hermes_recipe`
-extras. Frozen tags stay in `hermes_recipe`; the first version does not mutate
-Mealie's shared tag organizer. `link_only` sends only the title, original HTTPS source link,
+extras. Frozen discovery tags stay in `hermes_recipe`; saving a recipe never
+creates or changes Mealie organizer tags. Organizer tags are exposed separately
+through exact label operations described below. `link_only` sends only the title, original HTTPS source link,
 attribution/rights metadata and operation metadata—never ingredients, steps or
 notes. A definite rejection before Mealie creates anything is failed. Any lost
 response or failure after possible creation is uncertain, is never retried or
@@ -458,11 +461,13 @@ newer. The self-host build reports `selfhost` rather than its application
 version, so support additionally requires the same exact selected request and
 response schema fingerprint, not merely matching operation names, plus
 successful semantic read probes. Connection testing reads the OpenAPI
-version, validates the bearer session, reads the authenticated-user shape and
-lists at most one private recipe. It reports only `search`, `get`,
-`create_from_discovery` and `reconcile_create`; a configured `read_only`
-connection retains search/get, suppresses create/reconcile and cannot be the
-writable primary. RecipeSage rating is not treated as a favorite. Native
+version, validates the bearer session, reads the authenticated-user shape,
+lists at most one private recipe and validates the authenticated label-list
+shape. It reports `search`, `get`, `create_from_discovery`, `reconcile_create`,
+`label_read` and, for a writable connection, `label_create`; a configured
+`read_only` connection retains search/get and label reads, suppresses creates
+and reconciliation, and cannot be the writable primary. RecipeSage rating is
+not treated as a favorite. Native
 favorite read, desired-state mutation, conditional favorite write and favorite
 reconciliation are all false for the verified v4.0.6 hosted contract. Rating,
 labels, folders and local shadow metadata are never used to emulate that
@@ -480,9 +485,9 @@ the UUID. Saving sends one already frozen discovery document directly to
 Discover. Native recipe fields carry the permitted content and deterministic
 attribution. A versioned block at the start of the private recipe notes carries
 the unguessable operation ID, exact `library_id`, snapshot digest, normalized
-source identity and frozen document needed for semantic readback. Frozen tags
-and fields without a native RecipeSage representation stay in that block; the
-adapter does not mutate the account's label organizer.
+source identity and frozen document needed for semantic readback. Frozen
+discovery tags and fields without a native RecipeSage representation stay in
+that block; saving a recipe never mutates the account's label organizer.
 
 For `link_only`, the request contains only the permitted title, original link,
 attribution/rights statement and the required operation metadata—never recipe
@@ -577,6 +582,39 @@ dispatched write without authoritative confirmation remains target-bound
 `uncertain`. Favorite changes never alter an active menu or order snapshot,
 and ordinary weekly planning remains unchanged unless favorites are explicitly
 requested.
+
+External recipe tags and labels use provider-native identities only.
+`list_labels` returns each label's exact library-scoped
+`library_label_ref: {library_id, label_id, version?}`, display name and
+normalized comparison name. `get_labels` reads the native labels attached to
+one exact `library_recipe_ref`. Equal normalized names remain separate results;
+callers must choose the exact provider label ID and must never resolve a
+duplicate by list order. Provider-returned label text is untrusted content and
+cannot authorize a tool call, mutation or follow-up fetch.
+
+`create_label` is a separate, explicit operation with a stable idempotency key.
+It first requires an exact connection and a successful native label read, then
+rejects an equal normalized name rather than guessing or creating a duplicate.
+A recipe save never creates a label implicitly. Mealie 3.24.0 supports explicit
+organizer-tag creation only when the authenticated user has `canOrganize`;
+RecipeSage v4.0.6 supports explicit account-label creation. A read-only
+connection reports neither create capability. Neither verified provider has a
+safe conditional native recipe-label association route: `label_apply_existing`,
+`label_remove`, `label_conditional_write` and `label_reconcile` are therefore
+false, and `set_label` fails before dispatch. Full-set replacement and
+name-based upsert are disabled because either could overwrite unrelated labels
+or choose the wrong duplicate. An adapter may expose desired-state add/remove
+only when it can preserve unrelated native state, and a supplied
+`expected_label_revision` additionally requires `label_conditional_write`.
+
+Every label mutation is bound to its exact library, recipe and label IDs and to
+one stable request digest. An already-equal desired state is confirmed without
+a write. A definitely rejected operation is failed; a lost response remains
+target-bound `uncertain`, is never written again, and can become confirmed only
+when the same adapter advertises `label_reconcile` and an authoritative exact
+read proves the requested state. Labels never emulate favorite, archive,
+identity, ownership, rights, attribution, visibility or provider authorization,
+and label changes never alter frozen discovery or menu snapshots.
 
 Source URLs must be credential-free HTTPS. Query strings and fragments are
 discarded before persistence. Original Oda or MENY recipe text is stored only
