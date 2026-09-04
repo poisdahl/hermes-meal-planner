@@ -914,14 +914,14 @@ class MenyClient:
     const deposits = [...card.querySelectorAll('.ws-price__recycle')].filter(visible).map(node => norm(node.innerText));
     const buyButtons = [...card.querySelectorAll('.ws-add-to-cart__button')].filter(visible);
     const unavailable = [...card.querySelectorAll('.ws-product-label--type-unavailable')].filter(visible).filter(x => norm(x.innerText) === 'Midlertidig utsolgt');
-    if (names.length !== 1 || subtitles.length > 1 || prices.length > 1 || originalPrices.length > 1 || unitPrices.length > 1 || campaignTags.length > 1 || campaigns.length > 1 || deposits.length > 1 || buyButtons.length > 1 || unavailable.length > 1) return JSON.stringify({ready:false, identity:true, route:true, authenticated:true, root_count:1, heading_count:1, products:[], recipes:[]});
+    if (names.length !== 1 || subtitles.length > 1 || prices.length > 1 || originalPrices.length > 1 || unitPrices.length > 1 || campaigns.length > 1 || deposits.length > 1 || buyButtons.length > 1 || unavailable.length > 1) return JSON.stringify({ready:false, identity:true, route:true, authenticated:true, root_count:1, heading_count:1, products:[], recipes:[]});
     const name = norm(names[0].innerText);
     if (!name) return JSON.stringify({ready:false, identity:true, route:true, authenticated:true, root_count:1, heading_count:1, products:[], recipes:[]});
     const packageText = norm(subtitles[0]?.innerText);
     const price = norm(prices[0]?.innerText) || null;
     const originalPrice = originalPrices[0] || null;
     const unitPrice = unitPrices[0] || null;
-    const campaignTag = campaignTags[0] || null;
+    const campaignTag = campaignTags.join(' / ') || null;
     const campaign = campaigns[0] || null;
     const deposit = deposits[0] || null;
     const available = unavailable.length === 1 ? false : buyButtons.length === 1 ? !buyButtons[0].disabled : null;
