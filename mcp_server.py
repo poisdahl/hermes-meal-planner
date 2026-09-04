@@ -89,9 +89,10 @@ def meal_concierge_catalog(action: Literal["products", "recipes", "usuals"], que
     return rpc("catalog", action=action, query=query, limit=limit)
 
 
-@server.tool(description="Prepare or explicitly apply an exact bounded menu-product plan. Prepare is read-only, requires one exact active menu_ref or complete planner_handoff, searches only the configured provider, and returns needs_input until the user approves exact candidate_refs per requirement. Configured allergy/avoid rules also remain needs_input without authoritative product evidence. Its lowest-cost claim covers only those shown provider-search scopes and exact eligible product/package totals; it excludes delivery and cart-level fees and never locks a price. Apply requires the complete unchanged product_plan and digest plus cart_change_requested=true only for a clear current user request. It rereads all product facts, stops on drift, then reuses guarded idempotent cart sync; it never orders, checks out or pays.")
+@server.tool(description="Prepare or explicitly apply an exact bounded menu-product plan. Prepare is read-only, requires one exact active menu_ref or complete planner_handoff, searches only the configured provider, and returns needs_input until the user approves exact candidate_refs per requirement. Configured allergy/avoid rules also remain needs_input without authoritative product evidence. Explicit lowest_cost accepts one planner_input and compares at most three exact alternatives, preserving non-price rank unless every cost is complete and comparable. Return candidate approvals only for a current user-approved exact scope. Its lowest-cost claim covers only those shown provider-search scopes and exact eligible product/package totals; it excludes delivery and cart-level fees and never locks a price. Apply requires the complete unchanged product_plan and digest plus cart_change_requested=true only for a clear current user request. It rereads all product facts, stops on drift, then reuses guarded idempotent cart sync; it never orders, checks out or pays.")
 def meal_concierge_products(
-    action: Literal["prepare", "apply"] = "prepare",
+    action: Literal["prepare", "apply", "lowest_cost"] = "prepare",
+    planner_input: dict[str, Any] | None = None,
     menu_ref: dict[str, Any] | None = None,
     planner_handoff: dict[str, Any] | None = None,
     candidate_approvals: list[dict[str, Any]] | None = None,
@@ -100,7 +101,7 @@ def meal_concierge_products(
     cart_change_requested: bool = False,
 ) -> dict[str, Any]:
     return rpc(
-        "products", action=action, menu_ref=menu_ref,
+        "products", action=action, menu_ref=menu_ref, planner_input=planner_input,
         planner_handoff=planner_handoff,
         candidate_approvals=candidate_approvals or [],
         product_plan=product_plan, product_plan_digest=product_plan_digest,

@@ -1236,3 +1236,105 @@ class ProductRuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MenuCostComparisonTests(unittest.TestCase):
+    def setUp(self):
+        from test_meal_concierge_planner import WeeklyPlannerTests, recipe
+        self.fixture = WeeklyPlannerTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.tearDown)
+        self.app = self.fixture.app
+        self.candidates = []
+        for name in ("gulrot", "potet", "ris"):
+            saved = self.app.handle({"operation": "recipes", "action": "save",
+                "recipe": recipe(name, name, ingredient=name), "idempotency_key": name})["recipe"]
+            self.candidates.append({"recipe_ref": {"id": saved["id"], "revision": saved["revision"]}})
+        self.calls = []
+        self.prices = {"gulrot": 300, "potet": 200, "ris": 100}
+        self.stamp = OBSERVED_AT
+        self.unknown = None
+        self.bad_scope = False
+        owner = self
+        class Provider:
+            def call(self, tool, arguments, **kwargs):
+                owner.calls.append((tool, arguments))
+                if tool != "product_search":
+                    raise AssertionError("comparison must only search")
+                query = arguments["queries"][0]
+                opts = [option(owner.prices[query])]
+                if query == owner.unknown:
+                    opts[0]["price_kind"] = "from"
+                result = observation(query, [product(query, query, 200, "g", opts)], observed_at=owner.stamp)
+                if owner.bad_scope:
+                    result["scope"]["page"] = 2
+                return result
+        self.app.oda = Provider()
+        self.request = {"operation": "products", "action": "lowest_cost",
+                        "planner_input": self.fixture.request(self.candidates, alternatives=3)}
+        initial = self.app.handle(self.request)["cost_comparison"]
+        approvals = {}
+        for alternative in initial["alternatives"]:
+            for row in alternative["product_plan"]["requirements"]:
+                approvals[row["requirement_id"]] = {"requirement_id": row["requirement_id"], "candidate_refs": [row["identity"]]}
+        self.request["candidate_approvals"] = list(approvals.values())
+        self.calls.clear()
+
+    def compare(self):
+        return self.app.handle(deepcopy(self.request))["cost_comparison"]
+
+    def test_exact_cost_ranking_and_fresh_later_prepare(self):
+        before = self.fixture.store.read()
+        result = self.compare()
+        self.assertEqual(result["status"], "compared")
+        self.assertEqual([a["product_plan"]["totals"]["total_payable_ore"] for a in result["alternatives"]], [100, 200, 300])
+        self.assertEqual(before, self.fixture.store.read())
+        chosen = result["selected_handoff"]
+        self.app.handle({"operation": "menu", "action": "save", "planner_handoff": chosen})
+        saved = self.fixture.store.read()["menu"]
+        self.prices["ris"] = 999
+        fresh = self.app.handle({"operation": "products", "action": "prepare", "menu_ref": self.app._cart_menu_ref(saved),
+            "candidate_approvals": [{"requirement_id": row["requirement_id"], "candidate_refs": [row["identity"]]}
+              for row in result["alternatives"][0]["product_plan"]["requirements"]]})["product_plan"]
+        self.assertEqual(fresh["totals"]["total_payable_ore"], 999)
+        self.assertEqual(saved, self.fixture.store.read()["menu"])
+        self.assertEqual({c[0] for c in self.calls}, {"product_search"})
+
+    def test_unknown_and_bad_scope_keep_original_rank(self):
+        self.unknown = "ris"
+        result = self.compare()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["comparison_claim"])
+        self.assertEqual([a["original_rank"] for a in result["alternatives"]], [1, 2, 3])
+        self.unknown = None
+        self.bad_scope = True
+        result = self.compare()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertIsNone(result["comparison_claim"])
+
+    def test_input_order_timestamps_ties_and_search_deduplication(self):
+        self.prices = dict.fromkeys(self.prices, 200)
+        first = self.compare()
+        self.assertEqual([a["original_rank"] for a in first["alternatives"]], [1, 2, 3])
+        self.assertEqual(len(self.calls), 3)
+        self.request["planner_input"]["candidates"].reverse()
+        self.request["candidate_approvals"].reverse()
+        self.stamp = "2026-09-05T12:00:00+00:00"
+        second = self.compare()
+        self.assertEqual(first["fact_digest"], second["fact_digest"])
+        # Two-day alternatives share requirements: still only three searches.
+        self.request["planner_input"]["dates"] = ["2026-09-07", "2026-09-08"]
+        self.calls.clear()
+        self.compare()
+        self.assertEqual(len(self.calls), 3)
+
+    def test_budget_preflight_no_search_and_maximum_alternatives(self):
+        from unittest import mock
+        with mock.patch("service.MAX_REQUIREMENTS", 2):
+            result = self.compare()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(len(result["alternatives"]), 3)
+        self.request["planner_input"]["alternatives"] = 4
+        with self.assertRaises(HouseholdError):
+            self.compare()

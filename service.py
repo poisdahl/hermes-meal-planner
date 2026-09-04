@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import fcntl
 import hashlib
 import html
@@ -57,7 +58,7 @@ from planner import (
     MAX_CANDIDATES, MAX_HISTORY_RECORDS, PLANNER_VERSION, PlannerError, plan_week,
 )
 from product_planner import (
-    MAX_CANDIDATES_PER_REQUIREMENT,
+    MAX_CANDIDATES_PER_REQUIREMENT, MAX_REQUIREMENTS, normalize_approvals,
     build_product_plan,
     cart_requirements as prepared_cart_requirements,
     menu_requirements as exact_menu_requirements,
@@ -4895,11 +4896,16 @@ class Application:
 
     def _product_observations(
         self, menu: Mapping[str, Any], *, deadline: float | None,
+        search_cache: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, dict[str, Any]]:
         requirements, _unresolved = exact_menu_requirements(menu)
         observations = {}
+        cache = search_cache if search_cache is not None else {}
         for requirement in requirements:
-            query = requirement["search"]
+            query = requirement["identity"] if search_cache is not None else requirement["search"]
+            if query in cache:
+                observations[requirement["requirement_id"]] = deepcopy(cache[query])
+                continue
             kwargs = {
                 "deadline": deadline,
                 "allow_recovery": False,
@@ -4917,7 +4923,8 @@ class Application:
             normalized = deepcopy(dict(observation))
             normalized["query"] = query
             scope = normalized.get("scope")
-            if not isinstance(scope, Mapping) or scope.get("semantics") != "bounded_relevance_ranked":
+            if (not isinstance(scope, Mapping) or scope.get("semantics") != "bounded_relevance_ranked"
+                or scope.get("kind") != "provider_search" or scope.get("page") != 1):
                 raise HouseholdError("provider product search scope changed")
             products = normalized.get("products")
             returned = scope.get("returned")
@@ -4934,7 +4941,8 @@ class Application:
                 "page": 1,
                 "requested_size": MAX_CANDIDATES_PER_REQUIREMENT,
             }
-            observations[requirement["requirement_id"]] = normalized
+            cache[query] = normalized
+            observations[requirement["requirement_id"]] = deepcopy(normalized)
         return observations
 
     @staticmethod
@@ -5046,9 +5054,96 @@ class Application:
             hard_product_constraints=hard_constraints,
         )
 
+    def _compare_menu_costs(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        value = request.get("planner_input")
+        if not isinstance(value, Mapping):
+            raise PlannerError("lowest_cost requires one canonical planner_input")
+        # Explicit comparison defaults to three; the normal planner stays at one.
+        value = {**value, "alternatives": value.get("alternatives", 3)}
+        result, resolved, _ = self._plan_menu(value)
+        comparison = {
+            "mode": "lowest_cost", "status": "unavailable", "comparison_claim": None,
+            "planner_version": result["planner_version"], "input_digest": result["input_digest"],
+            "work_limits": {"maximum_alternatives": 3, "maximum_unique_requirements": MAX_REQUIREMENTS,
+                            "maximum_unique_searches": MAX_REQUIREMENTS,
+                            "maximum_candidates_per_search": MAX_CANDIDATES_PER_REQUIREMENT,
+                            "maximum_product_plans": 3},
+            "alternatives": [], "unavailable": [],
+        }
+        if result.get("status") != "planned":
+            comparison["unavailable"] = deepcopy(result.get("issues", []))
+            return {"plan": result, "cost_comparison": comparison}
+        menus = [self._materialize_planner_menu(h, resolved) for h in result["save_handoffs"]]
+        requirements = [exact_menu_requirements(menu)[0] for menu in menus]
+        ids = {r["requirement_id"] for rows in requirements for r in rows}
+        queries = {r["identity"] for rows in requirements for r in rows}
+        if len(ids) > MAX_REQUIREMENTS or len(queries) > MAX_REQUIREMENTS:
+            comparison["alternatives"] = [{"original_rank": rank, "selection_digest": h["selection_digest"],
+                "non_price_selection": deepcopy(h["selection"]), "save_handoff": deepcopy(h),
+                "product_plan": None, "cost_status": "comparison_work_budget_exceeded"}
+                for rank, h in enumerate(result["save_handoffs"], 1)]
+            comparison["selected_handoff"] = deepcopy(result["save_handoff"])
+            comparison["unavailable"] = [{"reason": "comparison_work_budget_exceeded"}]
+            return {"plan": result, "cost_comparison": comparison}
+        approvals = normalize_approvals(request.get("candidate_approvals"), ids)
+        profile = self.store.read()["profile"]
+        diet = profile.get("diet", {})
+        hard = {key: deepcopy(diet[key]) for key in ("allergies_or_sensitivities", "avoid") if diet.get(key)}
+        cache = {}
+        # All alternatives share one canonical query per ingredient identity. Search
+        # dispatch order is independent of planner rank and caller candidate order.
+        for query in sorted(queries):
+            synthetic = {"dishes": [{"shopping_requirements": [{"item": query, "unit": "g", "quantity": 1, "scalable": True}]}], "salads": []}
+            try:
+                self._product_observations(synthetic, deadline=request.get("_deadline"), search_cache=cache)
+            except HouseholdError:
+                comparison["unavailable"].append({"search": query, "reason": "provider_search_unavailable_or_scope_changed"})
+        for rank, (handoff, menu, rows) in enumerate(zip(result["save_handoffs"], menus, requirements, strict=True), 1):
+            observations = {r["requirement_id"]: cache[r["identity"]] for r in rows if r["identity"] in cache}
+            selected_approvals = [{key: value for key, value in approvals[r["requirement_id"]].items() if key != "source"}
+                                  for r in rows if r["requirement_id"] in approvals]
+            product_plan = build_product_plan(
+                provider=self.provider, binding={"kind": "planner_selection", "planner_handoff": handoff},
+                menu=menu, observations=observations, candidate_approvals=selected_approvals, hard_product_constraints=hard,
+            )
+            comparison["alternatives"].append({
+                "original_rank": rank, "selection_digest": handoff["selection_digest"],
+                "non_price_selection": deepcopy(handoff["selection"]), "save_handoff": deepcopy(handoff),
+                "product_plan": product_plan,
+            })
+            if product_plan["status"] != "prepared":
+                comparison["unavailable"].append({"selection_digest": handoff["selection_digest"],
+                                                   "requirements": product_plan["unresolved_requirements"]})
+        alternatives = comparison["alternatives"]
+        scopes = {canonical(a["product_plan"]["scope"]) for a in alternatives}
+        if len(scopes) != 1:
+            comparison["unavailable"].append({"reason": "inconsistent_candidate_scope"})
+        if not comparison["unavailable"]:
+            def cost_key(alternative):
+                totals = alternative["product_plan"]["totals"]
+                excess = totals["excess_score"]
+                return (totals["total_payable_ore"], Fraction(excess["numerator"], excess["denominator"]),
+                        totals["package_count"], alternative["original_rank"], alternative["selection_digest"])
+            alternatives.sort(key=cost_key)
+            comparison["status"] = "compared"
+            comparison["comparison_claim"] = f"lowest verified product cost among these {len(alternatives)} exact menu alternatives and their declared provider candidate scopes"
+        comparison["selected_handoff"] = deepcopy(alternatives[0]["save_handoff"])
+        # Timestamps/display never carry comparison or apply authority.
+        comparison["fact_digest"] = hashlib.sha256(canonical({
+            "input_digest": result["input_digest"], "status": comparison["status"],
+            "alternatives": [{"selection_digest": a["selection_digest"],
+                              "product_plan_digest": a["product_plan"]["product_plan_digest"]} for a in alternatives],
+        }).encode()).hexdigest()
+        if len(json.dumps({"ok": True, "result": comparison}, ensure_ascii=True).encode()) > MAX_REQUEST - 4096:
+            raise PlannerError("cost comparison cannot fit the response transport; reduce candidate scope")
+        return {"cost_comparison": comparison}
+
     def _products(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "prepare")
         deadline = request.get("_deadline")
+        if action == "lowest_cost":
+            with self._recipe_planner_operation():
+                return self._compare_menu_costs(request)
         if action == "prepare":
             binding, menu, _saved_ref = self._product_binding(
                 menu_ref=request.get("menu_ref"),
