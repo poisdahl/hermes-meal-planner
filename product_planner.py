@@ -61,6 +61,12 @@ def _identity(value: Any) -> str | None:
 
 
 def _positive_fraction(value: Any) -> Fraction | None:
+    if isinstance(value, Mapping):
+        try:
+            result = _read_fraction(value, positive=True)
+            return result if result.numerator <= 10**15 and result.denominator <= 10**12 else None
+        except HouseholdError:
+            return None
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
     if isinstance(value, float) and not math.isfinite(value):

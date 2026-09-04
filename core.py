@@ -125,7 +125,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 10,
+        "version": 11,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -147,6 +147,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "order_change": None,
         "email_jobs": [],
         "occurrences": {},
+        "batch_outcomes": {"sources": {}, "leftovers": {}},
         "planning_feedback": [],
         "menu_planning": {"locks": {}, "history": {}, "retired": {}, "applied": {}, "outcomes": {}},
         "recipe_usage": {},
@@ -457,11 +458,12 @@ def _migrate_state(
     before_v8: Callable[[Mapping[str, Any]], None] | None = None,
     before_v9: Callable[[Mapping[str, Any]], None] | None = None,
     before_v10: Callable[[Mapping[str, Any]], None] | None = None,
+    before_v11: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 10:
+    if version > 11:
         raise HouseholdError("household state is newer than this meal concierge")
     if version >= 6 and "favorites" in state:
         raise HouseholdError("household state contains the retired favorites key")
@@ -613,6 +615,16 @@ def _migrate_state(
             before_v10(state)
         state["planning_feedback"] = []
         state["version"] = 10
+    if state["version"] == 10:
+        if "batch_outcomes" in state:
+            raise HouseholdError("household v10 batch outcomes conflict with migration")
+        if before_v11 is not None:
+            before_v11(state)
+        state["batch_outcomes"] = {"sources": {}, "leftovers": {}}
+        state["version"] = 11
+    batch = state.get("batch_outcomes")
+    if not isinstance(batch, dict) or set(batch) != {"sources", "leftovers"} or any(not isinstance(v,dict) or len(v)>2000 for v in batch.values()):
+        raise HouseholdError("household batch outcomes are invalid")
     if not isinstance(state.get("planning_feedback"), list) or len(state["planning_feedback"]) > 500:
         raise HouseholdError("household planning feedback is invalid")
     planning = state.get("menu_planning")
@@ -783,6 +795,13 @@ class StateStore:
                 if not backup.exists():
                     _atomic_json(backup, value)
 
+            def backup_v10(value: Mapping[str, Any]) -> None:
+                if source_version != 10:
+                    return
+                backup = self.directory / "state-v10.backup.json"
+                if not backup.exists():
+                    _atomic_json(backup, value)
+
             _migrate_state(
                 state,
                 self.config,
@@ -791,6 +810,7 @@ class StateStore:
                 before_v8=backup_v7,
                 before_v9=backup_v8,
                 before_v10=backup_v9,
+                before_v11=backup_v10,
             )
             state_household = state.get("household")
             configured_household = str(self.config["household"])

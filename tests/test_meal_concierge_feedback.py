@@ -156,7 +156,7 @@ class FeedbackMigrationTests(unittest.TestCase):
     def test_atomic_private_v9_backup_and_newer_rejection(self):
         with tempfile.TemporaryDirectory() as directory:
             store=StateStore(directory,fixtures.CONFIG); old=store.read()
-            old['version']=9; old.pop('planning_feedback'); store.path.write_text(json.dumps(old))
+            old['version']=9; old.pop('planning_feedback'); old.pop('batch_outcomes'); store.path.write_text(json.dumps(old))
             before=store.path.read_bytes()
             with mock.patch('core._atomic_json',side_effect=OSError('fixture')):
                 with self.assertRaises(OSError): StateStore(directory,fixtures.CONFIG)
@@ -165,7 +165,7 @@ class FeedbackMigrationTests(unittest.TestCase):
             backup=Path(directory)/'state-v9.backup.json'
             self.assertEqual(json.loads(backup.read_text()),old)
             self.assertEqual(backup.stat().st_mode&0o777,0o600)
-            self.assertEqual(current.read()['version'],10)
+            self.assertEqual(current.read()['version'],11)
             self.assertEqual(current.read()['planning_feedback'],[])
             raw=backup.read_bytes(); StateStore(directory,fixtures.CONFIG); self.assertEqual(raw,backup.read_bytes())
             old['version']=99; store.path.write_text(json.dumps(old))

@@ -191,11 +191,11 @@ class ReplanMigrationTests(unittest.TestCase):
                 store = StateStore(directory, CONFIG)
                 legacy = store.read()
                 legacy['version'] = version
-                legacy.pop('menu_planning'); legacy.pop('planning_feedback')
+                legacy.pop('menu_planning'); legacy.pop('planning_feedback'); legacy.pop('batch_outcomes')
                 legacy['menu'] = {'schedule':[{'day':'Monday','meal':'unknown'}]}
                 store.path.write_text(json.dumps(legacy))
                 migrated = StateStore(directory, CONFIG)
-                self.assertEqual(migrated.read()['version'], 10)
+                self.assertEqual(migrated.read()['version'], 11)
                 self.assertEqual(migrated.read()['menu'], legacy['menu'])
                 backup = Path(directory)/f'state-v{version}.backup.json'
                 self.assertEqual(json.loads(backup.read_text()), legacy)
@@ -205,7 +205,7 @@ class ReplanMigrationTests(unittest.TestCase):
                 self.assertEqual(before, backup.read_bytes())
         with tempfile.TemporaryDirectory() as directory:
             store = StateStore(directory, CONFIG)
-            legacy = store.read(); legacy['version']=8; legacy.pop('menu_planning'); legacy.pop('planning_feedback')
+            legacy = store.read(); legacy['version']=8; legacy.pop('menu_planning'); legacy.pop('planning_feedback'); legacy.pop('batch_outcomes')
             store.path.write_text(json.dumps(legacy)); before = store.path.read_bytes()
             with mock.patch('core._atomic_json', side_effect=OSError('fixture backup failure')):
                 with self.assertRaises(OSError): StateStore(directory, CONFIG)

@@ -450,3 +450,56 @@ Because PR #26 already used state v8 and slot planning uses v9, feedback is the
 additive v9→v10 migration. Existing v9 state receives one atomic private 0600
 `state-v9.backup.json`, never overwritten. Failed migration leaves its source
 usable and unknown newer versions fail closed.
+
+
+### Deliberate batch leftovers
+
+The default remains different freshly cooked dinners with `batch_dishes=0`.
+Batch planning is opt-in for one exact current plan. `menu.batch_prepare` takes
+`menu_ref` and `batch_spec` with an exact `source_slot_id`,
+`source_snapshot_digest`, `prepared_portions`, `consumed_at_source`, structured
+`suitability={source:"current_user",value:"suitable"}`, and
+`storage={source:"current_user",method:"refrigerated"|"frozen",max_interval_days:...}`
+(or an exact `use_by_date`; when both are supplied, both constrain the interval).
+`leftovers` lists one to six exact target `slot_id`/`portions` pairs. The source
+must be unrecorded and current/future; source consumption must match its existing
+meal portions. Targets must follow the source within the supplied interval.
+Decimal strings/integers and `{numerator,denominator}` fractions use exact bounded
+arithmetic (up to 1,000 portions, denominator up to 1,000,000).
+
+Missing/conflicting facts return `needs_input`. Recipe prose, model inference,
+a generic storage instruction or an agent-supplied boolean cannot establish
+suitability, storage life or consent. Show the complete prepared batch plan and
+obtain a clear current-user confirmation of these exact facts before
+`batch_apply`. Pass the unchanged `batch_plan` with
+`batch_confirmation={batch_digest:...,statement:...}` using its returned exact
+confirmation statement. Do not invent that confirmation. It is frozen with the
+source/dependencies in an immutable successor and is never provider/cart/order
+authority. Existing recipe-bank and recipe-document schemas are unchanged.
+
+The source recipe snapshot is retained once. Shopping scales its requirements
+once to prepared portions using exact rational quantities; leftover slots add
+zero requirements and zero new recipe/cooldown usage. Planned leftovers are
+never claimed as actual stock. When marking the source cooked, provide explicit
+`actual_batch={prepared_portions:...,consumed_at_source:...}`. A mismatch or
+`mark_not_cooked` marks future dependents `needs_replan`; a leftover cannot be
+marked cooked before an exact matching source confirmation and enough confirmed
+remaining portions. Multiple/repeated dependent actions cannot consume a portion
+twice. Inspect current dependency status through `menu.get`.
+
+Source replacement requires all future dependents in the same replan. A lock on
+any component member prevents an incompatible partial change. Valid carried
+dependencies retain their exact source link, immutable spec and original
+confirmation through successors. Replacing a dependent adds its new recipe
+requirements through the structural comparison; historical/cooked slots remain
+excluded. Invalid future dependents must be replanned together. Ordered menus,
+order/email snapshots and predecessor usage remain immutable. Any desired cart
+or order change still requires the separate explicit sync/reconciliation path.
+No batch action calls a provider or infers pantry/container/freezer inventory.
+These supplied facts and plans are not food-safety compliance or guarantees.
+
+Following the existing version chain, batch outcomes add state v10→v11 with one
+atomic private 0600 `state-v10.backup.json`, never overwritten; failed migration
+leaves v10 usable and unknown newer versions fail closed. Source/leftover outcome
+maps each retain at most 2,000 entries and fail without deleting history at the
+bound.
