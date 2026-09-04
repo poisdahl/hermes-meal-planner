@@ -387,7 +387,7 @@ class CoreTestsBase:
         mcp_server_package = types.ModuleType("mcp.server")
         mcp_server_module = types.ModuleType("mcp.server.mcpserver")
         mcp_server_module.MCPServer = FakeMCPServer
-        spec = importlib.util.spec_from_file_location("meal_planner_mcp_server_test", CORE / "mcp_server.py")
+        spec = importlib.util.spec_from_file_location("meal_concierge_mcp_server_test", CORE / "mcp_server.py")
         module = importlib.util.module_from_spec(spec)
         with mock.patch.dict(sys.modules, {
             "mcp": mcp,
@@ -400,9 +400,9 @@ class CoreTestsBase:
         self.assertEqual(module.rpc_timeout("delivery", {"action": "list"}), 300)
         self.assertEqual(module.rpc_timeout("checkout", {"action": "submit"}), 660)
         module.rpc = mock.Mock(return_value={})
-        self.assertIn("meal_planner_product_favorites", module.server.tools)
-        self.assertNotIn("meal_planner_favorites", module.server.tools)
-        module.meal_planner_product_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
+        self.assertIn("meal_concierge_product_favorites", module.server.tools)
+        self.assertNotIn("meal_concierge_favorites", module.server.tools)
+        module.meal_concierge_product_favorites("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=2)
         module.rpc.assert_called_with(
             "product_favorites",
             action="add",
@@ -410,7 +410,7 @@ class CoreTestsBase:
             product_id=MENY_PRODUCT,
         )
         schedule = {"unit": "weeks", "every": 2, "anchor": "2026-W36"}
-        module.meal_planner_recurring("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=1, schedule=schedule)
+        module.meal_concierge_recurring("add", product_id=MENY_PRODUCT, product_name="Brokkoli", quantity=1, schedule=schedule)
         module.rpc.assert_called_with(
             "recurring",
             action="add",
@@ -418,14 +418,14 @@ class CoreTestsBase:
             product_id=MENY_PRODUCT,
             date=None,
         )
-        module.meal_planner_email(
+        module.meal_concierge_email(
             "ack_automation", order_id="order-1", delivery_date="2026-09-05",
-            automation_key="meal-planner-email-0123456789abcdef", automation_digest="a" * 64, protocol=3,
+            automation_key="meal-concierge-email-0123456789abcdef", automation_digest="a" * 64, protocol=4,
         )
         module.rpc.assert_called_with(
             "email", action="ack_automation", order_id="order-1", delivery_date="2026-09-05",
-            provider=None, claim_token=None, automation_key="meal-planner-email-0123456789abcdef",
-            automation_digest="a" * 64, protocol=3,
+            provider=None, claim_token=None, automation_key="meal-concierge-email-0123456789abcdef",
+            automation_digest="a" * 64, protocol=4,
         )
 
     def test_cart_summary_rejects_huge_provider_quantity_as_a_bounded_error(self):
@@ -1470,7 +1470,7 @@ class CoreTestsBase:
             "history": [{"old": True}],
         }}
         state = migrate(CONFIG, planning, {"schedules": []})
-        self.assertEqual(state["version"], 7)
+        self.assertEqual(state["version"], 8)
         self.assertEqual(len(state["product_favorites"]), 1)
         self.assertNotIn("favorites", state)
         self.assertEqual(len(state["recurring_items"]), 1)
@@ -1481,13 +1481,13 @@ class CoreTestsBase:
     def test_clean_state_and_skill_expose_only_product_favorites(self):
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
-        self.assertEqual(state["version"], 7)
+        self.assertEqual(state["version"], 8)
         self.assertEqual(state["schedule"]["delivery"]["strategy"], "cheapest")
         self.assertIsNone(state["delivery_selection"])
         self.assertEqual(state["product_favorites"], [])
         self.assertNotIn("favorites", state)
         skill = (CORE / "skill" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("meal_planner_product_favorites", skill)
+        self.assertIn("meal_concierge_product_favorites", skill)
         self.assertIn("Never route “favorite this recipe” to the product tool", skill)
 
     def test_v5_migration_creates_one_private_backup_and_preserves_the_exact_product_list(self):
@@ -1510,7 +1510,7 @@ class CoreTestsBase:
 
             self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(backup_before), state)
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertEqual(migrated["schedule"]["delivery"]["strategy"], "keep_selected")
             self.assertEqual(migrated["product_favorites"], items)
             self.assertNotIn("favorites", migrated)
@@ -1573,7 +1573,7 @@ class CoreTestsBase:
 
             self.assertEqual(json.loads(backup), state)
             self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertEqual(migrated["schedule"]["delivery"]["strategy"], "keep_selected")
             self.assertIsNone(migrated["delivery_selection"])
 
@@ -1602,6 +1602,39 @@ class CoreTestsBase:
                     StateStore(Path(temp), CONFIG)
                 self.assertEqual(state_path.read_bytes(), before)
 
+    def test_v7_migration_renames_saved_email_automation_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = StateStore(Path(temp), CONFIG).read()
+            state["version"] = 7
+            state["email_jobs"] = [{
+                "provider": "oda",
+                "order_id": "order-1",
+                "delivery_date": "2026-09-05",
+                "recipient_snapshot": "owner@example.test",
+                "status": "pending",
+                "automation_key": "meal-planner-email-0123456789abcdef",
+                "automation_protocol": 3,
+            }]
+            state_path = self.write_state(temp, state)
+
+            migrated = StateStore(Path(temp), CONFIG).read()
+            backup_path = Path(temp) / "state-v7.backup.json"
+            backup = backup_path.read_bytes()
+            after = state_path.read_bytes()
+
+            self.assertEqual(json.loads(backup), state)
+            self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(
+                migrated["email_jobs"][0]["automation_key"],
+                "meal-concierge-email-0123456789abcdef",
+            )
+            self.assertEqual(migrated["email_jobs"][0]["automation_protocol"], 0)
+
+            StateStore(Path(temp), CONFIG)
+            self.assertEqual(backup_path.read_bytes(), backup)
+            self.assertEqual(state_path.read_bytes(), after)
+
     def test_malformed_v6_old_key_fails_closed_and_older_states_continue_through_v6(self):
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
@@ -1619,14 +1652,14 @@ class CoreTestsBase:
             del state["product_favorites"]
             self.write_state(temp, state)
             migrated = StateStore(Path(temp), CONFIG).read()
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertEqual(migrated["product_favorites"], state["favorites"])
             self.assertTrue((Path(temp) / "state-v4.backup.json").exists())
             self.assertTrue((Path(temp) / "state-v5.backup.json").exists())
 
         with tempfile.TemporaryDirectory() as temp:
             state = StateStore(Path(temp), CONFIG).read()
-            state["version"] = 8
+            state["version"] = 9
             self.write_state(temp, state)
             with self.assertRaisesRegex(HouseholdError, "newer than"):
                 StateStore(Path(temp), CONFIG)
@@ -1653,7 +1686,7 @@ class CoreTestsBase:
             state = json.loads((root / "output" / "state.json").read_text(encoding="utf-8"))
             self.assertEqual(report["product_favorites_count"], 1)
             self.assertNotIn("favorites", report)
-            self.assertEqual(state["version"], 7)
+            self.assertEqual(state["version"], 8)
             self.assertEqual(state["product_favorites"][0]["product_id"], "1")
             self.assertNotIn("favorites", state)
 
@@ -1710,7 +1743,7 @@ class CoreTests(CoreTestsBase, unittest.TestCase):
         fake_bin.mkdir()
         fake_modules.mkdir()
         hermes_home.mkdir()
-        (hermes_home / "skills" / "meal-planner").mkdir(parents=True)
+        (hermes_home / "skills" / "meal-concierge").mkdir(parents=True)
         (hermes_home / "config.yaml").touch()
         private_root.mkdir()
 
@@ -1753,9 +1786,9 @@ if arguments == [\"-c\", \"import mcp; import tools.mcp_oauth\"]:
 if arguments and arguments[0] == \"-\":
     source = sys.stdin.read()
     if 'status = rpc(\"status\")' in source:
-        state_path = Path(os.environ[\"MEAL_PLANNER_HOME\"]) / \"state\" / \"state.json\"
+        state_path = Path(os.environ[\"MEAL_CONCIERGE_HOME\"]) / \"state\" / \"state.json\"
         state = json.loads(state_path.read_text(encoding=\"utf-8\"))
-        if state.get(\"version\") != 7 or \"product_favorites\" not in state or \"favorites\" in state:
+        if state.get(\"version\") != 8 or \"product_favorites\" not in state or \"favorites\" in state:
             raise SystemExit(1)
         with open({str(python_log)!r}, \"a\", encoding=\"utf-8\") as handle:
             handle.write(\"status-probe\\n\")
@@ -1773,7 +1806,7 @@ os.execv({sys.executable!r}, [{sys.executable!r}, *arguments])
         self.write_executable(fake_bin / "chromium", "#!/bin/sh\nexit 0\n")
         self.write_executable(fake_bin / "systemctl", f"""#!/bin/sh
 printf '%s\\n' \"$*\" >> {str(systemctl_log)!r}
-if [ \"$*\" = \"--user is-active --quiet hermes-meal-planner.service\" ] && [ \"${{FAKE_SERVICE_ACTIVE:-false}}\" != true ]; then
+if [ \"$*\" = \"--user is-active --quiet meal-concierge.service\" ] && [ \"${{FAKE_SERVICE_ACTIVE:-false}}\" != true ]; then
   exit 3
 fi
 exit 0
@@ -1798,26 +1831,26 @@ with open({str(hermes_log)!r}, "a", encoding="utf-8") as handle:
     handle.write(" ".join(arguments) + "\\n")
 if arguments == ["mcp", "add", "--help"]:
     print("--connect-timeout")
-elif arguments[:3] == ["mcp", "add", "meal_planner"]:
+elif arguments[:3] == ["mcp", "add", "meal_concierge"]:
     command = arguments[arguments.index("--command") + 1]
     socket = arguments[arguments.index("--env") + 1].split("=", 1)[1]
     script = arguments[arguments.index("--args") + 1]
     config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
     raw = config_path.read_text(encoding="utf-8")
     value = json.loads(raw) if raw.strip() else dict()
-    value.setdefault("mcp_servers", dict())["meal_planner"] = dict(
+    value.setdefault("mcp_servers", dict())["meal_concierge"] = dict(
         command=command,
         args=[script],
-        env=dict([("MEAL_PLANNER_SOCKET", socket)]),
+        env=dict([("MEAL_CONCIERGE_SOCKET", socket)]),
         enabled=True,
     )
     config_path.write_text(json.dumps(value), encoding="utf-8")
-elif arguments == ["mcp", "test", "meal_planner"]:
+elif arguments == ["mcp", "test", "meal_concierge"]:
     config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
     value = json.loads(config_path.read_text(encoding="utf-8"))
-    script = value["mcp_servers"]["meal_planner"]["args"][0]
+    script = value["mcp_servers"]["meal_concierge"]["args"][0]
     source = Path(script).read_text(encoding="utf-8")
-    for name in re.findall(r"^def (meal_planner_[A-Za-z0-9_]+)\\(", source, re.MULTILINE):
+    for name in re.findall(r"^def (meal_concierge_[A-Za-z0-9_]+)\\(", source, re.MULTILINE):
         print(name)
 else:
     raise SystemExit(1)
@@ -1827,15 +1860,15 @@ else:
         if not clean:
             (hermes_home / "config.yaml").write_text(json.dumps({
                 "mcp_servers": {
-                    "meal_planner": {
+                    "meal_concierge": {
                         "command": str(python_wrapper),
                         "args": [str(CORE / "mcp_server.py")],
-                        "env": {"MEAL_PLANNER_SOCKET": str(socket_path)},
+                        "env": {"MEAL_CONCIERGE_SOCKET": str(socket_path)},
                         "enabled": True,
                     },
                 },
             }), encoding="utf-8")
-            (hermes_home / "skills" / "meal-planner" / "SKILL.md").write_text("old installed skill\n", encoding="utf-8")
+            (hermes_home / "skills" / "meal-concierge" / "SKILL.md").write_text("old installed skill\n", encoding="utf-8")
 
         environment = {
             **os.environ,
@@ -1844,10 +1877,10 @@ else:
             "PYTHONPATH": str(fake_modules),
             "HERMES_HOME": str(hermes_home),
             "HERMES_PYTHON": str(python_wrapper),
-            "MEAL_PLANNER_HOME": str(private_root),
-            "MEAL_PLANNER_AGENT_BROWSER": str(fake_bin / "agent-browser"),
-            "MEAL_PLANNER_BROWSER_EXECUTABLE": str(fake_bin / "chromium"),
-            "MEAL_PLANNER_VIPPS_PHONE_NUMBER": "90000000",
+            "MEAL_CONCIERGE_HOME": str(private_root),
+            "MEAL_CONCIERGE_AGENT_BROWSER": str(fake_bin / "agent-browser"),
+            "MEAL_CONCIERGE_BROWSER_EXECUTABLE": str(fake_bin / "chromium"),
+            "MEAL_CONCIERGE_VIPPS_PHONE_NUMBER": "90000000",
             "FAKE_SERVICE_ACTIVE": "true" if active else "false",
             "XDG_CONFIG_HOME": str(root / "config"),
             "XDG_RUNTIME_DIR": str(root / "runtime"),
@@ -1865,19 +1898,19 @@ else:
             self.assertEqual(completed.returncode, 0, completed.stderr)
             migrated = json.loads(state_path.read_text(encoding="utf-8"))
             backup = private_root / "state" / "state-v5.backup.json"
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertEqual(migrated["product_favorites"], product_items)
             self.assertNotIn("favorites", migrated)
             self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), old_state)
             self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
             commands = systemctl_log.read_text(encoding="utf-8").splitlines()
-            self.assertLess(commands.index("--user stop hermes-meal-planner.service"), commands.index("--user start hermes-meal-planner.service"))
-            self.assertEqual([line for line in commands if " stop " in f" {line} "], ["--user stop hermes-meal-planner.service"])
-            self.assertEqual([line for line in commands if " start " in f" {line} "], ["--user start hermes-meal-planner.service"])
+            self.assertLess(commands.index("--user stop meal-concierge.service"), commands.index("--user start meal-concierge.service"))
+            self.assertEqual([line for line in commands if " stop " in f" {line} "], ["--user stop meal-concierge.service"])
+            self.assertEqual([line for line in commands if " start " in f" {line} "], ["--user start meal-concierge.service"])
             self.assertEqual(python_log.read_text(encoding="utf-8"), "status-probe\n")
-            self.assertIn("mcp test meal_planner", hermes_log.read_text(encoding="utf-8"))
-            installed_skill = (hermes_home / "skills" / "meal-planner" / "SKILL.md").read_text(encoding="utf-8")
-            self.assertIn("meal_planner_product_favorites", installed_skill)
+            self.assertIn("mcp test meal_concierge", hermes_log.read_text(encoding="utf-8"))
+            installed_skill = (hermes_home / "skills" / "meal-concierge" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("meal_concierge_product_favorites", installed_skill)
 
     def test_inactive_existing_linux_and_macos_installs_are_started_and_verified(self):
         for platform in ("Linux", "Darwin"):
@@ -1891,14 +1924,14 @@ else:
                 self.assertEqual(migrated["product_favorites"], product_items)
                 commands = service_log.read_text(encoding="utf-8").splitlines()
                 if platform == "Linux":
-                    self.assertNotIn("--user stop hermes-meal-planner.service", commands)
-                    self.assertIn("--user start hermes-meal-planner.service", commands)
+                    self.assertNotIn("--user stop meal-concierge.service", commands)
+                    self.assertIn("--user start meal-concierge.service", commands)
                 else:
                     self.assertFalse(any(command.startswith("bootout ") for command in commands))
                     self.assertTrue(any(command.startswith("bootstrap gui/") for command in commands))
                 self.assertEqual(python_log.read_text(encoding="utf-8"), "status-probe\n")
 
-    def test_clean_install_creates_v7_skill_registration_and_new_tool_schema(self):
+    def test_clean_install_creates_v8_skill_registration_and_new_tool_schema(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             completed, old_state, product_items, state_path, service_log, python_log, hermes_log, hermes_home, private_root = self.fake_install(
@@ -1908,19 +1941,19 @@ else:
             self.assertIsNone(old_state)
             self.assertEqual(product_items, [])
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            self.assertEqual(state["version"], 7)
+            self.assertEqual(state["version"], 8)
             self.assertEqual(state["product_favorites"], [])
             self.assertNotIn("favorites", state)
             self.assertFalse((private_root / "state" / "state-v5.backup.json").exists())
             commands = service_log.read_text(encoding="utf-8").splitlines()
-            self.assertNotIn("--user stop hermes-meal-planner.service", commands)
-            self.assertNotIn("--user start hermes-meal-planner.service", commands)
+            self.assertNotIn("--user stop meal-concierge.service", commands)
+            self.assertNotIn("--user start meal-concierge.service", commands)
             self.assertFalse(python_log.exists())
             hermes_commands = hermes_log.read_text(encoding="utf-8")
-            self.assertIn("mcp add meal_planner", hermes_commands)
-            self.assertIn("mcp test meal_planner", hermes_commands)
-            installed_skill = (hermes_home / "skills" / "meal-planner" / "SKILL.md").read_text(encoding="utf-8")
-            self.assertIn("meal_planner_product_favorites", installed_skill)
+            self.assertIn("mcp add meal_concierge", hermes_commands)
+            self.assertIn("mcp test meal_concierge", hermes_commands)
+            installed_skill = (hermes_home / "skills" / "meal-concierge" / "SKILL.md").read_text(encoding="utf-8")
+            self.assertIn("meal_concierge_product_favorites", installed_skill)
 
     def test_failed_v5_migration_leaves_state_and_backup_and_does_not_restart(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1931,10 +1964,10 @@ else:
             self.assertEqual(json.loads(state_path.read_text(encoding="utf-8")), old_state)
             self.assertEqual(json.loads((private_root / "state" / "state-v5.backup.json").read_text(encoding="utf-8")), old_state)
             commands = systemctl_log.read_text(encoding="utf-8").splitlines()
-            self.assertIn("--user stop hermes-meal-planner.service", commands)
-            self.assertNotIn("--user start hermes-meal-planner.service", commands)
+            self.assertIn("--user stop meal-concierge.service", commands)
+            self.assertNotIn("--user start meal-concierge.service", commands)
             self.assertFalse(python_log.exists())
-            self.assertNotIn("mcp test meal_planner", hermes_log.read_text(encoding="utf-8"))
+            self.assertNotIn("mcp test meal_concierge", hermes_log.read_text(encoding="utf-8"))
 
     def test_checkout_starts_from_the_exact_cart_page(self):
         browser = OdaBrowser.__new__(OdaBrowser)
@@ -2893,7 +2926,7 @@ class MenyClientTests(unittest.TestCase):
 
         client._prepare_search()
 
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="close-cart"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="close-cart"]')
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.3), mock.call(0.25)])
         client._assert_authenticated.assert_called_once_with()
 
@@ -2931,7 +2964,7 @@ class MenyClientTests(unittest.TestCase):
             mock.call("https://meny.no/sok?query=levering"),
             mock.call("https://meny.no/varer"),
         ])
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-open"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="delivery-open"]')
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.25), mock.call(0.25)])
         self.assertIn("querySelectorAll('dialog,[role=\"dialog\"]')", scripts[-1])
         self.assertIn("=== 'Når skal vi levere til deg?'", scripts[-1])
@@ -2954,7 +2987,7 @@ class MenyClientTests(unittest.TestCase):
         client._open_delivery_picker()
 
         self.assertEqual(client._sleep.call_count, 20)
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-open"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="delivery-open"]')
 
     def test_delivery_picker_stops_before_click_on_route_or_login_loss(self):
         for state, message in (
@@ -3005,7 +3038,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("=== 'Lukk'", client._eval.call_args.args[0])
         self.assertNotIn("['Avbryt','Lukk']", client._eval.call_args.args[0])
         client._sleep.assert_called_once_with(0.25)
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="delivery-dismiss"]')
         client._wait_delivery_picker_closed.assert_called_once_with()
 
     def test_meny_price_label_drift_changes_display_without_changing_identity(self):
@@ -3076,10 +3109,10 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("endsWith(expectedSuffix)", scripts[2])
         client._sleep.assert_called_once_with(0.25)
         self.assertEqual(client._invoke.call_args_list, [
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-slot"]'),
             mock.call("network", "requests", "--clear"),
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-confirm"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-dismiss"]'),
         ])
         client._wait_for_delivery_reservation.assert_called_once_with()
 
@@ -3109,13 +3142,13 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(result["selected"]["slot_ref"], "meny:2026-09-03T10:00/12:00")
         self.assertEqual(client._open_delivery_picker.call_count, 3)
         self.assertEqual(client._invoke.call_args_list, [
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-refresh-slot"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-refresh-slot"]'),
             mock.call("network", "requests", "--clear"),
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-confirm"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-slot"]'),
             mock.call("network", "requests", "--clear"),
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-dismiss"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-confirm"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-dismiss"]'),
         ])
         self.assertEqual(client._wait_delivery_picker_closed.call_count, 3)
         self.assertEqual(client._wait_for_delivery_reservation.call_count, 2)
@@ -3137,7 +3170,7 @@ class MenyClientTests(unittest.TestCase):
         result = client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
 
         self.assertEqual(result["selected"]["slot_ref"], "meny:2026-09-03T10:00/12:00")
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="delivery-dismiss"]')
         client._wait_delivery_picker_closed.assert_called_once_with()
 
     def test_delivery_selection_cannot_reuse_a_tentative_open_dialog(self):
@@ -3157,9 +3190,9 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client._open_delivery_picker.call_count, 1)
         self.assertEqual(client._invoke.call_args_list, [
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-slot"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-slot"]'),
             mock.call("network", "requests", "--clear"),
-            mock.call("click", '[data-hermes-meal-planner-action="delivery-confirm"]'),
+            mock.call("click", '[data-meal-concierge-action="delivery-confirm"]'),
         ])
 
     def test_delivery_selection_never_confirms_a_mismatched_selected_slot(self):
@@ -3175,7 +3208,7 @@ class MenyClientTests(unittest.TestCase):
         with self.assertRaisesRegex(HouseholdError, "confirmation changed"):
             client._select_delivery_slot("meny:2026-09-03T10:00/12:00")
 
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="delivery-slot"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="delivery-slot"]')
 
     def test_delivery_selection_stops_before_slot_click_after_context_loss(self):
         for state, message in (
@@ -3256,7 +3289,7 @@ class MenyClientTests(unittest.TestCase):
         client._invoke = lambda *arguments, **_kwargs: invoked.append(arguments) or {}
         client._sleep = mock.Mock()
         cart = client._read_cart()
-        self.assertEqual(invoked, [("click", '[data-hermes-meal-planner-action="open-cart"]')])
+        self.assertEqual(invoked, [("click", '[data-meal-concierge-action="open-cart"]')])
         client._sleep.assert_called_once_with(0.5)
         self.assertEqual(cart["items"][0]["product_id"], MENY_PRODUCT)
         self.assertEqual(cart["delivery"], {"slot_id": None, "display": "torsdag 3. sep. kl. 10:00-12:00"})
@@ -3314,7 +3347,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("network", "requests", "--clear"),
             mock.call("network", "requests", "--filter", "/api/order/"),
-            mock.call("click", '[data-hermes-meal-planner-action="order-items"]'),
+            mock.call("click", '[data-meal-concierge-action="order-items"]'),
             mock.call("network", "request", "order-detail-1"),
         ])
         self.assertEqual(client._sleep.call_args_list, [mock.call(1.5), mock.call(0.25), mock.call(0.25)])
@@ -3427,8 +3460,8 @@ class MenyClientTests(unittest.TestCase):
         self.assertTrue(result["editing"])
         self.assertIn("dialog,[role=\"dialog\"]", scripts[1])
         self.assertEqual(client._invoke.call_args_list, [
-            mock.call("click", '[data-hermes-meal-planner-action="change-open"]'),
-            mock.call("click", '[data-hermes-meal-planner-action="change-confirm"]'),
+            mock.call("click", '[data-meal-concierge-action="change-open"]'),
+            mock.call("click", '[data-meal-concierge-action="change-confirm"]'),
         ])
 
     def test_order_change_abort_accepts_the_native_confirmation_dialog(self):
@@ -3445,8 +3478,8 @@ class MenyClientTests(unittest.TestCase):
         self.assertTrue(result["aborted"])
         self.assertIn("dialog,[role=\"dialog\"]", scripts[1])
         self.assertEqual(client._invoke.call_args_list, [
-            mock.call("click", '[data-hermes-meal-planner-action="change-abort-open"]'),
-            mock.call("click", '[data-hermes-meal-planner-action="change-abort-final"]'),
+            mock.call("click", '[data-meal-concierge-action="change-abort-open"]'),
+            mock.call("click", '[data-meal-concierge-action="change-abort-final"]'),
         ])
 
     def test_order_list_maps_and_removes_the_private_dom_status_marker(self):
@@ -3559,7 +3592,7 @@ class MenyClientTests(unittest.TestCase):
         client._sleep = mock.Mock()
         self.assertEqual(client._read_cart()["total"], 19.9)
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.25), mock.call(0.5)])
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="open-cart"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="open-cart"]')
 
     def test_cart_read_polls_the_opening_panel_snapshot(self):
         client = self.client()
@@ -3819,7 +3852,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertEqual(client._read_cart()["total"], 19.9)
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("reload"),
-            mock.call("click", '[data-hermes-meal-planner-action="open-cart"]'),
+            mock.call("click", '[data-meal-concierge-action="open-cart"]'),
         ])
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.5), mock.call(0.5)])
 
@@ -4061,7 +4094,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn(":scope > .ws-search-result__header", script)
         self.assertIn("queryValues.length === 1", script)
         self.assertIn("radios[0].labels", script)
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="search-kind"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="search-kind"]')
         client._sleep.assert_not_called()
 
     def test_recipe_search_reprobes_login_before_classifying_a_missing_shell(self):
@@ -4512,7 +4545,7 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("Endre bestilling", scripts[0])
         self.assertIn("matchAll", scripts[0])
         self.assertNotIn("text.includes", scripts[0])
-        client._invoke.assert_called_once_with("click", '[data-hermes-meal-planner-action="order-route"]')
+        client._invoke.assert_called_once_with("click", '[data-meal-concierge-action="order-route"]')
 
     def test_post_click_verification_error_is_always_uncertain(self):
         client = self.client()
@@ -4556,7 +4589,7 @@ class MenyClientTests(unittest.TestCase):
         client._eval = mock.Mock(side_effect=[{"ready": True}, {"ready": True}, {"ready": True}])
         client._click_checkout_control("checkout-next", expected_items=[(MENY_PRODUCT, 1)], target_code="TEST-CODE-1")
 
-        selector = '[data-hermes-meal-planner-action="checkout-next"]'
+        selector = '[data-meal-concierge-action="checkout-next"]'
         self.assertEqual(calls[0], ("scrollintoview", selector))
         self.assertEqual(calls[1], ("get", "box", selector))
         self.assertEqual([call[:2] for call in calls[2:]], [("mouse", "move"), ("mouse", "down"), ("mouse", "up")])
@@ -4586,7 +4619,7 @@ class MenyClientTests(unittest.TestCase):
 
         client._click_checkout_control("checkout-next")
 
-        self.assertEqual(client._invoke.call_args_list.count(mock.call("get", "box", '[data-hermes-meal-planner-action="checkout-next"]')), 3)
+        self.assertEqual(client._invoke.call_args_list.count(mock.call("get", "box", '[data-meal-concierge-action="checkout-next"]')), 3)
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.1), mock.call(0.1)])
         self.assertIn(mock.call("mouse", "down"), client._invoke.call_args_list)
 
@@ -4715,7 +4748,7 @@ class MenyClientTests(unittest.TestCase):
         client._close_checkout_cart()
 
         client._invoke.assert_called_once_with(
-            "click", '[data-hermes-meal-planner-action="checkout-cart-close"]'
+            "click", '[data-meal-concierge-action="checkout-cart-close"]'
         )
         client._sleep.assert_called_once_with(0.25)
         self.assertIn("location.href === 'https://meny.no/kassen'", client._eval.call_args_list[0].args[0])
@@ -4915,8 +4948,8 @@ class MenyClientTests(unittest.TestCase):
 
         self.assertEqual(client._invoke.call_args_list, [
             mock.call("fill", 'input[name="phone-number"]', "90000000"),
-            mock.call("scrollintoview", '[data-hermes-meal-planner-action="vipps-next"]'),
-            mock.call("get", "box", '[data-hermes-meal-planner-action="vipps-next"]'),
+            mock.call("scrollintoview", '[data-meal-concierge-action="vipps-next"]'),
+            mock.call("get", "box", '[data-meal-concierge-action="vipps-next"]'),
             mock.call("mouse", "move", "25", "40"),
             mock.call("mouse", "down"),
             mock.call("mouse", "up"),
@@ -5611,7 +5644,7 @@ class FlowTests(unittest.TestCase):
 
     def test_status_exposes_the_fresh_confirmation_default(self):
         status = self.app.handle({"operation": "status"})
-        self.assertEqual(status["state_version"], 7)
+        self.assertEqual(status["state_version"], 8)
         self.assertEqual(status["confirmation_policy"], "fresh")
         self.assertEqual(status["product_favorites_count"], 0)
         self.assertNotIn("favorites", status)
@@ -6829,8 +6862,9 @@ class FlowTests(unittest.TestCase):
             })
 
         self.browser.submit_checkout = live_shaped_submit
-        prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
-        result = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
+            result = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
 
         self.assertTrue(result["confirmed"])
         self.assertEqual(self.browser.checkout_clicks, 1)
@@ -7340,7 +7374,7 @@ class FlowTests(unittest.TestCase):
             state["email_jobs"] = [{
                 "order_id": "old", "delivery_date": delivery, "status": "pending", "sent_at": None,
                 "provider": "oda",
-                "recipient_snapshot": "owner@example.test", "menu_snapshot": deepcopy(state["menu"]), "automation_protocol": 3,
+                "recipient_snapshot": "owner@example.test", "menu_snapshot": deepcopy(state["menu"]), "automation_protocol": 4,
             }]
         self.oda.order_delivery = delivery
 
@@ -7478,7 +7512,8 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(self.browser.checkout_clicks, 0)
         self.assertEqual(self.store.read()["occurrences"]["2026-W36"]["status"], "awaiting_confirmation")
         self.assertEqual(self.store.read()["occurrences"]["2026-W36"]["attempts"], 2)
-        confirmed = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": retried["confirmation_id"]})
+        with mock.patch("service.now", return_value=datetime(2026, 9, 3, 13, 5, tzinfo=timezone.utc)):
+            confirmed = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": retried["confirmation_id"]})
         self.assertTrue(confirmed["confirmed"])
         occurrence = self.store.read()["occurrences"]["2026-W36"]
         self.assertEqual(occurrence["status"], "completed")

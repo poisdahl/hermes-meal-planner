@@ -260,7 +260,7 @@ class RecipeSageAdapter(RecipeLibraryAdapter):
         payload = None
         headers = {
             "Accept": "application/json",
-            "User-Agent": "hermes-meal-planner/recipesage-v1",
+            "User-Agent": "meal-concierge/recipesage-v1",
         }
         if authenticated:
             headers["Authorization"] = self._authorization

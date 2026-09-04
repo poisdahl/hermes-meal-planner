@@ -740,7 +740,7 @@ class MenyClient:
         self.vipps_phone_number = vipps_phone_number
         self._cdp_primed = False
         self._viewport_primed = False
-        self.session = f"hermes-meal-planner-meny-{instance}"
+        self.session = f"meal-concierge-meny-{instance}"
         self.lock = threading.Lock()
         self.deadline: float | None = None
         self.recovery_allowed = False
@@ -971,7 +971,7 @@ class MenyClient:
             for _ in range(20):
                 state = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const query = EXPECTED;
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -993,7 +993,7 @@ class MenyClient:
   const radios = result ? [...result.querySelectorAll(':scope > .ws-search-result__header input[type="radio"]')].filter(x => x.value === 'recipes' && !x.disabled) : [];
   const labels = radios.length === 1 ? [...radios[0].labels].filter(visible).filter(x => /^Oppskrifter \(\d+\)$/.test(norm(x.innerText))) : [];
   const ready = route && authenticated.length === 1 && mains.length === 1 && roots.length === 1 && resultRoots.length === 1 && resultRoots[0] === roots[0] && queryHeadings.length === 1 && kindHeadings.length === 1 && radios.length === 1 && labels.length === 1;
-  if (ready) labels[0].setAttribute('data-hermes-meal-planner-action', 'search-kind');
+  if (ready) labels[0].setAttribute('data-meal-concierge-action', 'search-kind');
   return JSON.stringify({ready, identity, route, authenticated:authenticated.length === 1});
 })()
 """.replace("EXPECTED", json.dumps(query, ensure_ascii=False)))
@@ -1003,7 +1003,7 @@ class MenyClient:
                     self._sleep(0.25)
                     continue
                 if state.get("ready") is True:
-                    self._invoke("click", '[data-hermes-meal-planner-action="search-kind"]')
+                    self._invoke("click", '[data-meal-concierge-action="search-kind"]')
                     return
                 self._sleep(0.25)
             if attempt == 0:
@@ -1017,20 +1017,20 @@ class MenyClient:
         for _ in range(20):
             state = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
   const searches = [...document.querySelectorAll('input[placeholder="Hva lurer du på?"]')].filter(visible);
   if (searches.length === 1) {
-    searches[0].setAttribute('data-hermes-meal-planner-action', 'search');
+    searches[0].setAttribute('data-meal-concierge-action', 'search');
     return JSON.stringify({ready:identity && authenticated.length === 1, identity, authenticated:authenticated.length === 1, action:'search'});
   }
   const carts = [...document.querySelectorAll('[aria-label="Handlevogn"]')].filter(visible).filter(x => [...x.querySelectorAll('button')].filter(visible).some(button => ['Til kassen','Fortsett'].includes(norm(button.innerText))));
   const closers = carts.length === 1 ? [...carts[0].querySelectorAll('button[aria-label="Lukk"]')].filter(visible) : [];
   if (!identity || authenticated.length !== 1 || carts.length !== 1 || closers.length !== 1) return JSON.stringify({ready:false, identity, authenticated:authenticated.length === 1});
-  closers[0].setAttribute('data-hermes-meal-planner-action', 'close-cart');
+  closers[0].setAttribute('data-meal-concierge-action', 'close-cart');
   return JSON.stringify({ready:true, identity, authenticated:true, action:'close'});
 })()
 """)
@@ -1042,7 +1042,7 @@ class MenyClient:
                 return
             if state.get("ready") is True and state.get("action") == "close" and not closed_cart:
                 closed_cart = True
-                self._invoke("click", '[data-hermes-meal-planner-action="close-cart"]')
+                self._invoke("click", '[data-meal-concierge-action="close-cart"]')
                 self._sleep(0.3)
                 self._assert_authenticated()
                 continue
@@ -1135,7 +1135,7 @@ class MenyClient:
     def _resolve_order_route(self, order_change_code: str | None) -> None:
         result = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const code = CODE;
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -1150,7 +1150,7 @@ class MenyClient:
   const codes = [...text.matchAll(/\bbestilling\s+([A-Za-z0-9-]+)/gi)].map(x => x[1]);
   if (code !== null && (codes.length !== 1 || codes[0] !== code)) return JSON.stringify({dialog:true, ready:false});
   const target = code === null ? fresh[0] : existing[0];
-  target.setAttribute('data-hermes-meal-planner-action', 'order-route');
+  target.setAttribute('data-meal-concierge-action', 'order-route');
   return JSON.stringify({dialog:true, ready:true, route:code === null ? 'new' : 'existing'});
 })()
 """.replace("CODE", json.dumps(order_change_code)))
@@ -1158,7 +1158,7 @@ class MenyClient:
             return
         if result.get("ready") is not True:
             raise HouseholdError("MENY order routing prompt changed")
-        self._invoke("click", '[data-hermes-meal-planner-action="order-route"]')
+        self._invoke("click", '[data-meal-concierge-action="order-route"]')
         self._sleep(0.5)
         remaining = self._eval(r"""
 (() => {
@@ -1196,10 +1196,10 @@ class MenyClient:
             raise
 
     def _click_cart_remove_control(self, product: str, quantity: int, order_change_code: str | None, before_dispatch: Any) -> None:
-        selector = '[data-hermes-meal-planner-action="cart-remove"]'
+        selector = '[data-meal-concierge-action="cart-remove"]'
         gate = r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
@@ -1224,8 +1224,8 @@ class MenyClient:
   const candidates = [...root.querySelectorAll('button')].filter(enabled).filter(x => labels.includes(norm(x.getAttribute('aria-label') || x.innerText)));
   if (!match || Number(match[1]) !== current || current !== expectedQuantity || candidates.length !== 1) return JSON.stringify({ready:false});
   const target = candidates[0];
-  target.setAttribute('data-hermes-meal-planner-action', 'cart-remove');
-  const marked = [...document.querySelectorAll('[data-hermes-meal-planner-action="cart-remove"]')];
+  target.setAttribute('data-meal-concierge-action', 'cart-remove');
+  const marked = [...document.querySelectorAll('[data-meal-concierge-action="cart-remove"]')];
   const hit = requireHit ? document.elementFromPoint(__HIT_X__, __HIT_Y__) : target;
   return JSON.stringify({ready:marked.length === 1 && marked[0] === target && Boolean(hit) && (hit === target || target.contains(hit))});
 })()
@@ -1287,7 +1287,7 @@ class MenyClient:
     def _product_control(self, action: str, delta: int, product: str) -> dict[str, Any]:
         return self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const headings = [...document.querySelectorAll('main h1')].filter(visible);
@@ -1312,8 +1312,8 @@ class MenyClient:
       : label === `Fjern ${name} fra handlevognen`;
   });
   if (candidates.length !== 1 || (DELTA < 0 && quantity < 1)) return JSON.stringify({ready:false, page_ready:true, authenticated:authenticated.length === 1, quantity});
-  candidates[0].setAttribute('data-hermes-meal-planner-action', 'cart');
-  const marked = [...document.querySelectorAll('[data-hermes-meal-planner-action="cart"]')];
+  candidates[0].setAttribute('data-meal-concierge-action', 'cart');
+  const marked = [...document.querySelectorAll('[data-meal-concierge-action="cart"]')];
   const label = norm(candidates[0].getAttribute('aria-label') || candidates[0].innerText);
   return JSON.stringify({ready:marked.length === 1 && marked[0] === candidates[0], page_ready:true, authenticated:authenticated.length === 1, quantity, label});
 })()
@@ -1322,14 +1322,14 @@ class MenyClient:
     def _click_cart_control(self, product: str, label: str) -> None:
         if not label:
             raise HouseholdError("MENY cart control identity is unavailable")
-        selector = '[data-hermes-meal-planner-action="cart"]'
+        selector = '[data-meal-concierge-action="cart"]'
         ready = self._eval(r"""
 (() => {
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
-  const marked = [...document.querySelectorAll('[data-hermes-meal-planner-action="cart"]')];
+  const marked = [...document.querySelectorAll('[data-meal-concierge-action="cart"]')];
   const target = marked[0];
   return JSON.stringify({ready:authenticated.length === 1 && location.origin === 'https://meny.no' && location.pathname === PRODUCT && marked.length === 1 && enabled(target) && norm(target.getAttribute('aria-label') || target.innerText) === LABEL});
 })()
@@ -1348,7 +1348,7 @@ class MenyClient:
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
-  const marked = [...document.querySelectorAll('[data-hermes-meal-planner-action="cart"]')];
+  const marked = [...document.querySelectorAll('[data-meal-concierge-action="cart"]')];
   const target = marked[0], hit = document.elementFromPoint(X, Y);
   return JSON.stringify({clear:authenticated.length === 1 && location.origin === 'https://meny.no' && location.pathname === PRODUCT && marked.length === 1 && enabled(target) && norm(target.getAttribute('aria-label') || target.innerText) === LABEL && Boolean(hit) && (hit === target || target.contains(hit))});
 })()
@@ -1382,11 +1382,11 @@ class MenyClient:
     ) -> None:
         if action not in {"checkout-next", "vipps"}:
             raise HouseholdError("invalid MENY checkout action")
-        selector = f'[data-hermes-meal-planner-action="{action}"]'
+        selector = f'[data-meal-concierge-action="{action}"]'
         expected_pairs = sorted([[str(product_id), int(quantity)] for product_id, quantity in (expected_items or [])])
         gate = r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
@@ -1422,7 +1422,7 @@ class MenyClient:
     const activationSurface = target === radio || (target?.tagName === 'LABEL' && label === target);
     semantic = vipps.length === 1 && activationSurface && enabled(radio) && radio.checked !== true && radio.getAttribute('aria-checked') !== 'true' && /Leverings- og betalingsinformasjon/.test(norm(main[0].innerText));
   }
-  if (semantic && target) target.setAttribute('data-hermes-meal-planner-action', action);
+  if (semantic && target) target.setAttribute('data-meal-concierge-action', action);
   const marked = [...document.querySelectorAll(__SELECTOR__)];
   const hit = requireHit ? document.elementFromPoint(__HIT_X__, __HIT_Y__) : target;
   const hitInteractive = hit?.closest('button,a,input,select,textarea,[role="button"],[role="radio"]');
@@ -1460,10 +1460,10 @@ class MenyClient:
     ) -> None:
         if self.vipps_phone_number is None:
             raise HouseholdError("MENY checkout requires vipps_phone_number in the private household config")
-        selector = '[data-hermes-meal-planner-action="checkout-submit"]'
+        selector = '[data-meal-concierge-action="checkout-submit"]'
         gate = r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const requireHit = __REQUIRE_HIT__;
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -1495,8 +1495,8 @@ __DELIVERY_BINDING__
   const exact = checked && homeChecked && targetReady && buttons.length === 1 && blockingDialogs.length === 0 && totalLabels.length === 1 && totals.length === 1 && Math.round(totals[0]*100) === __TOTAL__ && deliveryBinding?.root && deliveryBinding.display === __DELIVERY__ && location.href === __URL__;
   if (!exact) return JSON.stringify({ready:false});
   const target = buttons[0];
-  target.setAttribute('data-hermes-meal-planner-action', 'checkout-submit');
-  const marked = [...document.querySelectorAll('[data-hermes-meal-planner-action="checkout-submit"]')];
+  target.setAttribute('data-meal-concierge-action', 'checkout-submit');
+  const marked = [...document.querySelectorAll('[data-meal-concierge-action="checkout-submit"]')];
   const hit = requireHit ? document.elementFromPoint(__HIT_X__, __HIT_Y__) : target;
   return JSON.stringify({ready:marked.length === 1 && marked[0] === target && Boolean(hit) && (hit === target || target.contains(hit))});
 })()
@@ -1593,7 +1593,7 @@ __DELIVERY_BINDING__
         for attempt in range(40):
             form = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
@@ -1604,7 +1604,7 @@ __DELIVERY_BINDING__
   const buttons = [...document.querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Next');
   const remember = [...document.querySelectorAll('input[type="checkbox"]')].filter(visible);
   const ready = identity && !sent && /Continue to pay with Vipps/i.test(text) && phones.length === 1 && buttons.length === 1 && remember.length === 1 && remember[0].checked === false;
-  if (ready) buttons[0].setAttribute('data-hermes-meal-planner-action', 'vipps-next');
+  if (ready) buttons[0].setAttribute('data-meal-concierge-action', 'vipps-next');
   return JSON.stringify({identity, ready, sent});
 })()
 """)
@@ -1620,10 +1620,10 @@ __DELIVERY_BINDING__
             self._invoke("fill", 'input[name="phone-number"]', self.vipps_phone_number)
         except HouseholdError as exc:
             raise HouseholdError("Vipps mobile number could not be entered; the outcome is uncertain; do not retry") from exc
-        selector = '[data-hermes-meal-planner-action="vipps-next"]'
+        selector = '[data-meal-concierge-action="vipps-next"]'
         gate = r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const requireHit = __REQUIRE_HIT__;
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
@@ -1632,7 +1632,7 @@ __DELIVERY_BINDING__
   const buttons = [...document.querySelectorAll('button')].filter(enabled).filter(x => (x.innerText || '').trim() === 'Next');
   const exact = location.origin === 'https://api.vipps.no' && location.pathname === '/dwo-api-application/v1/deeplink/vippsgateway' && phone && phone.value.replace(/\D/g,'') === __PHONE__ && remember.length === 1 && remember[0].checked === false && buttons.length === 1;
   const target = exact ? buttons[0] : null;
-  if (target) target.setAttribute('data-hermes-meal-planner-action', 'vipps-next');
+  if (target) target.setAttribute('data-meal-concierge-action', 'vipps-next');
   const hit = requireHit ? document.elementFromPoint(__HIT_X__, __HIT_Y__) : target;
   return JSON.stringify({ready:Boolean(target && hit && (hit === target || target.contains(hit)))});
 })()
@@ -1699,7 +1699,7 @@ __DELIVERY_BINDING__
   if (carts.length === 1) return JSON.stringify({open:true, ready:true, authenticated:authenticated.length === 1, root_count:1});
   const open = [...document.querySelectorAll('button')].filter(visible).filter(button => !button.disabled && norm(button.getAttribute('aria-label')) === 'Åpne handlevognen');
   if (carts.length !== 0 || open.length !== 1) return JSON.stringify({open:false, ready:false, authenticated:authenticated.length === 1, root_count:carts.length, open_count:open.length});
-  open[0].setAttribute('data-hermes-meal-planner-action', 'open-cart');
+  open[0].setAttribute('data-meal-concierge-action', 'open-cart');
   return JSON.stringify({open:false, ready:true, authenticated:authenticated.length === 1, root_count:0, open_count:1});
 })()
 """)
@@ -1711,7 +1711,7 @@ __DELIVERY_BINDING__
         if state.get("ready") is not True:
             raise HouseholdError("MENY cart is unavailable")
         if state.get("open") is not True:
-            self._invoke("click", '[data-hermes-meal-planner-action="open-cart"]')
+            self._invoke("click", '[data-meal-concierge-action="open-cart"]')
             self._sleep(0.5)
         result: dict[str, Any] = {}
         for _ in range(60):
@@ -1826,7 +1826,7 @@ __DELIVERY_BINDING__
         for attempt in range(20):
             result = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
@@ -1836,7 +1836,7 @@ __DELIVERY_BINDING__
   const identity = location.href === 'https://meny.no/kassen' && authenticated.length === 1;
   if (identity && carts.length === 0 && open.length === 1) return JSON.stringify({ready:true, open:false});
   if (identity && carts.length === 1 && closers.length === 1) {
-    closers[0].setAttribute('data-hermes-meal-planner-action', 'checkout-cart-close');
+    closers[0].setAttribute('data-meal-concierge-action', 'checkout-cart-close');
     return JSON.stringify({ready:true, open:true});
   }
   return JSON.stringify({ready:false, open:carts.length > 0});
@@ -1845,7 +1845,7 @@ __DELIVERY_BINDING__
             if result == {"ready": True, "open": False}:
                 return
             if result == {"ready": True, "open": True} and not clicked:
-                self._invoke("click", '[data-hermes-meal-planner-action="checkout-cart-close"]')
+                self._invoke("click", '[data-meal-concierge-action="checkout-cart-close"]')
                 clicked = True
             if attempt < 19:
                 self._sleep(0.25)
@@ -1865,7 +1865,7 @@ __DELIVERY_BINDING__
         for _ in range(20):
             result = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
@@ -1873,8 +1873,8 @@ __DELIVERY_BINDING__
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => [...x.querySelectorAll('h1')].filter(visible).filter(h => norm(h.innerText) === 'Når skal vi levere til deg?').length === 1);
   const buttons = [...document.querySelectorAll('button')].filter(visible).filter(x => !x.disabled && norm(x.getAttribute('aria-label') || x.innerText) === 'Velg leveringstid');
   if (!identity || authenticated.length !== 1 || dialogs.length !== 0 || buttons.length !== 1) return JSON.stringify({ready:false, identity, authenticated:authenticated.length === 1, dialog_count:dialogs.length});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'delivery-open');
-  return JSON.stringify({ready:[...document.querySelectorAll('[data-hermes-meal-planner-action="delivery-open"]')].length === 1, identity, authenticated:true});
+  buttons[0].setAttribute('data-meal-concierge-action', 'delivery-open');
+  return JSON.stringify({ready:[...document.querySelectorAll('[data-meal-concierge-action="delivery-open"]')].length === 1, identity, authenticated:true});
 })()
 """)
             if result.get("identity") is not True:
@@ -1886,7 +1886,7 @@ __DELIVERY_BINDING__
             self._sleep(0.25)
         else:
             raise HouseholdError("MENY delivery picker is unavailable")
-        self._invoke("click", '[data-hermes-meal-planner-action="delivery-open"]')
+        self._invoke("click", '[data-meal-concierge-action="delivery-open"]')
         for _ in range(60):
             ready = self._eval(r"""
 (() => {
@@ -1939,7 +1939,7 @@ __DELIVERY_BINDING__
         for _ in range(20):
             result = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
@@ -1962,7 +1962,7 @@ __DELIVERY_BINDING__
   }
   const dismiss = [...root.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Lukk');
   if (dismiss.length !== 1 || slots.length === 0) return JSON.stringify({ready:false, identity, authenticated:true, slots});
-  dismiss[0].setAttribute('data-hermes-meal-planner-action', 'delivery-dismiss');
+  dismiss[0].setAttribute('data-meal-concierge-action', 'delivery-dismiss');
   return JSON.stringify({ready:true, identity, authenticated:true, slots});
 })()
 """)
@@ -1975,7 +1975,7 @@ __DELIVERY_BINDING__
             self._sleep(0.25)
         else:
             raise HouseholdError("MENY delivery slots are unavailable")
-        self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        self._invoke("click", '[data-meal-concierge-action="delivery-dismiss"]')
         self._wait_delivery_picker_closed()
         slots = result["slots"]
         if delivery_date:
@@ -2046,7 +2046,7 @@ __DELIVERY_BINDING__
         for _ in range(20):
             marked = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const expectedSuffix = EXPECTED_SUFFIX.toLocaleLowerCase('nb-NO');
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -2070,13 +2070,13 @@ __DELIVERY_BINDING__
     const alternatives = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => x !== buttons[0] && slotPattern.test(norm(x.getAttribute('aria-label') || x.innerText)));
     if (selected.length !== 1 || keep.length > 1 || (keep.length === 1 && alternatives.length === 0)) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length});
     if (keep.length === 1) {
-      alternatives[0].setAttribute('data-hermes-meal-planner-action', 'delivery-refresh-slot');
+      alternatives[0].setAttribute('data-meal-concierge-action', 'delivery-refresh-slot');
       return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:true, refresh_slot:norm(alternatives[0].getAttribute('aria-label') || alternatives[0].innerText), label:norm(buttons[0].getAttribute('aria-label') || buttons[0].innerText)});
     }
-    dismiss[0].setAttribute('data-hermes-meal-planner-action', 'delivery-dismiss');
+    dismiss[0].setAttribute('data-meal-concierge-action', 'delivery-dismiss');
     return JSON.stringify({ready:true, identity, authenticated:true, already_selected:true, refresh_available:false, label:norm(buttons[0].getAttribute('aria-label') || buttons[0].innerText)});
   }
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'delivery-slot');
+  buttons[0].setAttribute('data-meal-concierge-action', 'delivery-slot');
   return JSON.stringify({ready:true, identity, authenticated:true, already_selected:false, label:norm(buttons[0].getAttribute('aria-label') || buttons[0].innerText)});
 })()
 """.replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
@@ -2093,7 +2093,7 @@ __DELIVERY_BINDING__
         selected_suffix = expected_suffix
         refreshing = False
         if marked.get("already_selected") is True and marked.get("refresh_available") is not True:
-            self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+            self._invoke("click", '[data-meal-concierge-action="delivery-dismiss"]')
             self._wait_delivery_picker_closed()
             selected = normalized_selected_meny_slot(slot_ref, marked.get("label"))
             return {
@@ -2108,13 +2108,13 @@ __DELIVERY_BINDING__
             if selected_slot_ref == slot_ref:
                 raise HouseholdError("MENY delivery refresh slot is invalid")
             refreshing = True
-            self._invoke("click", '[data-hermes-meal-planner-action="delivery-refresh-slot"]')
+            self._invoke("click", '[data-meal-concierge-action="delivery-refresh-slot"]')
         else:
-            self._invoke("click", '[data-hermes-meal-planner-action="delivery-slot"]')
+            self._invoke("click", '[data-meal-concierge-action="delivery-slot"]')
         for _ in range(20):
             confirmation = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const expectedSuffix = EXPECTED_SUFFIX.toLocaleLowerCase('nb-NO');
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -2136,7 +2136,7 @@ __DELIVERY_BINDING__
     return parts && parts[1].toLocaleLowerCase('nb-NO') === expectedSuffix;
   });
   if (allSelected.length !== 1 || selected.length !== 1 || confirm.length + keep.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length, total_selected_count:allSelected.length});
-  (confirm[0] || keep[0]).setAttribute('data-hermes-meal-planner-action', 'delivery-confirm');
+  (confirm[0] || keep[0]).setAttribute('data-meal-concierge-action', 'delivery-confirm');
   return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1, keeping_existing:keep.length === 1});
 })()
 """.replace("EXPECTED_SUFFIX", json.dumps(selected_suffix, ensure_ascii=False)))
@@ -2150,7 +2150,7 @@ __DELIVERY_BINDING__
         else:
             raise HouseholdError("MENY delivery confirmation changed")
         self._invoke("network", "requests", "--clear")
-        self._invoke("click", '[data-hermes-meal-planner-action="delivery-confirm"]')
+        self._invoke("click", '[data-meal-concierge-action="delivery-confirm"]')
         self._wait_for_delivery_reservation()
         self._wait_delivery_picker_closed()
         if refreshing:
@@ -2165,7 +2165,7 @@ __DELIVERY_BINDING__
         for _ in range(20):
             selected = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const expectedSuffix = EXPECTED_SUFFIX.toLocaleLowerCase('nb-NO');
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -2178,7 +2178,7 @@ __DELIVERY_BINDING__
   const selected = allSelected.filter(x => norm(x.getAttribute('aria-label') || x.innerText).toLocaleLowerCase('nb-NO').endsWith(expectedSuffix));
   const dismiss = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Lukk');
   if (allSelected.length !== 1 || selected.length !== 1 || dismiss.length !== 1) return JSON.stringify({ready:false, identity, authenticated:true, selected_count:selected.length, total_selected_count:allSelected.length});
-  dismiss[0].setAttribute('data-hermes-meal-planner-action', 'delivery-dismiss');
+  dismiss[0].setAttribute('data-meal-concierge-action', 'delivery-dismiss');
   return JSON.stringify({ready:true, identity, authenticated:true, selected_count:1, total_selected_count:1, label:norm(selected[0].getAttribute('aria-label') || selected[0].innerText)});
 })()
 """.replace("EXPECTED_SUFFIX", json.dumps(expected_suffix, ensure_ascii=False)))
@@ -2191,7 +2191,7 @@ __DELIVERY_BINDING__
             self._sleep(0.25)
         else:
             raise HouseholdError("MENY selected delivery could not be verified")
-        self._invoke("click", '[data-hermes-meal-planner-action="delivery-dismiss"]')
+        self._invoke("click", '[data-meal-concierge-action="delivery-dismiss"]')
         self._wait_delivery_picker_closed()
         verified = normalized_selected_meny_slot(slot_ref, selected.get("label"))
         return {
@@ -2289,7 +2289,7 @@ __DELIVERY_BINDING__
         self._sleep(1.5)
         script = r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const expected = EXPECTED;
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
@@ -2331,7 +2331,7 @@ __DELIVERY_BINDING__
   }
   const buttons = [...root.querySelectorAll('button')].filter(visible).filter(x => /^Bestilte varer \(\d+\)$/.test(norm(x.innerText)));
   const expand = !rowsReady && buttons.length === 1 && buttons[0].getAttribute('aria-expanded') !== 'true';
-  if (expand) buttons[0].setAttribute('data-hermes-meal-planner-action', 'order-items');
+  if (expand) buttons[0].setAttribute('data-meal-concierge-action', 'order-items');
   const orderPaths = [`/trumf-profil/nettbutikk/bestilling/${expected}`, `/profil/nettbutikk/bestilling/${expected}`];
   const baseReady = actual === expected && orderPaths.includes(location.pathname) && heading.length === 1 && Number.isFinite(total) && Boolean(delivery) && Number.isInteger(itemCount) && itemCount > 0;
   return JSON.stringify({ready:baseReady && rowsReady, expand:baseReady && expand, authenticated:true, order_number:actual, code, status, total, delivery, item_count:itemCount, products});
@@ -2346,7 +2346,7 @@ __DELIVERY_BINDING__
             if result.get("ready") is True:
                 break
             if result.get("expand") is True and not expanded:
-                self._invoke("click", '[data-hermes-meal-planner-action="order-items"]')
+                self._invoke("click", '[data-meal-concierge-action="order-items"]')
                 expanded = True
             self._sleep(0.25)
         else:
@@ -2466,7 +2466,7 @@ __DELIVERY_BINDING__
         self._sleep(0.25)
         state_script = r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const identity = location.origin === 'https://meny.no' && location.pathname === '/varer' && !location.search && !location.hash;
@@ -2475,7 +2475,7 @@ __DELIVERY_BINDING__
   if (identity && carts.length === 1) return JSON.stringify({ready:true, open:true, authenticated:authenticated.length === 1});
   const open = [...document.querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.getAttribute('aria-label')) === 'Åpne handlevognen');
   if (!identity || carts.length !== 0 || open.length !== 1) return JSON.stringify({ready:false, open:false, authenticated:authenticated.length === 1});
-  open[0].setAttribute('data-hermes-meal-planner-action', 'verify-cart-open');
+  open[0].setAttribute('data-meal-concierge-action', 'verify-cart-open');
   return JSON.stringify({ready:true, open:false, authenticated:authenticated.length === 1});
 })()
 """
@@ -2491,7 +2491,7 @@ __DELIVERY_BINDING__
         if state.get("ready") is not True:
             raise HouseholdError("MENY cart is unavailable")
         if state.get("open") is not True:
-            self._invoke("click", '[data-hermes-meal-planner-action="verify-cart-open"]')
+            self._invoke("click", '[data-meal-concierge-action="verify-cart-open"]')
             self._sleep(0.4)
         result_script = r"""
 (() => {
@@ -2533,36 +2533,36 @@ __DELIVERY_BINDING__
                 raise HouseholdError("MENY order change identity is unavailable")
             result = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const buttons = [...document.querySelectorAll('main button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.innerText) === 'Endre');
   if (buttons.length !== 1) return JSON.stringify({ready:false});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'change-open');
+  buttons[0].setAttribute('data-meal-concierge-action', 'change-open');
   return JSON.stringify({ready:true});
 })()
 """)
             if result != {"ready": True}:
                 raise HouseholdError("MENY order cannot be changed now")
-            self._invoke("click", '[data-hermes-meal-planner-action="change-open"]')
+            self._invoke("click", '[data-meal-concierge-action="change-open"]')
             self._sleep(0.25)
             dialog = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Vil du endre bestillingen\?/i.test(norm(x.innerText)));
   if (dialogs.length !== 1) return JSON.stringify({ready:false});
   const buttons = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.innerText) === 'Endre bestilling');
   if (buttons.length !== 1) return JSON.stringify({ready:false});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'change-confirm');
+  buttons[0].setAttribute('data-meal-concierge-action', 'change-confirm');
   return JSON.stringify({ready:true});
 })()
 """)
             if dialog != {"ready": True}:
                 raise HouseholdError("MENY order change confirmation changed")
             try:
-                self._invoke("click", '[data-hermes-meal-planner-action="change-confirm"]')
+                self._invoke("click", '[data-meal-concierge-action="change-confirm"]')
                 for _ in range(40):
                     ready = self._eval(r"""
 (() => {
@@ -2595,7 +2595,7 @@ __DELIVERY_BINDING__
             self._verify_order_change(order_id, code)
             opened = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const expected = CODE;
@@ -2605,30 +2605,30 @@ __DELIVERY_BINDING__
   });
   const buttons = carts.length === 1 ? [...carts[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.innerText) === 'Avbryt endring') : [];
   if (buttons.length !== 1) return JSON.stringify({ready:false});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'change-abort-open');
+  buttons[0].setAttribute('data-meal-concierge-action', 'change-abort-open');
   return JSON.stringify({ready:true});
 })()
 """.replace("CODE", json.dumps(str(code))))
             if opened != {"ready": True}:
                 raise HouseholdError("MENY order change is not active")
-            self._invoke("click", '[data-hermes-meal-planner-action="change-abort-open"]')
+            self._invoke("click", '[data-meal-concierge-action="change-abort-open"]')
             self._sleep(0.25)
             final = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Vil du avbryte endringen\?/i.test(norm(x.innerText)));
   if (dialogs.length !== 1) return JSON.stringify({ready:false});
   const buttons = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.innerText) === 'Avbryt endring');
   if (buttons.length !== 1) return JSON.stringify({ready:false});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'change-abort-final');
+  buttons[0].setAttribute('data-meal-concierge-action', 'change-abort-final');
   return JSON.stringify({ready:true});
 })()
 """)
             if final != {"ready": True}:
                 raise HouseholdError("MENY order change abort confirmation changed")
-            self._invoke("click", '[data-hermes-meal-planner-action="change-abort-final"]')
+            self._invoke("click", '[data-meal-concierge-action="change-abort-final"]')
             self._sleep(0.5)
             order = self._get_order(order_id)
             return {"provider": "meny", "order_id": order_id, "aborted": True, "order": order}
@@ -2674,7 +2674,7 @@ __DELIVERY_BINDING__
         self._sleep(0.8)
         step_script = r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const main = [...document.querySelectorAll('main')].filter(visible);
@@ -2719,7 +2719,7 @@ __DELIVERY_BINDING__
   }
   const minimumMessage = text.match(/Du må handle for \d+(?:[ .]\d{3})*,\d{2}\s*kr til for å få varene levert på døren\.?/i)?.[0] || null;
   const ready = /Se over varene/.test(text) && targetReady && unavailableReady && buttons.length === 1 && controls.length > 0 && items.length === controls.length;
-  if (ready && enabled) buttons[0].setAttribute('data-hermes-meal-planner-action', 'checkout-next');
+  if (ready && enabled) buttons[0].setAttribute('data-meal-concierge-action', 'checkout-next');
   return JSON.stringify({ready, authenticated:true, step:1, next_enabled:enabled, minimum_message:minimumMessage, items, unavailable_items:unavailableItems, active_order_change:active});
 })()
 """.replace("TARGET", json.dumps(target_code or None))
@@ -2788,18 +2788,18 @@ __DELIVERY_BINDING__
   const dialogs = [...document.querySelectorAll('[role="dialog"]')].filter(visible).filter(x => /Noen av varene har vi dessverre ikke/i.test(norm(x.innerText)));
   if (dialogs.length !== 1) return JSON.stringify({unavailable:false, dismiss:false});
   const dismiss = [...dialogs[0].querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Avbryt');
-  if (dismiss.length === 1) dismiss[0].setAttribute('data-hermes-meal-planner-action', 'checkout-unavailable-dismiss');
+  if (dismiss.length === 1) dismiss[0].setAttribute('data-meal-concierge-action', 'checkout-unavailable-dismiss');
   return JSON.stringify({unavailable:true, dismiss:dismiss.length === 1});
 })()
 """)
         if unavailable.get("unavailable") is True:
             if unavailable.get("dismiss") is True:
-                self._invoke("click", '[data-hermes-meal-planner-action="checkout-unavailable-dismiss"]')
+                self._invoke("click", '[data-meal-concierge-action="checkout-unavailable-dismiss"]')
             raise HouseholdError("MENY cart contains unavailable items; adjust the cart before preparing checkout")
         for _ in range(20):
             payment = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const main = [...document.querySelectorAll('main')].filter(visible);
@@ -2807,7 +2807,7 @@ __DELIVERY_BINDING__
   const vipps = [...main[0].querySelectorAll('input[type="radio"], [role="radio"]')].filter(visible).filter(x => /^Vipps(?:\s|$)/i.test(norm(x.getAttribute('aria-label') || x.closest('label')?.innerText || x.parentElement?.innerText)));
   if (vipps.length !== 1) return JSON.stringify({ready:false});
   const checked = vipps[0].checked === true || vipps[0].getAttribute('aria-checked') === 'true';
-  if (!checked) (vipps[0].closest('label') || vipps[0]).setAttribute('data-hermes-meal-planner-action', 'vipps');
+  if (!checked) (vipps[0].closest('label') || vipps[0]).setAttribute('data-meal-concierge-action', 'vipps');
   return JSON.stringify({ready:true, checked});
 })()
 """)
@@ -2941,7 +2941,7 @@ __DELIVERY_BINDING__
                     raise HouseholdError("MENY checkout changed after review")
                 ready = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
@@ -2970,7 +2970,7 @@ __DELIVERY_BINDING__
 __DELIVERY_BINDING__
   const exact = checked && homeChecked && targetReady && buttons.length === 1 && totalLabels.length === 1 && totals.length === 1 && Math.round(totals[0]*100) === __TOTAL__ && deliveryBinding?.root && deliveryBinding.display === __DELIVERY__ && location.href === __URL__;
   if (!exact) return JSON.stringify({ready:false});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'checkout-submit');
+  buttons[0].setAttribute('data-meal-concierge-action', 'checkout-submit');
   return JSON.stringify({ready:true});
 })()
 """.replace("__DELIVERY_BINDING__", CHECKOUT_DELIVERY_BINDING_JS).replace("__CODE__", json.dumps(review.get("target_order_code"))).replace("__TOTAL__", str(int(round(float(review["summary"]["total"]) * 100)))).replace("__DELIVERY__", json.dumps(review["summary"]["delivery"]["display"], ensure_ascii=False)).replace("__URL__", json.dumps(CHECKOUT_URL)))
@@ -3002,7 +3002,7 @@ __DELIVERY_BINDING__
                 raise HouseholdError("MENY order changed before cancellation review")
             result = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const expected = ORDER, paths = [`/trumf-profil/nettbutikk/bestilling/${expected}`, `/profil/nettbutikk/bestilling/${expected}`];
@@ -3012,17 +3012,17 @@ __DELIVERY_BINDING__
   if (!paths.includes(location.pathname) || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({available:false});
   const buttons = [...main[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Kanseller bestilling');
   if (buttons.length !== 1) return JSON.stringify({available:false});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'cancel-open');
+  buttons[0].setAttribute('data-meal-concierge-action', 'cancel-open');
   return JSON.stringify({available:true});
 })()
 """.replace("ORDER", json.dumps(order_id)))
             if result.get("available") is not True:
                 return {"available": False, "reason": "MENY order is not cancellable"}
-            self._invoke("click", '[data-hermes-meal-planner-action="cancel-open"]')
+            self._invoke("click", '[data-meal-concierge-action="cancel-open"]')
             self._sleep(0.25)
             dialog = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const dialogs = [...document.querySelectorAll('dialog,[role="dialog"]')].filter(visible).filter(x => /Sikker på at du vil kansellere bestilling/i.test(norm(x.innerText)));
@@ -3030,13 +3030,13 @@ __DELIVERY_BINDING__
   const root = dialogs[0], final = [...root.querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Kanseller');
   const dismiss = [...root.querySelectorAll('button')].filter(visible).filter(x => norm(x.innerText) === 'Avbryt');
   if (final.length !== 1 || dismiss.length !== 1) return JSON.stringify({ready:false});
-  dismiss[0].setAttribute('data-hermes-meal-planner-action', 'cancel-dismiss');
+  dismiss[0].setAttribute('data-meal-concierge-action', 'cancel-dismiss');
   return JSON.stringify({ready:true, consequence:null});
 })()
 """)
             if dialog.get("ready") is not True:
                 raise HouseholdError("MENY cancellation dialog changed")
-            self._invoke("click", '[data-hermes-meal-planner-action="cancel-dismiss"]')
+            self._invoke("click", '[data-meal-concierge-action="cancel-dismiss"]')
             for _ in range(20):
                 settled = self._eval(r"""
 (() => {
@@ -3068,7 +3068,7 @@ __DELIVERY_BINDING__
                     raise HouseholdError("MENY order changed after cancellation confirmation")
                 opened = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const expected = ORDER, paths = [`/trumf-profil/nettbutikk/bestilling/${expected}`, `/profil/nettbutikk/bestilling/${expected}`];
@@ -3078,17 +3078,17 @@ __DELIVERY_BINDING__
   if (!paths.includes(location.pathname) || main.length !== 1 || index < 0 || lines[index+1] !== expected) return JSON.stringify({ready:false});
   const buttons = [...main[0].querySelectorAll('button')].filter(visible).filter(x => !x.disabled && x.getAttribute('aria-disabled') !== 'true').filter(x => norm(x.getAttribute('aria-label') || x.innerText) === 'Kanseller bestilling');
   if (buttons.length !== 1) return JSON.stringify({ready:false});
-  buttons[0].setAttribute('data-hermes-meal-planner-action', 'cancel-submit-open');
+  buttons[0].setAttribute('data-meal-concierge-action', 'cancel-submit-open');
   return JSON.stringify({ready:true});
 })()
 """.replace("ORDER", json.dumps(order_id)))
                 if opened != {"ready": True}:
                     raise HouseholdError("MENY cancellation control changed")
-                self._invoke("click", '[data-hermes-meal-planner-action="cancel-submit-open"]')
+                self._invoke("click", '[data-meal-concierge-action="cancel-submit-open"]')
                 self._sleep(0.25)
                 final = self._eval(r"""
 (() => {
-  document.querySelectorAll('[data-hermes-meal-planner-action]').forEach(x => x.removeAttribute('data-hermes-meal-planner-action'));
+  document.querySelectorAll('[data-meal-concierge-action]').forEach(x => x.removeAttribute('data-meal-concierge-action'));
   const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
   const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
   const enabled = x => visible(x) && !x.disabled && x.getAttribute('aria-disabled') !== 'true';
@@ -3102,7 +3102,7 @@ __DELIVERY_BINDING__
   const confirm = [...dialogs[0].querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Kanseller');
   const dismiss = [...dialogs[0].querySelectorAll('button')].filter(enabled).filter(x => norm(x.innerText) === 'Avbryt');
   if (confirm.length !== 1 || dismiss.length !== 1) return JSON.stringify({ready:false});
-  confirm[0].setAttribute('data-hermes-meal-planner-action', 'cancel-submit-final');
+  confirm[0].setAttribute('data-meal-concierge-action', 'cancel-submit-final');
   return JSON.stringify({ready:true});
 })()
 """.replace("ORDER", json.dumps(order_id)))
@@ -3112,7 +3112,7 @@ __DELIVERY_BINDING__
                 if before_click:
                     before_click()
                 final_dispatched = True
-                self._invoke("click", '[data-hermes-meal-planner-action="cancel-submit-final"]')
+                self._invoke("click", '[data-meal-concierge-action="cancel-submit-final"]')
         except HouseholdError as exc:
             if not final_dispatched:
                 raise CancellationPreconditionError(str(exc)) from exc

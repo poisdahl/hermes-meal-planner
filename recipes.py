@@ -663,7 +663,7 @@ class RecipeStore:
             )
             version = "1"
         if version not in {"1", "2", "3", "4"}:
-            raise RecipeError("recipe bank schema is newer than this meal planner")
+            raise RecipeError("recipe bank schema is newer than this meal concierge")
         row = connection.execute("SELECT value FROM metadata WHERE key='household'").fetchone()
         if row is None:
             connection.execute(
@@ -961,7 +961,7 @@ class RecipeStore:
                 if metadata.get("household") not in {None, self.household}:
                     raise RecipeError("recipe bank belongs to a different household")
                 if metadata.get("schema_version") not in {None, "1", "2", "3", "4"}:
-                    raise RecipeError("recipe bank schema is newer than this meal planner")
+                    raise RecipeError("recipe bank schema is newer than this meal concierge")
             recipes_exist = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recipes'"
             ).fetchone()

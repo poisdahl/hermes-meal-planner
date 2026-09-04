@@ -124,7 +124,7 @@ def _probe(connection: Mapping[str, Any], credential: Mapping[str, Any]) -> dict
 
 def _restart_running_service() -> None:
     if os.uname().sysname == "Darwin":
-        label = os.environ.get("MEAL_PLANNER_LAUNCHD_LABEL", "com.hermes-agent.meal-planner")
+        label = os.environ.get("MEAL_CONCIERGE_LAUNCHD_LABEL", "com.hermes-agent.meal-concierge")
         target = f"gui/{os.getuid()}/{label}"
         status = subprocess.run(
             ["launchctl", "print", target],
@@ -143,7 +143,7 @@ def _restart_running_service() -> None:
         )
     else:
         subprocess.run(
-            ["systemctl", "--user", "try-restart", "hermes-meal-planner.service"],
+            ["systemctl", "--user", "try-restart", "meal-concierge.service"],
             check=True,
             stdin=subprocess.DEVNULL,
         )
@@ -340,7 +340,7 @@ def _remove_connection(args: argparse.Namespace, config: dict[str, Any]) -> dict
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Configure optional Meal Planner recipe libraries locally")
+    result = argparse.ArgumentParser(description="Configure optional Meal Concierge recipe libraries locally")
     result.add_argument("--config", type=Path, required=True)
     result.add_argument("--home", type=Path, required=True)
     result.add_argument(

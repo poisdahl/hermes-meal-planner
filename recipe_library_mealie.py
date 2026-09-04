@@ -161,7 +161,7 @@ class MealieAdapter(RecipeLibraryAdapter):
         headers = {
             "Accept": "application/json",
             "Authorization": self._authorization,
-            "User-Agent": "hermes-meal-planner/mealie-v1",
+            "User-Agent": "meal-concierge/mealie-v1",
         }
         if body is not None:
             try:

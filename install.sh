@@ -6,10 +6,10 @@ usage() {
 Usage: ./install.sh --provider oda|meny --household NAME
 
 Installs one household into the standard non-root Hermes home. Set HERMES_HOME,
-HERMES_PYTHON, MEAL_PLANNER_AGENT_BROWSER, or MEAL_PLANNER_BROWSER_EXECUTABLE
-only when the standard locations do not apply. Set MEAL_PLANNER_NODE when an
+HERMES_PYTHON, MEAL_CONCIERGE_AGENT_BROWSER, or MEAL_CONCIERGE_BROWSER_EXECUTABLE
+only when the standard locations do not apply. Set MEAL_CONCIERGE_NODE when an
 agent-browser wrapper needs a non-standard Node.js 24+ executable. MENY also
-needs MEAL_PLANNER_VIPPS_PHONE_NUMBER, or an interactive private prompt.
+needs MEAL_CONCIERGE_VIPPS_PHONE_NUMBER, or an interactive private prompt.
 EOF
 }
 
@@ -45,13 +45,13 @@ if [[ -z "$household" || "$household" == *$'\n'* || "$household" == *$'\r'* ]]; 
   echo "--household must be a non-empty single-line name" >&2
   exit 2
 fi
-vipps_phone_number="${MEAL_PLANNER_VIPPS_PHONE_NUMBER:-}"
+vipps_phone_number="${MEAL_CONCIERGE_VIPPS_PHONE_NUMBER:-}"
 if [[ "$provider" == "meny" && -z "$vipps_phone_number" && -t 0 ]]; then
   read -r -s -p "Vipps mobile number (8 digits): " vipps_phone_number
   printf '\n'
 fi
 if [[ "$provider" == "meny" && ! "$vipps_phone_number" =~ ^[0-9]{8}$ ]]; then
-  echo "MENY requires an 8-digit MEAL_PLANNER_VIPPS_PHONE_NUMBER" >&2
+  echo "MENY requires an 8-digit MEAL_CONCIERGE_VIPPS_PHONE_NUMBER" >&2
   exit 2
 fi
 if ! command -v hermes >/dev/null 2>&1; then
@@ -67,17 +67,17 @@ fi
 source_root="$(cd -- "$(dirname -- "$0")" && pwd)"
 cd "$source_root"
 hermes_home="${HERMES_HOME:-$HOME/.hermes}"
-private_root="${MEAL_PLANNER_HOME:-$hermes_home/meal-planner}"
+private_root="${MEAL_CONCIERGE_HOME:-$hermes_home/meal-concierge}"
 config_path="$private_root/config.json"
 socket_path="$private_root/service.sock"
-browser_socket_directory="${MEAL_PLANNER_BROWSER_SOCKET_DIR:-${XDG_RUNTIME_DIR:-/tmp}/hermes-meal-planner-$(id -u)}"
-unit_path="$hermes_home/systemd/hermes-meal-planner.service"
+browser_socket_directory="${MEAL_CONCIERGE_BROWSER_SOCKET_DIR:-${XDG_RUNTIME_DIR:-/tmp}/meal-concierge-$(id -u)}"
+unit_path="$hermes_home/systemd/meal-concierge.service"
 xdg_config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-user_unit_path="$xdg_config_home/systemd/user/hermes-meal-planner.service"
-launchd_label="${MEAL_PLANNER_LAUNCHD_LABEL:-com.hermes-agent.meal-planner}"
-launch_agent_path="${MEAL_PLANNER_LAUNCH_AGENT_PATH:-$HOME/Library/LaunchAgents/$launchd_label.plist}"
-launchd_stdout_path="${MEAL_PLANNER_STDOUT_LOG:-$HOME/Library/Logs/$launchd_label.out.log}"
-launchd_stderr_path="${MEAL_PLANNER_STDERR_LOG:-$HOME/Library/Logs/$launchd_label.err.log}"
+user_unit_path="$xdg_config_home/systemd/user/meal-concierge.service"
+launchd_label="${MEAL_CONCIERGE_LAUNCHD_LABEL:-com.hermes-agent.meal-concierge}"
+launch_agent_path="${MEAL_CONCIERGE_LAUNCH_AGENT_PATH:-$HOME/Library/LaunchAgents/$launchd_label.plist}"
+launchd_stdout_path="${MEAL_CONCIERGE_STDOUT_LOG:-$HOME/Library/Logs/$launchd_label.out.log}"
+launchd_stderr_path="${MEAL_CONCIERGE_STDERR_LOG:-$HOME/Library/Logs/$launchd_label.err.log}"
 existing_install=false
 if [[ -e "$config_path" || -e "$private_root/state/state.json" || -e "$unit_path" || -e "$user_unit_path" || -e "$launch_agent_path" ]]; then
   existing_install=true
@@ -103,16 +103,16 @@ if [[ -z "$python" ]] || ! "$python" -c 'import mcp; import tools.mcp_oauth' >/d
   exit 1
 fi
 
-if [[ -n "${MEAL_PLANNER_AGENT_BROWSER:-}" && -x "$MEAL_PLANNER_AGENT_BROWSER" ]]; then
-  agent_browser="$MEAL_PLANNER_AGENT_BROWSER"
+if [[ -n "${MEAL_CONCIERGE_AGENT_BROWSER:-}" && -x "$MEAL_CONCIERGE_AGENT_BROWSER" ]]; then
+  agent_browser="$MEAL_CONCIERGE_AGENT_BROWSER"
 elif command -v agent-browser >/dev/null 2>&1; then
   agent_browser="$(command -v agent-browser)"
-elif [[ -x "$HOME/.local/lib/hermes-meal-planner/node_modules/.bin/agent-browser" ]]; then
-  agent_browser="$HOME/.local/lib/hermes-meal-planner/node_modules/.bin/agent-browser"
+elif [[ -x "$HOME/.local/lib/meal-concierge/node_modules/.bin/agent-browser" ]]; then
+  agent_browser="$HOME/.local/lib/meal-concierge/node_modules/.bin/agent-browser"
 elif [[ -x "$hermes_home/node/bin/agent-browser" ]]; then
   agent_browser="$hermes_home/node/bin/agent-browser"
 else
-  echo "agent-browser is missing. Install it under your home and set MEAL_PLANNER_AGENT_BROWSER." >&2
+  echo "agent-browser is missing. Install it under your home and set MEAL_CONCIERGE_AGENT_BROWSER." >&2
   exit 1
 fi
 runtime_path="/usr/local/bin:/usr/bin:/bin"
@@ -121,14 +121,14 @@ if [[ "$(LC_ALL=C head -c 2 -- "$agent_browser" 2>/dev/null || true)" == '#!' ]]
   agent_browser_header="$(head -n 1 -- "$agent_browser" 2>/dev/null || true)"
 fi
 if [[ "$agent_browser_header" == *node* ]]; then
-  if [[ -n "${MEAL_PLANNER_NODE:-}" && -x "$MEAL_PLANNER_NODE" ]]; then
-    node="$MEAL_PLANNER_NODE"
+  if [[ -n "${MEAL_CONCIERGE_NODE:-}" && -x "$MEAL_CONCIERGE_NODE" ]]; then
+    node="$MEAL_CONCIERGE_NODE"
   elif [[ -x "$hermes_home/node/bin/node" ]]; then
     node="$hermes_home/node/bin/node"
   elif command -v node >/dev/null 2>&1; then
     node="$(command -v node)"
   else
-    echo "agent-browser requires Node.js 24 or newer; install it or set MEAL_PLANNER_NODE" >&2
+    echo "agent-browser requires Node.js 24 or newer; install it or set MEAL_CONCIERGE_NODE" >&2
     exit 1
   fi
   node_major="$("$node" -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || true)"
@@ -139,8 +139,8 @@ if [[ "$agent_browser_header" == *node* ]]; then
   runtime_path="$(dirname -- "$node"):$runtime_path"
 fi
 
-if [[ -n "${MEAL_PLANNER_BROWSER_EXECUTABLE:-}" && -x "$MEAL_PLANNER_BROWSER_EXECUTABLE" ]]; then
-  chromium="$MEAL_PLANNER_BROWSER_EXECUTABLE"
+if [[ -n "${MEAL_CONCIERGE_BROWSER_EXECUTABLE:-}" && -x "$MEAL_CONCIERGE_BROWSER_EXECUTABLE" ]]; then
+  chromium="$MEAL_CONCIERGE_BROWSER_EXECUTABLE"
 else
   chromium=
   for candidate in chromium chromium-browser google-chrome-stable google-chrome; do
@@ -163,13 +163,13 @@ else
   fi
 fi
 if [[ -z "$chromium" ]]; then
-  echo "Chromium is missing. Install it or set MEAL_PLANNER_BROWSER_EXECUTABLE" >&2
+  echo "Chromium is missing. Install it or set MEAL_CONCIERGE_BROWSER_EXECUTABLE" >&2
   exit 1
 fi
 resolved_chromium="$(readlink -f -- "$chromium" 2>/dev/null || printf '%s' "$chromium")"
 if [[ "$chromium" == /snap/* || "$resolved_chromium" == /snap/* ]] \
   || { [[ -r "$chromium" ]] && grep -Eq '/snap/bin/chromium|snap run chromium' "$chromium"; }; then
-  echo "Snap Chromium cannot use the private Hermes profile. Install a non-snap Chromium/Chrome and set MEAL_PLANNER_BROWSER_EXECUTABLE." >&2
+  echo "Snap Chromium cannot use the private Hermes profile. Install a non-snap Chromium/Chrome and set MEAL_CONCIERGE_BROWSER_EXECUTABLE." >&2
   exit 1
 fi
 if [[ "$provider" == "oda" && ! -f "$hermes_home/mcp-tokens/oda-weekly.json" ]]; then
@@ -186,7 +186,7 @@ path = Path(sys.argv[1])
 value = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
 server = ((value or {}).get("mcp_servers") or {}).get("oda-weekly")
 if not isinstance(server, dict) or server.get("enabled") is not False:
-    raise SystemExit("disable the raw oda-weekly MCP server before installing the guarded meal planner")
+    raise SystemExit("disable the raw oda-weekly MCP server before installing the guarded meal concierge")
 PY
 fi
 case "$(uname -s)" in
@@ -196,7 +196,7 @@ case "$(uname -s)" in
       exit 1
     fi
     if [[ ! "$launchd_label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-      echo "MEAL_PLANNER_LAUNCHD_LABEL contains unsupported characters" >&2
+      echo "MEAL_CONCIERGE_LAUNCHD_LABEL contains unsupported characters" >&2
       exit 2
     fi
     launchd_domain="gui/$(id -u)"
@@ -216,7 +216,7 @@ case "$(uname -s)" in
 esac
 
 umask 077
-mkdir -p "$private_root/state" "$private_root/browser/profile" "$private_root/secrets/recipe-libraries" "$browser_socket_directory" "$hermes_home/skills/meal-planner"
+mkdir -p "$private_root/state" "$private_root/browser/profile" "$private_root/secrets/recipe-libraries" "$browser_socket_directory" "$hermes_home/skills/meal-concierge"
 if [[ "$service_manager" == "systemd" ]]; then
   mkdir -p "$(dirname -- "$unit_path")" "$(dirname -- "$user_unit_path")"
 else
@@ -257,8 +257,8 @@ fi
 chmod 600 "$config_path"
 
 if [[ "$existing_install" == true && "$service_manager" == "systemd" ]]; then
-  if systemctl --user is-active --quiet hermes-meal-planner.service; then
-    systemctl --user stop hermes-meal-planner.service
+  if systemctl --user is-active --quiet meal-concierge.service; then
+    systemctl --user stop meal-concierge.service
   fi
 elif [[ "$existing_install" == true ]] && launchctl print "$launchd_domain/$launchd_label" >/dev/null 2>&1; then
   launchctl bootout "$launchd_domain/$launchd_label"
@@ -274,8 +274,8 @@ from service import config
 StateStore(Path(sys.argv[1]), config(Path(sys.argv[2])))
 PY
 
-cp "$source_root/skill/SKILL.md" "$hermes_home/skills/meal-planner/SKILL.md"
-chmod 600 "$hermes_home/skills/meal-planner/SKILL.md"
+cp "$source_root/skill/SKILL.md" "$hermes_home/skills/meal-concierge/SKILL.md"
+chmod 600 "$hermes_home/skills/meal-concierge/SKILL.md"
 
 if [[ "$service_manager" == "systemd" ]]; then
   SOURCE_ROOT="$source_root" \
@@ -288,7 +288,7 @@ if [[ "$service_manager" == "systemd" ]]; then
   INSTALL_SOCKET_PATH="$socket_path" \
   INSTALL_BROWSER_SOCKET_DIRECTORY="$browser_socket_directory" \
   INSTALL_RUNTIME_PATH="$runtime_path" \
-    "$python" - "$source_root/systemd/hermes-meal-planner.service" "$unit_path" <<'PY'
+    "$python" - "$source_root/systemd/meal-concierge.service" "$unit_path" <<'PY'
 import os
 from pathlib import Path
 import sys
@@ -329,7 +329,7 @@ else
   INSTALL_RUNTIME_PATH="$runtime_path" \
   INSTALL_STDOUT_PATH="$launchd_stdout_path" \
   INSTALL_STDERR_PATH="$launchd_stderr_path" \
-    "$python" - "$source_root/launchd/hermes-meal-planner.plist" "$launch_agent_path" <<'PY'
+    "$python" - "$source_root/launchd/meal-concierge.plist" "$launch_agent_path" <<'PY'
 import os
 from pathlib import Path
 import plistlib
@@ -377,24 +377,24 @@ import yaml
 
 path = Path(sys.argv[1])
 value = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-server = ((value or {}).get("mcp_servers") or {}).get("meal_planner")
+server = ((value or {}).get("mcp_servers") or {}).get("meal_concierge")
 if server is None:
     print("add")
 elif (
     server.get("command") == sys.argv[2]
     and server.get("args") == [sys.argv[3]]
-    and (server.get("env") or {}).get("MEAL_PLANNER_SOCKET") == sys.argv[4]
+    and (server.get("env") or {}).get("MEAL_CONCIERGE_SOCKET") == sys.argv[4]
 ):
     print("present")
 else:
-    raise SystemExit("an existing meal_planner MCP server uses a different command, source or socket")
+    raise SystemExit("an existing meal_concierge MCP server uses a different command, source or socket")
 PY
 )"
 if [[ "$mcp_state" == "add" ]]; then
-  printf 'y\n' | hermes mcp add meal_planner \
+  printf 'y\n' | hermes mcp add meal_concierge \
     --command "$python" \
     --connect-timeout 10 \
-    --env "MEAL_PLANNER_SOCKET=$socket_path" \
+    --env "MEAL_CONCIERGE_SOCKET=$socket_path" \
     --args "$source_root/mcp_server.py"
 fi
 "$python" - "$hermes_home/config.yaml" "$python" "$source_root/mcp_server.py" "$socket_path" <<'PY'
@@ -403,19 +403,19 @@ import sys
 import yaml
 
 value = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8")) or {}
-server = (value.get("mcp_servers") or {}).get("meal_planner") or {}
+server = (value.get("mcp_servers") or {}).get("meal_concierge") or {}
 if server.get("command") != sys.argv[2] or server.get("args") != [sys.argv[3]]:
-    raise SystemExit("Hermes did not save the meal_planner MCP server")
-if (server.get("env") or {}).get("MEAL_PLANNER_SOCKET") != sys.argv[4]:
-    raise SystemExit("Hermes did not save the meal_planner socket")
+    raise SystemExit("Hermes did not save the meal_concierge MCP server")
+if (server.get("env") or {}).get("MEAL_CONCIERGE_SOCKET") != sys.argv[4]:
+    raise SystemExit("Hermes did not save the meal_concierge socket")
 if server.get("enabled") is not True:
-    raise SystemExit("Hermes saved meal_planner disabled; resolve MCP discovery before continuing")
+    raise SystemExit("Hermes saved meal_concierge disabled; resolve MCP discovery before continuing")
 PY
 
 if [[ "$service_manager" == "systemd" ]]; then
   systemctl --user daemon-reload
   if [[ "$existing_install" == true ]]; then
-    systemctl --user start hermes-meal-planner.service
+    systemctl --user start meal-concierge.service
   fi
 else
   if [[ "$existing_install" == true ]]; then
@@ -426,12 +426,12 @@ fi
 if [[ "$existing_install" == true ]]; then
   status_verified=false
   for _attempt in {1..40}; do
-    if MEAL_PLANNER_SOCKET="$socket_path" "$python" - <<'PY'
+    if MEAL_CONCIERGE_SOCKET="$socket_path" "$python" - <<'PY'
 from mcp_server import rpc
 
 status = rpc("status")
-if status.get("state_version") != 7 or "product_favorites_count" not in status or "favorites" in status:
-    raise SystemExit("meal-planner status does not expose canonical v7 state")
+if status.get("state_version") != 8 or "product_favorites_count" not in status or "favorites" in status:
+    raise SystemExit("meal-concierge status does not expose canonical v8 state")
 PY
     then
       status_verified=true
@@ -440,27 +440,27 @@ PY
     sleep 0.5
   done
   if [[ "$status_verified" != true ]]; then
-    echo "the restarted meal-planner service did not expose canonical v7 status" >&2
+    echo "the restarted meal-concierge service did not expose canonical v8 status" >&2
     exit 1
   fi
 fi
 
-mcp_probe="$(hermes mcp test meal_planner 2>&1)"
-if [[ "$mcp_probe" != *"meal_planner_product_favorites"* || "$mcp_probe" == *"meal_planner_favorites"* ]]; then
-  echo "Hermes MCP discovery did not expose only meal_planner_product_favorites" >&2
+mcp_probe="$(hermes mcp test meal_concierge 2>&1)"
+if [[ "$mcp_probe" != *"meal_concierge_product_favorites"* || "$mcp_probe" == *"meal_concierge_favorites"* ]]; then
+  echo "Hermes MCP discovery did not expose only meal_concierge_product_favorites" >&2
   printf '%s\n' "$mcp_probe" >&2
   exit 1
 fi
 
 if [[ "$service_manager" == "systemd" ]]; then
   cat <<EOF
-Installed the meal planner for $household with provider $provider.
+Installed the meal concierge for $household with provider $provider.
 
 Next:
   1. Complete provider login with the exact browser command printed below.
-  2. systemctl --user enable --now hermes-meal-planner.service
-  3. hermes mcp test meal_planner
-  4. Restart Hermes, then ask: "Show my meal-planner status."
+  2. systemctl --user enable --now meal-concierge.service
+  3. hermes mcp test meal_concierge
+  4. Restart Hermes, then ask: "Show my meal-concierge status."
 
 Resolved runtime:
   Hermes Python: $python
@@ -469,13 +469,13 @@ Resolved runtime:
 EOF
 else
   cat <<EOF
-Installed the meal planner for $household with provider $provider.
+Installed the meal concierge for $household with provider $provider.
 
 Next:
   1. Complete provider login with the exact browser command printed below.
   2. launchctl bootstrap $launchd_domain "$launch_agent_path"
-  3. hermes mcp test meal_planner
-  4. Restart Hermes, then ask: "Show my meal-planner status."
+  3. hermes mcp test meal_concierge
+  4. Restart Hermes, then ask: "Show my meal-concierge status."
 
 Lifecycle:
   Status:  launchctl print $launchd_domain/$launchd_label

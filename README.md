@@ -1,6 +1,6 @@
-# Hermes Meal Planner
+# Meal Concierge
 
-Hermes Meal Planner adds weekly meal planning and grocery ordering to Hermes
+Meal Concierge adds weekly meal planning and grocery ordering to Hermes
 Agent for a single household. It stores a private searchable recipe bank,
 household preferences, weekly menus, product favorites, and recurring items locally,
 discovers recipes through that bank, Oda, MENY, TheMealDB and Wikibooks
@@ -42,7 +42,7 @@ if two different paths share that identity.
 The supported path is a standard non-root Hermes Agent 0.20.5 or newer on a
 systemd-based Linux host or Apple Silicon macOS, plus Chromium or Google Chrome and
 [`agent-browser`](https://github.com/vercel-labs/agent-browser).
-The meal planner deliberately uses Hermes's managed Python runtime; a system
+The meal concierge deliberately uses Hermes's managed Python runtime; a system
 `python3` normally does not contain Hermes's MCP and OAuth modules. There is no
 external database service, web app, scheduler service or multi-agent controller;
 the private recipe bank is one local SQLite file.
@@ -56,7 +56,7 @@ Hermes uses a supported Node.js runtime; use its npm, or the supported Node on
 ```sh
 sudo apt-get update
 sudo apt-get install -y git chromium
-mkdir -p "$HOME/.local/lib/hermes-meal-planner"
+mkdir -p "$HOME/.local/lib/meal-concierge"
 node_bin="${HERMES_HOME:-$HOME/.hermes}/node/bin/node"
 npm_bin="${HERMES_HOME:-$HOME/.hermes}/node/bin/npm"
 if [ ! -x "$node_bin" ] || [ ! -x "$npm_bin" ]; then
@@ -65,23 +65,23 @@ if [ ! -x "$node_bin" ] || [ ! -x "$npm_bin" ]; then
 fi
 "$node_bin" -e 'if (Number(process.versions.node.split(".")[0]) < 24) { console.error("Node.js 24+ is required"); process.exit(1) }'
 PATH="$(dirname "$node_bin"):$PATH" "$npm_bin" install \
-  --prefix "$HOME/.local/lib/hermes-meal-planner" \
+  --prefix "$HOME/.local/lib/meal-concierge" \
   agent-browser@0.33.1
-export MEAL_PLANNER_AGENT_BROWSER="$HOME/.local/lib/hermes-meal-planner/node_modules/.bin/agent-browser"
+export MEAL_CONCIERGE_AGENT_BROWSER="$HOME/.local/lib/meal-concierge/node_modules/.bin/agent-browser"
 ```
 
 Ubuntu's transitional `chromium` package installs a strictly confined snap
 that cannot use the private profile below `~/.hermes`; the installer rejects
 it. Use a non-snap Chromium/Chrome package and, if needed, set
-`MEAL_PLANNER_BROWSER_EXECUTABLE` to its exact executable.
+`MEAL_CONCIERGE_BROWSER_EXECUTABLE` to its exact executable.
 
 Clone the repository to a stable path:
 
 ```sh
 mkdir -p "$HOME/.local/share"
-git clone https://github.com/poisdahl/hermes-meal-planner.git \
-  "$HOME/.local/share/hermes-meal-planner"
-cd "$HOME/.local/share/hermes-meal-planner"
+git clone https://github.com/poisdahl/meal-concierge.git \
+  "$HOME/.local/share/meal-concierge"
+cd "$HOME/.local/share/meal-concierge"
 ```
 
 For Oda, first let native Hermes OAuth create the normal private token files.
@@ -97,7 +97,7 @@ hermes config set mcp_servers.oda-weekly.enabled false
 
 For MENY, run the installer from an interactive terminal; it prompts privately
 for the eight-digit Vipps mobile number. For non-interactive installation, set
-`MEAL_PLANNER_VIPPS_PHONE_NUMBER` only for the installer process.
+`MEAL_CONCIERGE_VIPPS_PHONE_NUMBER` only for the installer process.
 
 ```sh
 ./install.sh --provider meny --household "My household"
@@ -106,27 +106,28 @@ for the eight-digit Vipps mobile number. For non-interactive installation, set
 The installer verifies Hermes's managed Python, `agent-browser`, Chromium and
 the platform's user service manager; creates one private config,
 provider-bound state, browser profile and Unix socket under
-`$HERMES_HOME/meal-planner` (normally `~/.hermes/meal-planner`); installs the
+`$HERMES_HOME/meal-concierge` (normally `~/.hermes/meal-concierge`); installs the
 single skill; registers the local MCP bridge with `hermes mcp add`; and installs
 a user-level systemd service on Linux or LaunchAgent on macOS. It does not start a provider session or overwrite
 an existing household/provider config. If the machine uses non-standard paths,
-set `HERMES_PYTHON`, `MEAL_PLANNER_AGENT_BROWSER` or
-`MEAL_PLANNER_BROWSER_EXECUTABLE` while running the installer; their resolved
+set `HERMES_PYTHON`, `MEAL_CONCIERGE_AGENT_BROWSER` or
+`MEAL_CONCIERGE_BROWSER_EXECUTABLE` while running the installer; their resolved
 values are saved in the private service definition.
 
-Clean installations create household state v7 with only the
+Clean installations create household state v8 with only the
 `product_favorites` list and expose the
-`meal_planner_product_favorites` tool. When rerun for an existing installation,
-the installer stops only the meal-planner service, creates the non-overwriting
+`meal_concierge_product_favorites` tool. When rerun for an existing installation,
+the installer stops only the meal-concierge service, creates the non-overwriting
 private migration backups, including `state-v6.backup.json` immediately before
-the v6→v7 delivery-preference migration, migrates state atomically, refreshes
+the v6→v7 delivery-preference migration and `state-v7.backup.json` before
+renaming saved email automation identities, migrates state atomically, refreshes
 the installed skill and MCP registration, restarts the service, and verifies
 both status and the new tool schema. This also starts an existing installation
 that was stopped before the update. If migration fails, the old state and its
 backup remain usable and the service stays stopped. Existing v6 households gain
 `delivery.strategy="keep_selected"`; clean state and newly replaced delivery
 preferences default to `"cheapest"`. Restore the matching backup before running
-older code; older code must not read a v7 state file.
+older code; older code must not read a v8 state file.
 
 New installations use `"confirmation_policy": "fresh"`: Hermes prepares the
 exact checkout or cancellation summary and asks once before dispatch. An owner
@@ -219,7 +220,7 @@ By default an existing same-SKU quantity counts toward the requirement, so the
 target is `max(B,R)` and the service adds only the verified shortfall. If the
 owner explicitly says a starting product is extra, its target is `B+R`.
 
-The plan stores only `B`, `R`, the verified quantity Meal Planner added, the
+The plan stores only `B`, `R`, the verified quantity Meal Concierge added, the
 last verified live product quantities/digest and an optional owner-approved
 digest. It survives restart, and repeated sync is idempotent, including after
 an explicit exclusion or accepted shortfall on an unchanged digest. Immediately
@@ -261,7 +262,7 @@ control and verifies the renewed selection before payment.
 
 Before starting the service, run the exact provider-login command printed by
 the installer. It uses the resolved Chromium/Chrome executable and the actual
-private profile even when `HERMES_HOME` or `MEAL_PLANNER_HOME` is customized.
+private profile even when `HERMES_HOME` or `MEAL_CONCIERGE_HOME` is customized.
 Open that profile in the visible browser and log in to the selected account. A remote headless host therefore
 needs a private graphical session such as X11 forwarding or a private remote
 desktop for this one-time step; do not copy cookies or credentials between
@@ -273,14 +274,14 @@ same account used for `oda-weekly`, the intended delivery address and an
 already configured provider-side payment method. Every new-cart or add-to-order
 protected Oda summary includes the browser-verified address and only the
 payment method's last four digits so the user can catch a wrong profile before
-confirming; the meal planner never stores full payment data.
+confirming; the meal concierge never stores full payment data.
 
 On systemd Linux, start and verify the service:
 
 ```sh
-systemctl --user enable --now hermes-meal-planner.service
-systemctl --user status hermes-meal-planner.service
-hermes mcp test meal_planner
+systemctl --user enable --now meal-concierge.service
+systemctl --user status meal-concierge.service
+hermes mcp test meal_concierge
 ```
 
 On macOS, the installer prints the exact LaunchAgent path and label. With the
@@ -288,22 +289,22 @@ defaults, start and verify it with:
 
 ```sh
 launchctl bootstrap "gui/$(id -u)" \
-  "$HOME/Library/LaunchAgents/com.hermes-agent.meal-planner.plist"
-launchctl print "gui/$(id -u)/com.hermes-agent.meal-planner"
-hermes mcp test meal_planner
+  "$HOME/Library/LaunchAgents/com.hermes-agent.meal-concierge.plist"
+launchctl print "gui/$(id -u)/com.hermes-agent.meal-concierge"
+hermes mcp test meal_concierge
 ```
 
 Restart with `launchctl kickstart -k
-"gui/$(id -u)/com.hermes-agent.meal-planner"`. Stop and unload it with
-`launchctl bootout "gui/$(id -u)/com.hermes-agent.meal-planner"`; start it
+"gui/$(id -u)/com.hermes-agent.meal-concierge"`. Stop and unload it with
+`launchctl bootout "gui/$(id -u)/com.hermes-agent.meal-concierge"`; start it
 again with the `bootstrap` command above. Standard output and errors go to
-`~/Library/Logs/com.hermes-agent.meal-planner.out.log` and `.err.log`.
+`~/Library/Logs/com.hermes-agent.meal-concierge.out.log` and `.err.log`.
 
 Restart the Hermes CLI or gateway after adding the MCP server. Current Hermes
-registers the tools as `mcp__meal_planner__meal_planner_*` and makes them
+registers the tools as `mcp__meal_concierge__meal_concierge_*` and makes them
 available to ordinary natural-language turns. A vanilla config needs no
 toolset edit. If a platform is explicitly restricted under
-`platform_toolsets.<platform>`, add the raw server name `meal_planner` to that
+`platform_toolsets.<platform>`, add the raw server name `meal_concierge` to that
 platform's list.
 
 The systemd unit or LaunchAgent restarts the service on failure. For MENY, `agent-browser`
@@ -319,9 +320,9 @@ interactive login.
 For rollback, stop the service, keep a private copy of the config/state/profile,
 check out the previously working public commit in the stable clone, rerun the
 installer, and start the service again. For uninstall, stop and disable/unload
-the service, run `hermes mcp remove meal_planner`, and move its service
+the service, run `hermes mcp remove meal_concierge`, and move its service
 definition aside before removing the installed skill, stable clone and private
-meal-planner directory. The private directory contains provider state and must
+meal-concierge directory. The private directory contains provider state and must
 not be deleted before its backup is verified.
 
 Status reports pending checkout, cancellation and order-change status
@@ -329,7 +330,7 @@ explicitly without exposing their private payloads, so an uncertain protected
 operation cannot be mistaken for an idle household.
 
 The socket is mode `0660`, assigned to the configured group, and placed under
-the private meal-planner directory by the installer. Config, OAuth tokens,
+the private meal-concierge directory by the installer. Config, OAuth tokens,
 state and browser profiles stay outside Git. Use `service.py --help` only for
 an advanced manual layout with separate service and agent users.
 
@@ -374,13 +375,13 @@ Authenticated adapter calls compare scheme, host and port before attaching a
 credential and never follow redirects.
 
 Credentials are separate from config at
-`$MEAL_PLANNER_HOME/secrets/recipe-libraries/<library_id>.json`, with directory
+`$MEAL_CONCIERGE_HOME/secrets/recipe-libraries/<library_id>.json`, with directory
 mode `0700` and file mode `0600`, owned by the service user. They never belong
 in command arguments, state, SQLite, logs, MCP traffic, fixtures or Git. After
 the provider-specific adapter is installed, use the interactive local helper:
 
 ```sh
-home="${MEAL_PLANNER_HOME:-${HERMES_HOME:-$HOME/.hermes}/meal-planner}"
+home="${MEAL_CONCIERGE_HOME:-${HERMES_HOME:-$HOME/.hermes}/meal-concierge}"
 python3 recipe_library_setup.py --config "$home/config.json" --home "$home" \
   add --library-id family-mealie --provider mealie --base-url https://recipes.example
 python3 recipe_library_setup.py --config "$home/config.json" --home "$home" \
@@ -430,9 +431,9 @@ only the exact confirmed or reconciled provider UUID.
 
 Mealie search and get include the authenticated account's current native
 `is_favorite`; `favorites_only=true` is accepted because the connection reports
-`favorite_read`. Meal Planner serializes its own desired-state writes for a
+`favorite_read`. Meal Concierge serializes its own desired-state writes for a
 connection, reads before dispatch to avoid a redundant add/remove, and reads
-back afterward. This prevents conflicting Meal Planner calls from racing each
+back afterward. This prevents conflicting Meal Concierge calls from racing each
 other, but it does not detect an out-of-band change without a provider
 conditional token. A lost response is never followed by another write: an
 exact authenticated read may confirm the desired state because Mealie reports
@@ -449,7 +450,7 @@ the configured instance and the RecipeSage license.
 At the hidden credential prompt, enter exactly
 `{"token":"<RecipeSage bearer session token>"}`. Obtain or renew that token
 through an explicit local RecipeSage sign-in. Do not provide the RecipeSage
-email/password, Google token or Google authorization code to Meal Planner, MCP,
+email/password, Google token or Google authorization code to Meal Concierge, MCP,
 the command line or logs; the helper persists only the returned session token
 in the mode-`0600` credential file. A revoked or expired session reports
 `needs_auth` and is never silently replaced. Install a renewed token with the
@@ -535,7 +536,7 @@ or inside a state-root container mount, without exposing either path through MCP
 ## Private recipe bank
 
 The recipe bank is household-bound SQLite at
-`$HERMES_HOME/meal-planner/state/recipes.sqlite3`. It is opened only by recipe
+`$HERMES_HOME/meal-concierge/state/recipes.sqlite3`. It is opened only by recipe
 operations, so a missing or damaged bank cannot block provider status, cart,
 delivery or order reconciliation. Recipe saves and imports require explicit
 source and rights metadata. Full recipes have structured ingredients and
@@ -722,14 +723,14 @@ dry run first. The first committed import creates the bank without a backup:
 
 ```sh
 python3 import_recipes.py recipes.jsonl \
-  --state-directory "${HERMES_HOME:-$HOME/.hermes}/meal-planner/state" \
+  --state-directory "${HERMES_HOME:-$HOME/.hermes}/meal-concierge/state" \
   --dry-run
 python3 import_recipes.py recipes.jsonl \
-  --state-directory "${HERMES_HOME:-$HOME/.hermes}/meal-planner/state"
+  --state-directory "${HERMES_HOME:-$HOME/.hermes}/meal-concierge/state"
 ```
 
 On subsequent imports into an existing bank, add
-`--backup "${HERMES_HOME:-$HOME/.hermes}/meal-planner/state/recipes-before-import.sqlite3"`.
+`--backup "${HERMES_HOME:-$HOME/.hermes}/meal-concierge/state/recipes-before-import.sqlite3"`.
 
 The import is bounded to 64 MiB, 10,000 records and the normal per-recipe
 limits. Reimporting identical native records is idempotent. Keep the private
@@ -751,7 +752,7 @@ snapshots even if the current menu or recipient later changes.
 After restart, use the normal Hermes CLI or messaging path. Useful smoke
 requests, in a safe order, are:
 
-- “Show my meal-planner status and household profile.”
+- “Show my meal-concierge status and household profile.”
 - On the first interactive run, answer the one setup question by keeping all
   values or changing only the named values.
 - “Change dinner portions to four,” then “Reset dinner portions.”
@@ -803,7 +804,7 @@ requests, in a safe order, are:
 New, moved and upgraded delivery-day jobs expose
 `automation_update_required`. Apply the exact `cron_prompt` to that one Hermes
 automation, then call the returned `automation_ack`; acknowledgement records
-protocol 3 only after the external update succeeds. After an upgrade, call
+protocol 4 only after the external update succeeds. After an upgrade, call
 email `automation_plan`, replace every listed legacy prompt, and acknowledge
 each result. Until then the old prompt safely declines to send rather than
 using an unbound payload.

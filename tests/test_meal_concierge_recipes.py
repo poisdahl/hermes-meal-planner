@@ -69,7 +69,7 @@ from service import (  # noqa: E402
     Application, MAX_REQUEST, Server, canonical, load_library_secret_for_state,
     menu_email_html, money_cents, strict_json_loads,
 )
-from tests.test_meal_planner import (  # noqa: E402
+from tests.test_meal_concierge import (  # noqa: E402
     CONFIG, MENY_PRODUCT, FakeBrowser, FakeMeny, FakeOda, MutableFakeMeny, MutableFakeOda,
 )
 
@@ -2345,7 +2345,7 @@ class StateMigrationTests(unittest.TestCase):
             (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
             store = StateStore(root, {**CONFIG, "household": "Hus A", "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertIn("product_favorites", migrated)
             self.assertNotIn("favorites", migrated)
             self.assertEqual(migrated["profile"]["recipes"]["repeat_cooldown_weeks"], 6)
@@ -2402,7 +2402,7 @@ class StateMigrationTests(unittest.TestCase):
 
             store = StateStore(root, {**CONFIG, "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertEqual(migrated["email_jobs"][0]["provider"], "oda")
             self.assertEqual(migrated["email_jobs"][0]["status"], "pending")
             self.assertEqual(migrated["order_snapshot_providers"]["order-old"], "oda")
@@ -2415,7 +2415,7 @@ class StateMigrationTests(unittest.TestCase):
             plan = Application(store, FakeOda(), FakeBrowser()).handle({
                 "operation": "email", "action": "automation_plan",
             })
-            self.assertEqual(plan["protocol"], 3)
+            self.assertEqual(plan["protocol"], 4)
             self.assertEqual(plan["updates"][0]["provider"], "oda")
 
     def test_v2_migration_rejects_malformed_snapshot_container_at_boundary(self):
@@ -2439,7 +2439,7 @@ class StateMigrationTests(unittest.TestCase):
 
             migrated = StateStore(root, {**CONFIG, "provider": "oda"}).read()
 
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertIsNone(migrated["cart_plan"])
             backup = json.loads((root / "state-v3.backup.json").read_text(encoding="utf-8"))
             self.assertEqual(backup["version"], 3)
@@ -2460,7 +2460,7 @@ class StateMigrationTests(unittest.TestCase):
                 "profile_overrides": {"recipes": {"sources": {"themealdb": False}}},
             }).read()
 
-            self.assertEqual(migrated["version"], 7)
+            self.assertEqual(migrated["version"], 8)
             self.assertEqual(migrated["setup"]["status"], "needs_review")
             self.assertFalse(migrated["profile"]["recipes"]["sources"]["themealdb"])
             self.assertTrue(migrated["profile"]["recipes"]["sources"]["wikibooks"])
@@ -4700,7 +4700,7 @@ class RecipeFlowTests(unittest.TestCase):
             state["email_jobs"] = [{
                 "order_id": "old", "delivery_date": today, "status": "pending", "sent_at": None,
                 "provider": "oda", "recipient_snapshot": "owner@example.test",
-                "menu_snapshot": deepcopy(ordered), "automation_protocol": 3,
+                "menu_snapshot": deepcopy(ordered), "automation_protocol": 4,
             }]
         app = Application(store, main, FakeBrowser(), email_provider_clients={"oda": alternate})
         meny_schedule = app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": today})
@@ -4735,9 +4735,9 @@ class RecipeFlowTests(unittest.TestCase):
             }
             state["email_jobs"] = [
                 {"provider": "oda", "order_id": "same", "delivery_date": date.today().isoformat(), "status": "pending", "sent_at": None,
-                 "recipient_snapshot": "oda@example.test", "menu_snapshot": deepcopy(ordered), "automation_protocol": 3},
+                 "recipient_snapshot": "oda@example.test", "menu_snapshot": deepcopy(ordered), "automation_protocol": 4},
                 {"provider": "meny", "order_id": "same", "delivery_date": date.today().isoformat(), "status": "pending", "sent_at": None,
-                 "recipient_snapshot": "meny@example.test", "menu_snapshot": deepcopy(ordered), "automation_protocol": 3},
+                 "recipient_snapshot": "meny@example.test", "menu_snapshot": deepcopy(ordered), "automation_protocol": 4},
             ]
         app = Application(store, FakeMeny(), FakeBrowser(), email_provider_clients={"oda": alternate})
         result = app.handle({"operation": "email", "action": "due", "provider": "oda", "order_id": "same"})
@@ -4761,7 +4761,7 @@ class RecipeFlowTests(unittest.TestCase):
                 "provider": "oda", "order_id": "same", "delivery_date": date.today().isoformat(),
                 "status": "sending", "sent_at": None, "claim_token": "claim",
                 "recipient_snapshot": "oda@example.test", "menu_snapshot": deepcopy(meny_menu),
-                "automation_protocol": 3,
+                "automation_protocol": 4,
             }]
         app = Application(store, FakeMeny(), FakeBrowser())
         result = app.handle({
@@ -4784,12 +4784,12 @@ class RecipeFlowTests(unittest.TestCase):
                 {
                     "provider": "oda", "order_id": "same", "delivery_date": date.today().isoformat(),
                     "status": "sent", "sent_at": datetime.now(timezone.utc).isoformat(),
-                    "recipient_snapshot": "oda@example.test", "automation_protocol": 3,
+                    "recipient_snapshot": "oda@example.test", "automation_protocol": 4,
                 },
                 {
                     "provider": "meny", "order_id": "other", "delivery_date": date.today().isoformat(),
                     "status": "sending", "sent_at": None, "claim_token": "claim",
-                    "recipient_snapshot": "meny@example.test", "automation_protocol": 3,
+                    "recipient_snapshot": "meny@example.test", "automation_protocol": 4,
                 },
             ]
         app = Application(store, FakeMeny(), FakeBrowser())
@@ -4852,7 +4852,7 @@ class RecipeFlowTests(unittest.TestCase):
         with store.locked() as state:
             state["email_jobs"] = [{
                 "order_id": "old", "delivery_date": date.today().isoformat(), "status": "pending", "sent_at": None,
-                "provider": "oda", "recipient_snapshot": "owner@example.test", "menu_snapshot": deepcopy(ordered), "automation_protocol": 3,
+                "provider": "oda", "recipient_snapshot": "owner@example.test", "menu_snapshot": deepcopy(ordered), "automation_protocol": 4,
             }]
         app = Application(store, FakeMeny(), FakeBrowser())
         with self.assertRaisesRegex(HouseholdError, "provider oda is unavailable"):
@@ -4871,7 +4871,7 @@ class RecipeFlowTests(unittest.TestCase):
             state["email_jobs"] = [{
                 "provider": "oda", "order_id": "oda-old", "delivery_date": today,
                 "status": "pending", "sent_at": None, "recipient_snapshot": "owner@example.test",
-                "menu_snapshot": deepcopy(ordered), "automation_protocol": 3,
+                "menu_snapshot": deepcopy(ordered), "automation_protocol": 4,
             }]
         app = Application(store, main, FakeBrowser(), email_provider_clients={"oda": alternate})
         due = app.handle({
@@ -4909,7 +4909,7 @@ class RecipeFlowTests(unittest.TestCase):
         jobs = {job["order_id"]: job for job in self.store.read()["email_jobs"]}
         self.assertEqual(jobs["order-1"]["delivery_date"], moved)
 
-    def test_protocol_two_job_requires_provider_qualified_protocol_three_update(self):
+    def test_protocol_three_job_requires_meal_concierge_protocol_four_update(self):
         ordered = self.app.handle({"operation": "menu", "action": "save", "menu": menu("2026-W40")})["menu"]
         ordered.update({"phase": "ordered", "order_id": "old"})
         with self.store.locked() as state:
@@ -4919,13 +4919,13 @@ class RecipeFlowTests(unittest.TestCase):
         scheduled = self.app.handle({"operation": "email", "action": "schedule", "order_id": "old", "delivery_date": date.today().isoformat()})
         self.app.handle({"operation": "email", **scheduled["automation_ack"]})
         with self.store.locked() as state:
-            state["email_jobs"][0]["automation_protocol"] = 2
-            state["email_jobs"][0]["automation_key"] = "meal-planner-email-0123456789abcdef"
+            state["email_jobs"][0]["automation_protocol"] = 3
+            state["email_jobs"][0]["automation_key"] = "meal-concierge-email-0123456789abcdef"
         plan = self.app.handle({"operation": "email", "action": "automation_plan"})
-        self.assertEqual(plan["protocol"], 3)
+        self.assertEqual(plan["protocol"], 4)
         self.assertEqual(len(plan["updates"]), 1)
         self.assertEqual(plan["updates"][0]["provider"], "oda")
-        self.assertNotEqual(plan["updates"][0]["automation_key"], "meal-planner-email-0123456789abcdef")
+        self.assertNotEqual(plan["updates"][0]["automation_key"], "meal-concierge-email-0123456789abcdef")
         self.assertIn("provider=oda", plan["updates"][0]["cron_prompt"])
         blocked = self.app.handle({"operation": "email", "action": "due", "provider": "oda", "order_id": "old"})
         self.assertTrue(blocked["automation_update_required"])
