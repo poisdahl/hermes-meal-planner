@@ -1831,6 +1831,22 @@ class RecipeStore:
                 ).fetchone()
                 if snapshot is None:
                     raise RecipeError("discovery reference was not found")
+                # Migration and discovery saves share the same external write
+                # boundary. Never bypass an unresolved or already copied exact
+                # origin merely by choosing the ordinary discovery-save tool.
+                from recipe_migration import origin, digest
+                exact_origin = origin(resolved["recipe"])
+                migrated = None if exact_origin is None else connection.execute(
+                    "SELECT status FROM library_operations WHERE kind='migration' "
+                    "AND library_id=? AND json_extract(request_metadata, '$.origin_identity')=? "
+                    "AND status IN ('pending','uncertain','confirmed') LIMIT 1",
+                    (library, digest(exact_origin)),
+                ).fetchone()
+                if migrated is not None:
+                    raise RecipeError(
+                        "this exact source has a pending, uncertain or confirmed migration; "
+                        "inspect/resume that plan and use its exact destination mapping"
+                    )
                 request_digest = _hash({
                     "kind": "create",
                     "library_id": library,

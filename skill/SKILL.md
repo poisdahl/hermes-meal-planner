@@ -550,7 +550,10 @@ version/document, metadata and destination conflicts; drift returns
 in the existing `library_operations` journal precedes each create. Resume the
 same plan after a partial result. An uncertain create reserves that exact
 source/target across plans and can only use provider-specific reconciliation;
-it never dispatches another create. After expiry, only already-dispatched
+it never dispatches another create. Ordinary discovery saves also honor pending,
+uncertain and confirmed migration origins: inspect/resume that migration and
+use its confirmed destination mapping instead of starting another save.
+After expiry, only already-dispatched
 operations may reconcile. Successful mappings survive other item failures.
 
 Favorites/labels are separate journaled stages on the confirmed destination

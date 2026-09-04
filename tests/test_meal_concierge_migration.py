@@ -307,6 +307,20 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(connection.execute('SELECT COUNT(*) FROM migration_plans').fetchone()[0], 0)
         self.assertEqual(self.dest.create_calls, 0)
 
+    def test_discovery_save_cannot_bypass_uncertain_or_confirmed_migration(self):
+        self.dest.timeout = True
+        plan = self.prepare(source_refs=[self.source.ref('0')])
+        self.assertEqual(self.execute(plan)['status'], 'uncertain')
+        discovery = self.app.recipes.persist_discovery(self.source.docs['0'])
+        request = {'operation': 'recipes', 'action': 'save', 'library_id': 'destination', 'discovery_ref': discovery['discovery_ref'], 'idempotency_key': 'ordinary-save'}
+        with self.assertRaisesRegex(RecipeError, 'exact source.*migration'):
+            self.app.handle(request)
+        self.assertEqual(self.dest.create_calls, 1)
+        self.assertEqual(self.execute(plan)['status'], 'complete')
+        with self.assertRaisesRegex(RecipeError, 'exact source.*migration'):
+            self.app.handle(request)
+        self.assertEqual(self.dest.create_calls, 1)
+
     def test_builtin_restart_after_recipe_commit_before_mapping(self):
         plan = self.prepare(source_refs=[self.source.ref('0')], destination_library_id='builtin')
         with mock.patch.object(migration.Migration, 'save_mapping', side_effect=SystemExit('crash after local commit')):
