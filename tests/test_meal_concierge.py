@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import struct
 import sys
@@ -3911,6 +3912,67 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("prices.length > 1", scripts[0])
         self.assertIn("campaigns.length > 1", scripts[0])
         self.assertIn("deposits.length > 1", scripts[0])
+
+    @unittest.skipUnless(shutil.which("node"), "Node is required to execute the browser extractor")
+    def test_product_search_executes_cards_with_multiple_campaign_badges(self):
+        # The live MENY search shows two distinct badges on one card. Execute
+        # the actual extractor; pre-extracted response mocks missed this case.
+        client = self.client()
+        client._open = mock.Mock()
+        client._product_price_details = mock.Mock(return_value={
+            "detail_price": "21,80 kroner.", "deposit_status": "none",
+        })
+        harness = r"""
+const fs = require('node:fs');
+const {script, tags} = JSON.parse(fs.readFileSync(0, 'utf8'));
+const element = (text = '', selectors = {}) => ({
+  innerText: text, disabled: false,
+  getBoundingClientRect: () => ({width: 10, height: 10}),
+  getAttribute: () => null,
+  querySelectorAll: selector => selectors[selector] || [],
+});
+global.getComputedStyle = () => ({display: 'block', visibility: 'visible'});
+global.location = new URL('https://meny.no/sok?query=melk&expanded=products');
+const anchor = element();
+anchor.href = 'https://meny.no/varer/meieri/melk/lettmelk-7038010000000';
+const card = element('', {
+  'a[href]': [anchor], 'h3': [element('Lettmelk')],
+  '.ws-product-vertical__subtitle': [element('1 l')],
+  '.ws-price__main': [element('21,80 kr')],
+  '.ws-campaign-tag': tags.map(tag => element(tag)),
+  '.ws-add-to-cart__button': [element()],
+});
+const root = element('', {
+  ':scope > h2': [element('Varer')],
+  'li.ws-product-list-vertical__item': [card],
+});
+const state = element('', {':scope > .ws-search-result-full': [root]});
+root.closest = () => state;
+global.document = element('', {
+  'button': [element('Brukermeny')],
+  'main': [element('', {'.ws-search-result-full': [root]})],
+});
+process.stdout.write(eval(script));
+"""
+        for tags in (["3 for 2", "Faste knallkjøp"], ["3 for 2", "æ" * 100]):
+            with self.subTest(tags=tags):
+                def evaluate(script):
+                    completed = subprocess.run(
+                        [shutil.which("node"), "-e", harness],
+                        input=json.dumps({"script": script, "tags": tags}),
+                        text=True, capture_output=True, check=True, timeout=10,
+                    )
+                    return json.loads(completed.stdout)
+
+                client._eval = evaluate
+                result = client._search("melk", 3, "products")
+                self.assertEqual(len(result["products"]), 1)
+                product = result["products"][0]
+                self.assertEqual(product["availability"], "available")
+                self.assertEqual(product["purchase_options"][0]["eligibility"], "unknown")
+                self.assertNotIn("total_payable_ore", product["purchase_options"][0])
+                if len(" / ".join(tags).encode("utf-8")) <= 100:
+                    self.assertEqual(product["display"]["campaign_tag"], " / ".join(tags))
 
     def test_product_search_accepts_current_results_shell_without_optional_query_header(self):
         client = self.client()

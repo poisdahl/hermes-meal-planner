@@ -389,7 +389,7 @@ def _normalize_meny_product(raw: Any, observed_at: str) -> dict[str, Any]:
         ))
     else:
         has_unconfirmed_promotion = bool(
-            campaign_tag or campaign or original_price_text or detail_is_discount
+            raw.get("campaign_tag") or campaign or original_price_text or detail_is_discount
         )
         offer_kind = "discount" if confirmed_discount else "member" if member else "regular"
         eligibility = "confirmed" if confirmed_discount or not has_unconfirmed_promotion else "unknown"
