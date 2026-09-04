@@ -82,7 +82,7 @@ class Migration:
             self.store.recover_library_operations()
             self.app._recipe_operations_recovered = True
         for item in plan["items"]:
-            self.execute_item(plan, item, expired)
+            self.execute_item(plan, item, now() >= datetime.fromisoformat(plan["expires_at"]))
         return self.report(plan)
 
     def get(self, reference, *, latest=False):
@@ -281,6 +281,10 @@ class Migration:
                    "metadata_options": options, "items": [item["preview"] for item in items],
                    "expires_at": (timestamp + timedelta(minutes=30)).isoformat(), "confirmation_statement": CONFIRMATION}
         plan_digest = digest(preview)
+        # Reserve ample transport space for confirmed refs and 21 stage results
+        # per item; JSON wire encoding escapes Unicode unlike private storage.
+        if len(json.dumps(preview, ensure_ascii=True).encode()) > 512 * 1024:
+            raise RecipeError("migration preview exceeds its wire budget; select fewer recipes or labels")
         if len(canonical(items).encode()) > 4 * 1024 * 1024:
             raise RecipeError("frozen migration selection is too large; select fewer recipes")
         with self.store._connection() as connection:
@@ -425,11 +429,18 @@ class Migration:
                 progress.update(copy_status="needs_review", reason="source_destination_or_metadata_changed")
                 self.update(plan, item)
                 return
+        if not dispatched and now() >= datetime.fromisoformat(plan["expires_at"]):
+            self.finish(operation, "failed")
+            progress.update(copy_status="needs_review", reason="confirmation_expired")
+            self.update(plan, item)
+            return
         try:
             if destination == "builtin":
                 # One local transaction commits the new recipe and operation result.
                 with self.store._connection() as connection:
                     connection.execute("BEGIN IMMEDIATE")
+                    if now() >= datetime.fromisoformat(plan["expires_at"]):
+                        raise RecipeLibraryDefiniteError("migration confirmation expired")
                     saved = self.store._save(connection, frozen["document"], "active", None, "migration", migration_identity=self.identity(frozen["source_ref"]))
                     ref = saved["library_recipe_ref"]
                     connection.execute("UPDATE library_operations SET status='confirmed',result_metadata=?,provider_recipe_id=?,provider_version=?,updated_at=? WHERE operation_id=?", (canonical(ref), ref["recipe_id"], ref["version"], now().isoformat(), operation["operation_id"]))
@@ -443,9 +454,11 @@ class Migration:
                     if result is None:
                         raise RecipeError("exact reconciliation unresolved")
                 else:
-                    claimed = self.store.claim_library_dispatch(operation["operation_id"])
+                    claimed = self.store.claim_library_dispatch(operation["operation_id"], dispatch_before=plan["expires_at"])
                     if not claimed["claimed"]:
-                        raise RecipeError("dispatch already claimed")
+                        progress.update(copy_status="needs_review" if claimed["status"] == "failed" else "uncertain", reason="dispatch_not_authorized")
+                        self.update(plan, item)
+                        return
                     operation = claimed
                     result = adapter.create_from_snapshot(outbound, self.app._outbound_library_operation(operation))
                 ref, returned = self.app._validated_library_create_result(result, frozen["document"], destination)
@@ -492,12 +505,12 @@ class Migration:
                 operation = None
             else:
                 operation = self.store.library_operation_for_idempotency(key)
-            if expired and (operation is None or not operation.get("dispatched_at")):
+            if now() >= datetime.fromisoformat(plan["expires_at"]) and (operation is None or not operation.get("dispatched_at")):
                 completed[index_key] = {"status": "failed", "reason": "confirmation_expired"}
                 continue
             try:
                 args = {k: v for k, v in stage.items() if k in {"action", "is_favorite", "library_label_ref", "present"}}
-                result = self.app._recipes({**args, "library_recipe_ref": progress["destination_ref"], "idempotency_key": key})
+                result = self.app._recipes({**args, "library_recipe_ref": progress["destination_ref"], "idempotency_key": key, "_migration_expires_at": plan["expires_at"]})
                 status = result.get("status", "confirmed" if isinstance(result.get("is_favorite"), bool) else "uncertain")
                 completed[index_key] = {"status": status}
                 if result.get("operation_id"):

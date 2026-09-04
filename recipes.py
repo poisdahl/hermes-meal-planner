@@ -2791,7 +2791,7 @@ class RecipeStore:
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
-    def claim_library_dispatch(self, operation_id: Any) -> dict[str, Any]:
+    def claim_library_dispatch(self, operation_id: Any, *, dispatch_before: str | None = None) -> dict[str, Any]:
         operation = _bounded_text(operation_id, "operation_id", required=True, maximum=80)
         if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
             raise RecipeError("recipe library operation was not found")
@@ -2805,6 +2805,9 @@ class RecipeStore:
                     raise RecipeError("recipe library operation was not found")
                 if row["status"] != "pending" or row["dispatched_at"] is not None:
                     return self._operation(row)
+                if dispatch_before is not None and datetime.now(timezone.utc) >= datetime.fromisoformat(dispatch_before):
+                    connection.execute("UPDATE library_operations SET status='failed',error_code='confirmation_expired',error_text='migration confirmation expired',updated_at=? WHERE operation_id=?", (_now(), operation))
+                    return self._operation(connection.execute("SELECT * FROM library_operations WHERE operation_id=?", (operation,)).fetchone())
                 if row["kind"] in {"archive", "delete"}:
                     try:
                         created_at = datetime.fromisoformat(row["created_at"])
@@ -3575,6 +3578,7 @@ class RecipeStore:
         *,
         expected_favorite_revision: Any = None,
         idempotency_key: Any,
+        dispatch_before: str | None = None,
     ) -> dict[str, Any]:
         reference = validate_library_recipe_ref(library_recipe_ref)
         if reference["library_id"] != "builtin":
@@ -3624,6 +3628,8 @@ class RecipeStore:
                         "favorite revision conflict; current favorite revision is "
                         f"{current['favorite_revision']}"
                     )
+                if dispatch_before is not None and datetime.now(timezone.utc) >= datetime.fromisoformat(dispatch_before):
+                    raise RecipeError("migration confirmation expired")
                 changed = current["is_favorite"] != is_favorite
                 if changed:
                     timestamp = _now()

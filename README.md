@@ -1340,6 +1340,8 @@ mappings. A non-empty v4 bank receives one transactionally consistent private
 advances the schema version last; failure preserves v4 and unknown newer
 versions fail closed. Earlier schema backups remain unchanged.
 
+Previews are limited to 512 KiB of actual escaped JSON, leaving transport space
+for final item and metadata outcomes; oversized selections must be narrowed.
 At most 100 plans, 20 items and 4 MiB of frozen documents per plan, and 10,000
 confirmed/reserved mappings are retained. Plans/snapshots expire after 30 days
 only when reconciliation and in-progress stages are unpinned. Confirmed ID

@@ -1,6 +1,6 @@
 from contextlib import closing
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import sqlite3
@@ -250,6 +250,62 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual([item['copy_status'] for item in result['items']], ['uncertain', 'needs_review'])
             self.assertEqual(self.dest.create_calls, 1)
             self.assertEqual(self.prepare(source_refs=[self.source.ref('1')])['items'][0]['status'], 'unavailable')
+
+    def test_expiry_checked_after_reads_each_create_and_inside_metadata_dispatch(self):
+        instant = [migration.now()]
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return instant[0]
+        plan = self.prepare(metadata_options={'favorites': 'preserve', 'labels': 'omit'})
+        create = self.dest.create_from_snapshot
+        def slow_create(snapshot, operation):
+            result = create(snapshot, operation)
+            instant[0] += timedelta(hours=1)
+            return result
+        with mock.patch.object(migration, 'now', side_effect=lambda: instant[0]), mock.patch.object(fixtures.recipe_module, 'datetime', Clock), mock.patch.object(self.dest, 'create_from_snapshot', slow_create):
+            result = self.execute(plan)
+        self.assertEqual(self.dest.create_calls, 1)
+        self.assertEqual(result['items'][1]['copy_status'], 'needs_review')
+        self.assertEqual(self.dest.favorite_write_calls, 0)
+
+        instant[0] = migration.now()
+        plan = self.prepare(source_refs=[self.source.ref('1')])
+        get = self.source.get
+        def slow_get(ref):
+            result = get(ref)
+            instant[0] += timedelta(hours=1)
+            return result
+        with mock.patch.object(migration, 'now', side_effect=lambda: instant[0]), mock.patch.object(self.source, 'get', slow_get):
+            self.assertEqual(self.execute(plan)['status'], 'needs_review')
+        self.assertEqual(self.dest.create_calls, 1)
+
+        instant[0] = migration.now(); self.source.favorite_state = True
+        plan = self.prepare(source_refs=[self.source.ref('1')], metadata_options={'favorites': 'preserve', 'labels': 'omit'})
+        get_favorite = self.dest.get_favorite
+        def slow_favorite(ref):
+            result = get_favorite(ref)
+            instant[0] += timedelta(hours=1)
+            return result
+        with mock.patch.object(migration, 'now', side_effect=lambda: instant[0]), mock.patch.object(fixtures.recipe_module, 'datetime', Clock), mock.patch.object(self.dest, 'get_favorite', slow_favorite):
+            result = self.execute(plan)
+        self.assertEqual(result['items'][0]['metadata_status'], 'partial')
+        self.assertEqual(self.dest.favorite_write_calls, 0)
+
+    def test_oversized_unicode_preview_rejected_before_persistence(self):
+        self.source.docs = {str(i): normalize_recipe(fixtures.full_recipe(str(i), external_id=str(i))) for i in range(10)}
+        self.source.versions = {key: 'v1' for key in self.source.docs}
+        def label(library, index):
+            return {'library_id': library, 'library_label_ref': {'library_id': library, 'label_id': str(index) + '界' * 290, 'version': '界' * 300}, 'name': '界' * 100, 'normalized_name': '界' * 100}
+        self.source.labels_enabled = self.dest.labels_enabled = True
+        self.source.associations = [label('source', i) for i in range(20)]
+        self.dest.labels = [label('destination', i) for i in range(20)]
+        mappings = [{'source': src['library_label_ref'], 'destination': dst['library_label_ref']} for src, dst in zip(self.source.associations, self.dest.labels)]
+        with self.assertRaisesRegex(RecipeError, 'wire budget'):
+            self.prepare(metadata_options={'favorites': 'omit', 'labels': 'preserve', 'label_mappings': mappings})
+        with self.app.recipes._connection() as connection:
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM migration_plans').fetchone()[0], 0)
+        self.assertEqual(self.dest.create_calls, 0)
 
     def test_builtin_restart_after_recipe_commit_before_mapping(self):
         plan = self.prepare(source_refs=[self.source.ref('0')], destination_library_id='builtin')
