@@ -54,6 +54,12 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(self.store.read()['menu_planning']['history'][mp.lock_key(self.menu)],self.menu)
         self.assertEqual(self.fixture.provider.calls,[])
 
+    def test_huge_decimal_exponents_fail_before_fraction_construction(self):
+        for value in ('1e1000000000','1e-1000000000','0e1000000000'):
+            with mock.patch('batch_planning.Fraction',side_effect=AssertionError('must not construct')):
+                with self.assertRaises(HouseholdError): bp.fraction(value)
+        self.assertEqual(bp.fraction('0.5000000000000000'),bp.fraction({'numerator':1,'denominator':2}))
+
     def test_unknown_conflicting_overconsumed_intervals_and_locks_need_input(self):
         bads=[]
         for field,value in [('suitability',True),('storage',{'method':'fridge'}),('prepared_portions','4'),('prepared_portions','-1'),('consumed_at_source','3')]:

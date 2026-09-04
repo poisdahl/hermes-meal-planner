@@ -19,7 +19,8 @@ def fraction(value, *, zero=False):
             result = Fraction(n,d)
         elif type(value) in {str,int} and len(str(value)) <= 30:
             decimal = Decimal(str(value))
-            if not decimal.is_finite(): raise ValueError()
+            if not decimal.is_finite() or decimal < 0 or decimal > 1000 or not -30 <= decimal.as_tuple().exponent <= 30:
+                raise ValueError()
             result = Fraction(decimal)
         else:
             raise ValueError()
