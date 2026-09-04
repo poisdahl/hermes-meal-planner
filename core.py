@@ -125,7 +125,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 9,
+        "version": 10,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -147,6 +147,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "order_change": None,
         "email_jobs": [],
         "occurrences": {},
+        "planning_feedback": [],
         "menu_planning": {"locks": {}, "history": {}, "retired": {}, "applied": {}, "outcomes": {}},
         "recipe_usage": {},
         "recipe_usage_requests": {},
@@ -455,11 +456,12 @@ def _migrate_state(
     before_v7: Callable[[Mapping[str, Any]], None] | None = None,
     before_v8: Callable[[Mapping[str, Any]], None] | None = None,
     before_v9: Callable[[Mapping[str, Any]], None] | None = None,
+    before_v10: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 9:
+    if version > 10:
         raise HouseholdError("household state is newer than this meal concierge")
     if version >= 6 and "favorites" in state:
         raise HouseholdError("household state contains the retired favorites key")
@@ -604,6 +606,15 @@ def _migrate_state(
             before_v9(state)
         state["menu_planning"] = {"locks": {}, "history": {}, "retired": {}, "applied": {}, "outcomes": {}}
         state["version"] = 9
+    if state["version"] == 9:
+        if "planning_feedback" in state:
+            raise HouseholdError("household v9 feedback conflicts with migration")
+        if before_v10 is not None:
+            before_v10(state)
+        state["planning_feedback"] = []
+        state["version"] = 10
+    if not isinstance(state.get("planning_feedback"), list) or len(state["planning_feedback"]) > 500:
+        raise HouseholdError("household planning feedback is invalid")
     planning = state.get("menu_planning")
     if not isinstance(planning, dict) or set(planning) != {"locks", "history", "retired", "applied", "outcomes"} or any(not isinstance(v, dict) or len(v) > 2000 for v in planning.values()):
         raise HouseholdError("household planning metadata is invalid")
@@ -765,6 +776,13 @@ class StateStore:
                 if not backup.exists():
                     _atomic_json(backup, value)
 
+            def backup_v9(value: Mapping[str, Any]) -> None:
+                if source_version != 9:
+                    return
+                backup = self.directory / "state-v9.backup.json"
+                if not backup.exists():
+                    _atomic_json(backup, value)
+
             _migrate_state(
                 state,
                 self.config,
@@ -772,6 +790,7 @@ class StateStore:
                 before_v7=backup_v6,
                 before_v8=backup_v7,
                 before_v9=backup_v8,
+                before_v10=backup_v9,
             )
             state_household = state.get("household")
             configured_household = str(self.config["household"])

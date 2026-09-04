@@ -15,7 +15,7 @@ import unicodedata
 from core import HouseholdError
 
 
-PLANNER_VERSION = "weekly-menu-v1"
+PLANNER_VERSION = "weekly-menu-v2"
 MAX_CANDIDATES = 12
 MAX_DAYS = 7
 MAX_ALTERNATIVES = 3
@@ -375,6 +375,9 @@ def _slot_reasons(
     candidate: Mapping[str, Any], day: str, index: int, count: int, profile: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
     reasons: list[dict[str, Any]] = []
+    explicit_feedback = candidate.get("planning_feedback")
+    if explicit_feedback is not None:
+        reasons.append(_reason("feedback:explicit-v1", explicit_feedback["weight"], deepcopy(explicit_feedback)))
     facets = candidate["facts"]["dietary_facets"]["values"]
     weights = {"fish": 9, "legume": 8, "wholegrain_or_potato": 5, "vegetable": 3}
     for facet in sorted(facets):
@@ -627,7 +630,7 @@ def _validate_request(value: Any) -> dict[str, Any]:
 
 def plan_week(
     request: Any, *, profile: Mapping[str, Any], candidates: list[Mapping[str, Any]],
-    history: Mapping[str, Any],
+    history: Mapping[str, Any], feedback: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a byte-stable ranking for already-resolved exact candidates."""
     checked = _validate_request(request)
@@ -727,6 +730,8 @@ def plan_week(
         },
         "candidates": evaluations,
     }
+    if feedback is not None:
+        canonical_input["feedback"] = deepcopy(dict(feedback))
     input_digest = digest(canonical_input)
     base_result = {
         "planner_version": PLANNER_VERSION,
