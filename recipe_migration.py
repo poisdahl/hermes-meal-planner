@@ -138,8 +138,9 @@ class Migration:
                 (source_ref["library_id"], source_ref["recipe_id"], destination)).fetchone()
             pending = connection.execute(
                 "SELECT operation_id FROM library_operations WHERE kind IN ('create','migration') AND library_id=? "
-                "AND source_identity IN (?,?) AND status IN ('pending','uncertain') LIMIT 1",
-                (destination, self.identity(source_ref), source_key(doc))).fetchone()
+                "AND (source_identity IN (?,?) OR (kind='migration' AND json_extract(request_metadata, '$.origin_identity')=?)) "
+                "AND status IN ('pending','uncertain') LIMIT 1",
+                (destination, self.identity(source_ref), source_key(doc), digest(origin(doc)) if origin(doc) else None)).fetchone()
         if mapped:
             ref = json.loads(mapped["destination_ref"])
             current = self.get(ref, latest=True)
@@ -312,7 +313,14 @@ class Migration:
         result["plan_digest"] = plan["digest"]
         result["items"] = [{**deepcopy(item["frozen"]["preview"]), **deepcopy(item["progress"])} for item in plan["items"]]
         statuses = [i.get("copy_status") for i in result["items"]]
-        result["status"] = ("needs_review" if "needs_review" in statuses else "uncertain" if "uncertain" in statuses or any(i.get("metadata_status") == "uncertain" for i in result["items"]) else "complete" if all(s == "confirmed" and i.get("metadata_status") not in {"partial", "uncertain"} for s, i in zip(statuses, result["items"])) else "partial" if any(statuses) else "prepared")
+        if "uncertain" in statuses or any(i.get("metadata_status") == "uncertain" for i in result["items"]):
+            result["status"] = "uncertain"
+        elif "needs_review" in statuses:
+            result["status"] = "needs_review"
+        elif all(s == "confirmed" and i.get("metadata_status") == "complete" for s, i in zip(statuses, result["items"])):
+            result["status"] = "complete"
+        else:
+            result["status"] = "partial" if any(statuses) else "prepared"
         result["primary_library_changed"] = False
         return result
 
@@ -330,14 +338,16 @@ class Migration:
                 return self.store._operation(row)
             if connection.execute("SELECT 1 FROM library_connection_controls WHERE library_id=?", (destination,)).fetchone():
                 raise RecipeError("destination connection is disabled")
-            if connection.execute("SELECT 1 FROM library_operations WHERE kind='migration' AND library_id=? AND source_identity=? AND status IN ('pending','uncertain')", (destination, self.identity(ref))).fetchone():
+            if connection.execute("SELECT 1 FROM library_operations WHERE kind IN ('create','migration') AND library_id=? "
+                                  "AND (source_identity IN (?,?) OR (kind='migration' AND json_extract(request_metadata, '$.origin_identity')=?)) "
+                                  "AND status IN ('pending','uncertain')", (destination, self.identity(ref), source_key(doc), digest(origin(doc)) if origin(doc) else None)).fetchone():
                 raise RecipeError("an unresolved copy already reserves this source and destination")
             if connection.execute("SELECT COUNT(*) FROM library_operations").fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
                 raise RecipeError("recipe operation journal is full")
             if connection.execute("SELECT COUNT(*) FROM migration_mappings").fetchone()[0] + connection.execute("SELECT COUNT(*) FROM library_operations WHERE kind='migration' AND status IN ('pending','uncertain')").fetchone()[0] >= MAX_MAPPINGS:
                 raise RecipeError("migration mapping capacity reached")
             operation_id, timestamp = f"libop:v1:{secrets.token_urlsafe(18)}", now().isoformat()
-            metadata = {"status": "active", "plan_id": plan["plan_id"], "source_ref": ref, "destination_library_id": destination, "document_digest": digest(doc)}
+            metadata = {"status": "active", "plan_id": plan["plan_id"], "source_ref": ref, "destination_library_id": destination, "document_digest": digest(doc), "origin_identity": digest(origin(doc)) if origin(doc) else None}
             connection.execute("""INSERT INTO library_operations(operation_id,kind,library_id,request_digest,request_metadata,idempotency_key,status,source_identity,snapshot_digest,created_at,updated_at)
                                   VALUES(?,'migration',?,?,?,?,'pending',?,?,?,?)""", (operation_id, destination, digest(metadata), canonical(metadata), key, self.identity(ref), digest(doc), timestamp, timestamp))
             return self.store._operation(connection.execute("SELECT * FROM library_operations WHERE operation_id=?", (operation_id,)).fetchone())
@@ -420,7 +430,7 @@ class Migration:
                 # One local transaction commits the new recipe and operation result.
                 with self.store._connection() as connection:
                     connection.execute("BEGIN IMMEDIATE")
-                    saved = self.store._save(connection, frozen["document"], "active", key, "migration", migration_identity=self.identity(frozen["source_ref"]))
+                    saved = self.store._save(connection, frozen["document"], "active", None, "migration", migration_identity=self.identity(frozen["source_ref"]))
                     ref = saved["library_recipe_ref"]
                     connection.execute("UPDATE library_operations SET status='confirmed',result_metadata=?,provider_recipe_id=?,provider_version=?,updated_at=? WHERE operation_id=?", (canonical(ref), ref["recipe_id"], ref["version"], now().isoformat(), operation["operation_id"]))
             else:
@@ -473,7 +483,15 @@ class Migration:
             if completed.get(index_key, {}).get("status") in {"confirmed", "failed"}:
                 continue
             key = f"mig:{plan['plan_id']}:{item['item_id']}:meta:{index}"
-            operation = self.store.library_operation_for_idempotency(key)
+            if progress["destination_ref"]["library_id"] == "builtin":
+                with self.store._connection() as connection:
+                    saved = connection.execute("SELECT response_json FROM idempotency WHERE key=? AND operation='set_favorite'", (key,)).fetchone()
+                if saved:
+                    completed[index_key] = {"status": "confirmed"}
+                    continue
+                operation = None
+            else:
+                operation = self.store.library_operation_for_idempotency(key)
             if expired and (operation is None or not operation.get("dispatched_at")):
                 completed[index_key] = {"status": "failed", "reason": "confirmation_expired"}
                 continue

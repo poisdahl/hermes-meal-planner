@@ -240,6 +240,50 @@ class MigrationTests(unittest.TestCase):
                 migration.Migration(self.app).load(plan['plan_id'])
         self.assertEqual(self.prepare(source_refs=[self.source.ref('0')])['items'][0]['status'], 'already_mapped')
 
+    def test_uncertain_origin_blocks_other_source_refs_despite_search_visibility(self):
+        self.source.docs['1'] = deepcopy(self.source.docs['0'])
+        plan = self.prepare()
+        self.dest.timeout = True
+        with mock.patch.object(self.dest, 'search', return_value={'recipes': [], 'cursor': None}):
+            result = self.execute(plan)
+            self.assertEqual(result['status'], 'uncertain')
+            self.assertEqual([item['copy_status'] for item in result['items']], ['uncertain', 'needs_review'])
+            self.assertEqual(self.dest.create_calls, 1)
+            self.assertEqual(self.prepare(source_refs=[self.source.ref('1')])['items'][0]['status'], 'unavailable')
+
+    def test_builtin_restart_after_recipe_commit_before_mapping(self):
+        plan = self.prepare(source_refs=[self.source.ref('0')], destination_library_id='builtin')
+        with mock.patch.object(migration.Migration, 'save_mapping', side_effect=SystemExit('crash after local commit')):
+            with self.assertRaises(SystemExit): self.execute(plan)
+        self.assertEqual(len(self.app.recipes.search('')), 1)
+        self.assertEqual(self.execute(plan)['status'], 'complete')
+        self.assertEqual(len(self.app.recipes.search('')), 1)
+
+    def test_inspect_after_mapping_does_not_claim_pending_metadata_complete(self):
+        plan = self.prepare(source_refs=[self.source.ref('0')], metadata_options={'favorites': 'preserve', 'labels': 'omit'})
+        with mock.patch.object(migration.Migration, 'apply_metadata', side_effect=SystemExit('crash before metadata')):
+            with self.assertRaises(SystemExit): self.execute(plan)
+        inspected = self.app.handle({'operation': 'migration', 'action': 'inspect', 'plan_id': plan['plan_id']})
+        self.assertEqual(inspected['status'], 'partial')
+        self.assertEqual(inspected['items'][0]['metadata_status'], 'pending')
+        self.assertEqual(self.execute(plan)['status'], 'complete')
+
+    def test_builtin_favorite_restart_after_write_before_stage_progress(self):
+        self.source.favorite_state = True
+        plan = self.prepare(source_refs=[self.source.ref('0')], destination_library_id='builtin', metadata_options={'favorites': 'preserve', 'labels': 'omit'})
+        original = migration.Migration.update
+        def stop(engine, plan, item):
+            if item['progress'].get('metadata_stages', {}).get('0', {}).get('status') == 'confirmed':
+                raise SystemExit('crash after favorite write')
+            return original(engine, plan, item)
+        with mock.patch.object(migration.Migration, 'update', stop):
+            with self.assertRaises(SystemExit): self.execute(plan)
+        result = self.execute(plan)
+        self.assertEqual(result['status'], 'complete', result)
+        recipe = self.app.recipes.get(result['items'][0]['destination_ref']['recipe_id'])
+        self.assertTrue(recipe['is_favorite'])
+        self.assertEqual(recipe['favorite_revision'], 1)
+
     def test_installed_adapters_validate_native_storage_before_any_write(self):
         engine = migration.Migration(self.app)
         for adapter_class in (fixtures.MealieAdapter, fixtures.RecipeSageAdapter):
