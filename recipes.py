@@ -442,6 +442,7 @@ def scale_recipe(recipe: Mapping[str, Any], portions: Any | None = None) -> dict
                 "query": value.get("item"), "item": value.get("item"),
                 "quantity": value.get("quantity"), "unit": value.get("unit"),
                 "optional": value.get("optional", False), "pantry": value.get("pantry", False),
+                "scalable": value.get("scalable") is True,
             }
             for value in result.get("ingredients", [])
         ]
@@ -480,6 +481,7 @@ def scale_recipe(recipe: Mapping[str, Any], portions: Any | None = None) -> dict
             "unit": item.get("unit"),
             "optional": item.get("optional", False),
             "pantry": item.get("pantry", False),
+            "scalable": item.get("scalable") is True,
         })
     result["ingredients"] = scaled
     result["portions"] = target

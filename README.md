@@ -157,6 +157,78 @@ tool, the profile tool, or a private `profile_overrides.recipes.sources` value.
 Provider selection and confirmation policy remain config-bound and require a
 separate state/service change rather than an in-place setup edit.
 
+## Product observations and bounded selection
+
+Product search normalizes Oda and MENY results into one bounded observation
+shape while preserving the provider's exact `product_id`/`product_ref`. Each
+product carries availability, an observation timestamp, display-only provider
+text and, only when established exactly, package mass/volume/count and purchase
+options. Merchandise price, a `fra` lower bound, mandatory product-level pant
+and total payable are separate integer-øre fields. An exact displayed price or
+unit price is therefore not necessarily an exact payable total: missing pant,
+variable weight, unknown member eligibility and unsupported offer syntax all
+stay unresolved. Comparable merchandise unit prices use exact fractions within
+mass, volume or count; the display value is rounded to two decimal øre per
+canonical unit using round-half-even. The current Oda `product_search` fixture
+exposes exact merchandise price and availability but no product-level deposit
+or offer-term field, so its `total_payable_ore` and automatic offer use remain
+unavailable. MENY search cards likewise do not prove an exact pant amount or
+that pant is absent. For each bounded, available exact-price result the MENY
+adapter therefore verifies the same current price against the linked product's
+single primary price block. Exactly no pant marker establishes zero product
+pant; a `+ pant` marker without its amount remains unknown. This lets ordinary
+no-pant products expose an exact payable total without treating card absence as
+evidence. The captured public `Tilbud` current/original-price pair and strict
+`N for M` tag establish the only automatic MENY discount forms. `Fra N,NN kr`
+is always a lower bound (including `fra 0`), never payable; no such product card
+was present in the bounded verification capture. Other lower-bound, promotional
+and package grammars remain display-only. Because the captured campaigns do not
+state repetition limits, one discounted unit or one exact multi-buy threshold is
+the largest decision-bearing quantity; larger quantities stay unresolved. No
+observation is stored as durable price truth.
+
+`meal_concierge_products prepare` binds one read-only proposal to the exact
+active saved-menu identity or one complete deterministic planner handoff and to
+the configured provider. It aggregates only identical, scalable ingredients
+with exactly convertible units; raw or non-scalable quantities stay unresolved.
+For a menu saved before shopping requirements carried `scalable`, the flag is
+recovered only when the requirement still exactly matches the same-index frozen
+ingredient's identity, scaled quantity, unit and option/pantry flags.
+The first call exposes at most five relevance-ranked search
+results per requirement and returns `needs_input`; search order, names and
+promotional text never establish substitution safety. A subsequent current user
+choice must name the exact approved candidate refs for each exact requirement.
+Only confirmed availability, package evidence, offer eligibility and complete
+product-level payable amounts enter the bounded combination search.
+Configured allergy/sensitivity and avoid rules are also hard at the product
+boundary. The current provider observations contain no authoritative product
+safety evidence, so a non-empty rule keeps preparation at `needs_input`; an
+exact candidate-ref approval cannot override it.
+
+The resulting claim is only the lowest verified total payable amount among the
+explicitly approved, exactly priced candidates observed in those bounded
+provider searches—never the cheapest item in the store. It excludes delivery,
+bags, cart-level fees and checkout drift. Selection ranks exact payable amount,
+then the rational per-requirement excess score, package count and stable product
+refs. The complete canonical result and `product_plan_digest` are carried by the
+caller; display fields and timestamps do not grant freshness or apply authority.
+
+Apply needs that complete unchanged result and digest plus a clear current user
+request to change the cart. It repeats the same provider searches and ranking,
+stops without a cart write on menu, candidate, package, availability, offer or
+price drift, and otherwise hands the exact whole-package quantities to the
+existing guarded, restart-safe cart sync. A verified exact product-line amount
+is compared with the prepared exact total; a post-write difference is reported
+without rollback. MENY's current cart DOM does not establish a semantic line
+total, so its post-write price verification is explicitly unavailable rather
+than inferred from presentation markup. Product selection never authorizes
+delivery, checkout, ordering or payment, and the provider checkout summary
+remains the final price authority.
+MENY applies larger selections as sequential, acknowledged batches of at most
+two UI quantity changes. Immediately before each batch it rereads the cart;
+an unexpected intermediate cart stops the remaining batches and returns the
+normal reconciliation boundary. Reconciliation uses the same bounded batches.
+
 ## Delivery prices and selection
 
 Delivery list returns the same seven-field slot object for each provider:

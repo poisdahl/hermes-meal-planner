@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from core import HouseholdError, cart_summary, validate_delivery_slot
+from product_observations import normalize_oda_product_search
 
 
 ODA_ENDPOINT = "https://oda.com/mcp"
@@ -341,6 +342,12 @@ class OdaClient:
             raise HouseholdError("Oda returned no structured result")
         if tool == "get_delivery_slots":
             return normalize_oda_delivery_slots(value)
+        if tool == "product_search":
+            normalized = normalize_oda_product_search(value)
+            requested_size = arguments.get("size")
+            if isinstance(requested_size, int) and not isinstance(requested_size, bool):
+                normalized["scope"]["requested_size"] = requested_size
+            return normalized
         return value
 
     @contextmanager

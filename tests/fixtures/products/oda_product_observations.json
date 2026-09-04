@@ -1,0 +1,123 @@
+{
+  "fixture": {
+    "captured_at": "2026-09-04T17:17:00+00:00",
+    "source": "sanitized authenticated read-only product_search responses from the configured Bob Oda MCP v1.1.0 runtime",
+    "queries": ["melk 1 l", "cola 1,5 l", "banan", "laks"],
+    "sanitization": "The retained fields are public catalog data. Account, address, cart, order, payment, OAuth, session and private-history data were neither requested nor retained.",
+    "parser_boundary": "Only id, name, description, price and availability are decision-bearing. unitName, unitPrice, brand and URL remain display metadata. The result supplies no product-level deposit or offer-term field, so total payable and automatic offer use remain unavailable."
+  },
+  "responses": [
+    {
+      "result": [
+        {
+          "hasMore": true,
+          "products": [
+            {
+              "availability": {"code": "available", "description": "", "isAvailable": true},
+              "brand": "Q",
+              "brandId": 4305,
+              "description": "1%, 1 l",
+              "id": 1131,
+              "name": "Q Melk Lett 1%",
+              "price": "21.50",
+              "unitName": "liter",
+              "unitPrice": "21.50",
+              "url": "https://oda.com/no/products/1131-q-q-melk-lett-1/"
+            }
+          ],
+          "query": "melk 1 l"
+        }
+      ]
+    },
+    {
+      "result": [
+        {
+          "hasMore": true,
+          "products": [
+            {
+              "availability": {"code": "available", "description": "", "isAvailable": true},
+              "brand": "Coca-Cola",
+              "brandId": 56,
+              "description": "4 x 1,5 l, 6 l",
+              "id": 22207,
+              "name": "Coca-Cola 4 x 1,5 l",
+              "price": "99.00",
+              "unitName": "liter",
+              "unitPrice": "16.50",
+              "url": "https://oda.com/no/products/22207-coca-cola-coca-cola-4-x-15-l/"
+            }
+          ],
+          "query": "cola 1,5 l"
+        }
+      ]
+    },
+    {
+      "result": [
+        {
+          "hasMore": true,
+          "products": [
+            {
+              "availability": {"code": "available", "description": "", "isAvailable": true},
+              "brand": null,
+              "brandId": null,
+              "description": "3-5 Stk. Fairtrade, Ecuador / Peru, 700 g",
+              "id": 19432,
+              "name": "Økologiske Bananer 3-5 Stk. Fairtrade, Ecuador / Peru",
+              "price": "25.30",
+              "unitName": "kilogram",
+              "unitPrice": "31.63",
+              "url": "https://oda.com/no/products/19432-okologiske-bananer-3-5-stk-fairtrade-ecuador-peru/"
+            },
+            {
+              "availability": {"code": "sold_out_supplier", "description": "Utsolgt fra leverandør", "isAvailable": false},
+              "brand": "Q",
+              "brandId": 4305,
+              "description": "Porsjonspose, 90 g",
+              "id": 14068,
+              "name": "Q Skyr mini banan Porsjonspose",
+              "price": "16.00",
+              "unitName": "kilogram",
+              "unitPrice": "177.78",
+              "url": "https://oda.com/no/products/14068-q-skyr-mini-banan-porsjonspose/"
+            }
+          ],
+          "query": "banan"
+        }
+      ]
+    },
+    {
+      "result": [
+        {
+          "hasMore": true,
+          "products": [
+            {
+              "availability": {"code": "available", "description": "", "isAvailable": true},
+              "brand": "Norsk Sjømat",
+              "brandId": 1628,
+              "description": "Maks 3 til nedsatt pris, Naturell, 500 g",
+              "id": 27247,
+              "name": "Norsk Sjømat Laksefilet med skinn Naturell",
+              "price": "87.40",
+              "unitName": "kilogram",
+              "unitPrice": "174.80",
+              "url": "https://oda.com/no/products/27247-norsk-sjomat-laksefilet-med-skinn-naturell/"
+            },
+            {
+              "availability": {"code": "available", "description": "", "isAvailable": true},
+              "brand": "Vår Laveste Pris",
+              "brandId": 4051,
+              "description": "ca. 1 kg",
+              "id": 64592,
+              "name": "Vår Laveste Pris Nakkekoteletter",
+              "price": "119.80",
+              "unitName": "kilogram",
+              "unitPrice": "119.80",
+              "url": "https://oda.com/no/products/64592-var-laveste-pris-nakkekoteletter/"
+            }
+          ],
+          "query": "laks"
+        }
+      ]
+    }
+  ]
+}

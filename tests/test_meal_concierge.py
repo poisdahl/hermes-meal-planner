@@ -3855,6 +3855,8 @@ class MenyClientTests(unittest.TestCase):
             mock.call("click", '[data-meal-concierge-action="open-cart"]'),
         ])
         self.assertEqual(client._sleep.call_args_list, [mock.call(0.5), mock.call(0.5)])
+        self.assertIn("linePrices.length === 1", client._eval.call_args_list[1].args[0])
+        self.assertIn("filter(visible)", client._eval.call_args_list[1].args[0])
 
     def test_search_uses_encoded_bound_results_route_and_one_scoped_root(self):
         client = self.client()
@@ -3891,6 +3893,9 @@ class MenyClientTests(unittest.TestCase):
         self.assertIn("root.querySelectorAll('li.ws-product-list-vertical__item')", scripts[0])
         self.assertIn("paths.size !== 1", scripts[0])
         self.assertIn("visiblePaths.length === 0", scripts[0])
+        self.assertIn("prices.length > 1", scripts[0])
+        self.assertIn("campaigns.length > 1", scripts[0])
+        self.assertIn("deposits.length > 1", scripts[0])
 
     def test_product_search_accepts_current_results_shell_without_optional_query_header(self):
         client = self.client()
@@ -4053,6 +4058,12 @@ class MenyClientTests(unittest.TestCase):
         client = self.client()
         client._open = mock.Mock()
         client._sleep = mock.Mock()
+        client._product_price_details = mock.Mock(return_value={
+            "detail_price": "24,90 kroner.",
+            "detail_original_price": None,
+            "deposit_status": "none",
+            "detail_deposit": None,
+        })
         client._eval = mock.Mock(side_effect=[
             {
                 "ready": False,
@@ -4075,13 +4086,93 @@ class MenyClientTests(unittest.TestCase):
                 "state_root_count": 1,
                 "query_count": 1,
                 "heading_count": 1,
-                "products": [{"product_id": MENY_PRODUCT}],
+                "products": [{
+                    "product_id": MENY_PRODUCT,
+                    "name": "Brokkoli 400 g",
+                    "package": "400 g",
+                    "price": "24,90 kr",
+                    "deposit": None,
+                    "available": True,
+                }],
                 "recipes": [],
             },
         ])
         result = client._search("brokkoli", 5, "products")
-        self.assertEqual(result["products"], [{"product_id": MENY_PRODUCT}])
+        self.assertEqual(result["products"][0]["product_id"], MENY_PRODUCT)
+        self.assertEqual(result["products"][0]["name"], "Brokkoli 400 g")
+        self.assertEqual(result["products"][0]["purchase_options"][0]["total_payable_ore"], 2490)
+        client._product_price_details.assert_called_once()
         client._sleep.assert_called_once_with(0.25)
+
+    def test_product_search_preserves_card_pant_for_detail_contradiction(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._eval = mock.Mock(return_value={
+            "ready": True, "identity": True, "route": True,
+            "authenticated": True, "root_count": 1, "state_root_count": 1,
+            "query_count": 1, "heading_count": 1,
+            "products": [{
+                "product_id": MENY_PRODUCT, "name": "Brokkoli 400 g",
+                "package": "400 g", "price": "24,90 kr", "deposit": "+ pant",
+                "available": True,
+            }],
+            "recipes": [],
+        })
+        client._product_price_details = mock.Mock(return_value={
+            "detail_price": "24,90 kroner.",
+            "detail_original_price": None,
+            "deposit_status": "none",
+            "detail_deposit": None,
+        })
+        with self.assertRaisesRegex(HouseholdError, "contradictory"):
+            client._search("brokkoli", 5, "products")
+
+    def test_product_price_details_binds_one_public_detail_price_and_pant_state(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        scripts = []
+        client._eval = lambda script: scripts.append(script) or {
+            "ready": True,
+            "identity": True,
+            "authenticated": True,
+            "main_count": 1,
+            "primary_count": 1,
+            "price_count": 1,
+            "current_count": 1,
+            "current_labels": ["Tilbud, nå 119,00 kroner pluss pant."],
+            "original_count": 1,
+            "original_labels": ["Før 155,00 kroner."],
+            "recycle": ["+ pant"],
+        }
+        result = client._product_price_details({"product_id": MENY_PRODUCT})
+        client._open.assert_called_once_with("https://meny.no" + MENY_PRODUCT)
+        self.assertEqual(result, {
+            "detail_price": "Tilbud, nå 119,00 kroner pluss pant.",
+            "detail_original_price": "Før 155,00 kroner.",
+            "deposit_status": "present_unknown",
+            "detail_deposit": "+ pant",
+        })
+        self.assertIn(json.dumps(MENY_PRODUCT), scripts[0])
+        self.assertIn(".ws-product-details__primary-info", scripts[0])
+        self.assertIn("location.pathname === expectedPath", scripts[0])
+        self.assertIn("location.search", scripts[0])
+
+    def test_product_price_details_rejects_ambiguous_pant_markup(self):
+        client = self.client()
+        client._open = mock.Mock()
+        client._sleep = mock.Mock()
+        client._eval = mock.Mock(return_value={
+            "ready": True,
+            "identity": True,
+            "authenticated": True,
+            "current_labels": ["21,80 kroner."],
+            "original_labels": [],
+            "recycle": ["pant kan tilkomme"],
+        })
+        with self.assertRaisesRegex(HouseholdError, "deposit details changed"):
+            client._product_price_details({"product_id": MENY_PRODUCT})
 
     def test_recipe_search_selects_bound_visible_kind_control(self):
         client = self.client()

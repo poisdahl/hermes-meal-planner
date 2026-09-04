@@ -1,0 +1,98 @@
+{
+  "fixture": {
+    "captured_at": "2026-09-04T15:55:00+00:00",
+    "source": "authenticated read-only MENY search-card DOM plus the linked public product-detail price block",
+    "queries": ["melk", "cola", "fra", "fiskedisken", "ferskvare"],
+    "sanitization": "Only public product names, package text, product paths, prices, offer labels, availability and linked detail-page price evidence are retained. No account, address, cart, order, payment, session, cookie or private history data is retained.",
+    "parser_boundary": "The observations establish ordinary and discounted current price, one strict multi-buy tag, unknown member eligibility, missing/unsupported price, variable weight, a product-detail pant marker, exact no-pant detail evidence, and exact single/count-before-amount package forms. No product-card fra-price form was present in the bounded configured-provider reads; the strict fra grammar exists only because the issue contract explicitly requires Fra 0 to remain a lower bound, and it can never become payable cost. Other price and package grammars remain display-only."
+  },
+  "response": {
+    "provider": "meny",
+    "query": "fixture",
+    "products": [
+      {
+        "product_id": "/varer/meieri-egg/melk/lettmelk/lettmelk-0-5-7048840000500",
+        "name": "Lettmelk 0,5%",
+        "package": "1l Q",
+        "price": "21,80 kr",
+        "original_price": null,
+        "unit_price": "21,80 kr/l",
+        "campaign_tag": null,
+        "campaign": null,
+        "deposit": null,
+        "detail_price": "21,80 kroner.",
+        "detail_original_price": null,
+        "deposit_status": "none",
+        "available": true
+      },
+      {
+        "product_id": "/varer/drikke/brus/coca-cola-zero-7090000248147",
+        "name": "Coca-Cola Zero",
+        "package": "1,5lx8 flaske",
+        "price": "119,00 kr",
+        "original_price": "før 155,00 kr",
+        "unit_price": "9,92 kr/l",
+        "campaign_tag": "Tilbud",
+        "campaign": "Del av kampanje: Tilbud",
+        "deposit": "+ pant",
+        "detail_price": "Tilbud, nå 119,00 kroner pluss pant.",
+        "detail_original_price": "Før 155,00 kroner.",
+        "detail_deposit": "+ pant",
+        "deposit_status": "present_unknown",
+        "available": true
+      },
+      {
+        "product_id": "/varer/drikke/brus/coca-cola-5000112664331",
+        "name": "Coca-Cola",
+        "package": "0,33lx4 boks",
+        "price": "62,50 kr",
+        "original_price": null,
+        "unit_price": "47,35 kr/l",
+        "campaign_tag": "3 for 2",
+        "campaign": "Del av kampanje: Plukk & miks 4pk brus fra Coca-Cola",
+        "deposit": "+ pant",
+        "detail_price": "62,50 kroner pluss pant.",
+        "detail_original_price": null,
+        "detail_deposit": "+ pant",
+        "deposit_status": "present_unknown",
+        "available": true
+      },
+      {
+        "product_id": "/varer/frukt-gront/frosne-baer-og-gronnsaker/frukt-og-baer-frosne/blabaer-frosne/blabaer-7035620061349",
+        "name": "Blåbær",
+        "package": "Økologisk 225g Vilje",
+        "price": "38,90 kr",
+        "original_price": null,
+        "unit_price": "172,89 kr/kg",
+        "campaign_tag": null,
+        "campaign": "Del av kampanje: Fast for MENY MER-kunder",
+        "deposit": null,
+        "available": true
+      },
+      {
+        "product_id": "/varer/fisk-skalldyr/fisk/makrell/hel-makrell-1873",
+        "name": "Hel makrell",
+        "package": "ca. 500g. Fra fiskedisken",
+        "price": "179,00 kr/kg",
+        "original_price": null,
+        "unit_price": null,
+        "campaign_tag": "Fisketirsdag",
+        "campaign": null,
+        "deposit": null,
+        "available": false
+      },
+      {
+        "product_id": "/varer/fisk-skalldyr/fisk/torsk/torskeburger-7090070080005",
+        "name": "Torskeburger",
+        "package": "2x110g Ode",
+        "price": null,
+        "original_price": null,
+        "unit_price": null,
+        "campaign_tag": null,
+        "campaign": null,
+        "deposit": null,
+        "available": null
+      }
+    ]
+  }
+}
