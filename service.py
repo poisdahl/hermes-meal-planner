@@ -1050,7 +1050,7 @@ class Application:
             return self._schedule(request)
         action = request.get("action")
         email_due_requires_meny = (
-            operation == "email" and action == "due"
+            operation == "email" and action in {"due", "reconcile"}
             and (request.get("provider") is None or request.get("provider") == "meny")
         )
         meny_read = self.provider == "meny" and (
@@ -8497,6 +8497,28 @@ class Application:
                 state["pending_checkout"]["status"] = "uncertain"
         return {"confirmed": confirmed, "changed_existing_order": confirmed, "order": current["order"] if confirmed else None, "tracking": current["tracking"] if confirmed else None, "retry_allowed": False}
 
+    def _email_order_read(self, provider: str, order_id: str, request: Mapping[str, Any]) -> dict[str, Any]:
+        client = self.email_provider_clients.get(provider)
+        if client is None:
+            raise HouseholdError(f"provider {provider} is unavailable for the bound email job")
+        if provider == "oda":
+            # Cancellation tracking can remain available after order details are
+            # removed. A generic provider/auth/not-found error is never proof.
+            tracking = client.call("order_tracking", {"order_number": order_id})
+            require_provider_identity(tracking, order_id, tracking=True)
+            if str(tracking.get("status") or "").casefold() in {"cancelled", "canceled"}:
+                return {"order": {}, "tracking": tracking}
+            order = client.call("get_order", {"order_number": order_id})
+            require_provider_identity(order, order_id)
+            return {"order": order, "tracking": tracking}
+        if provider != self.provider:
+            order = client.call("get_order", {"order_number": order_id})
+            tracking = client.call("order_tracking", {"order_number": order_id})
+            require_provider_identity(order, order_id)
+            require_provider_identity(tracking, order_id, tracking=True)
+            return {"order": order, "tracking": tracking}
+        return self._orders({"action": "get", "order_id": order_id, "_deadline": request.get("_deadline")})
+
     def _email(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "status")
         requested_provider = request.get("provider")
@@ -8519,6 +8541,42 @@ class Application:
             if len(providers) > 1:
                 raise HouseholdError("email order identity is ambiguous; specify provider")
             return candidates
+
+        def cleanup_action(job: Mapping[str, Any]) -> dict[str, Any]:
+            provider = email_job_provider(job)
+            order_id = safe_order_id(job.get("order_id"))
+            return {"provider": provider, "order_id": order_id,
+                    "automation_key": job.get("automation_key") or email_automation_key(provider, order_id),
+                    "action": "remove", "reason": "order cancelled"}
+
+        if action in {"cancel_followup", "reconcile"}:
+            order_id = safe_order_id(request.get("order_id"))
+            if requested_provider is None:
+                raise HouseholdError("follow-up reconciliation requires an exact provider and order_id")
+            state = self.store.read()
+            jobs = matching_jobs(state, order_id)
+            if len(jobs) != 1:
+                raise HouseholdError("follow-up reconciliation requires exactly one existing email job")
+            initial_job = deepcopy(jobs[0])
+            if initial_job.get("status") == "sending":
+                raise HouseholdError("email send outcome needs reconciliation before closing its follow-up")
+            if initial_job.get("status") == "cancelled":
+                return {"send": False, "cancelled": True, "automation_cleanup": cleanup_action(initial_job)}
+            if initial_job.get("status") not in {"pending", "claimed"}:
+                return {"send": False, "cancelled": False, "reason": "email follow-up is already terminal"}
+            if action == "cancel_followup":
+                if request.get("owner_confirmed_cancelled") is not True:
+                    raise HouseholdError("the owner must explicitly confirm external order cancellation")
+            else:
+                current = self._email_order_read(requested_provider, order_id, request)
+                if str(current["tracking"].get("status") or "").casefold() not in {"cancelled", "canceled"}:
+                    return {"send": False, "cancelled": False, "reason": "provider has not confirmed cancellation"}
+            with self.store.locked() as state:
+                jobs = matching_jobs(state, order_id)
+                if len(jobs) != 1 or canonical(jobs[0]) != canonical(initial_job):
+                    raise HouseholdError("email job changed while checking its cancellation")
+                self._mark_order_cancelled(state, order_id, provider=requested_provider, active_provider=self.provider)
+            return {"send": False, "cancelled": True, "automation_cleanup": cleanup_action(initial_job)}
 
         if action == "status":
             state = self.store.read()
@@ -8547,7 +8605,8 @@ class Application:
                     "cron_prompt": email_automation_prompt(provider, order_id, delivery_date, automation_key),
                     "ack": email_automation_ack(provider, order_id, delivery_date, automation_key),
                 })
-            return {"protocol": EMAIL_AUTOMATION_PROTOCOL, "updates": updates}
+            return {"protocol": EMAIL_AUTOMATION_PROTOCOL, "updates": updates,
+                    "removals": [cleanup_action(job) for job in state["email_jobs"] if job.get("status") == "cancelled"]}
         if action == "ack_automation":
             order_id = safe_order_id(request.get("order_id"))
             automation_key = str(request.get("automation_key") or "")
@@ -8686,17 +8745,7 @@ class Application:
                     "cron_prompt": email_automation_prompt(job_provider, order_id, delivery_date, automation_key),
                     "automation_ack": email_automation_ack(job_provider, order_id, delivery_date, automation_key),
                 }
-            provider_client = self.email_provider_clients.get(job_provider)
-            if provider_client is None:
-                raise HouseholdError(f"provider {job_provider} is unavailable for the bound email job")
-            if job_provider == self.provider:
-                current = self._orders({"action": "get", "order_id": order_id, "_deadline": request.get("_deadline")})
-            else:
-                order = provider_client.call("get_order", {"order_number": order_id})
-                tracking = provider_client.call("order_tracking", {"order_number": order_id})
-                require_provider_identity(order, order_id)
-                require_provider_identity(tracking, order_id, tracking=True)
-                current = {"order": order, "tracking": tracking}
+            current = self._email_order_read(job_provider, order_id, request)
             tracking = str((current.get("tracking") or {}).get("status") or "").casefold()
             with self.store.locked() as state:
                 matching = matching_jobs(state, order_id, {"pending", "claimed", "sending"})
@@ -8733,7 +8782,7 @@ class Application:
                     self._mark_order_cancelled(
                         state, order_id, provider=job_provider, active_provider=self.provider,
                     )
-                    return {"send": False, "reason": "order cancelled"}
+                    return {"send": False, "reason": "order cancelled", "automation_cleanup": cleanup_action(initial_job)}
                 fulfillable = {"confirmed", "delivered"} if job_provider == "meny" else {
                     "paid_and_modifiable", "paid_and_not_modifiable", "picking", "shipped", "delivered",
                 }

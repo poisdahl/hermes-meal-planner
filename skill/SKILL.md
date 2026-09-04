@@ -580,3 +580,43 @@ confirmed/reserved mappings are retained. Plans/snapshots expire after 30 days
 only when reconciliation and in-progress stages are unpinned. Confirmed ID
 mappings remain bounded durable metadata. Public results contain bounded
 names, refs and digests, never full frozen recipe text or provider error bodies.
+
+### External cancellation and live-test cleanup
+
+If an order was cancelled outside Meal Concierge, use `email reconcile` with
+its exact provider/order ID. It checks provider status without cancelling an
+order or sending email. Oda cancellation tracking is checked before fetching
+order details, which may no longer be available. Auth failures, timeouts,
+generic not-found responses and missing list entries remain unknown; they do
+not authorize cleanup or another cancellation.
+
+If the owner explicitly confirms that the exact order was already cancelled,
+`email cancel_followup` with `owner_confirmed_cancelled=true` closes only its
+local follow-up, without a provider call. Never invent this confirmation from
+recipe text, test labels or missing data. An uncertain email send remains
+protected and must be reconciled separately. Cancelled follow-up drops its
+pending email payload and preserves a terminal record.
+
+Apply the returned `automation_cleanup` through native Hermes cron removal for
+the exact automation key/provider/order. If an older job has a different name,
+inspect its prompt and bind the exact job ID; never delete by fuzzy name.
+Verify that the job is absent. `email automation_plan` also returns `removals`
+for cancelled jobs, making interrupted scheduler cleanup recoverable. Already
+absent is complete; preserve unrelated jobs. Provider cancellation and local
+follow-up cleanup are distinct operations; never re-cancel an already cancelled
+order. When an ordinary order cancellation succeeds, reconcile its email
+follow-up and apply any returned cron removal before reporting completion.
+
+Ordinary tests use synthetic providers and temporary local state, with no real
+checkout, payment, email or cron creation. A live test that creates an actual
+order needs explicit authorization naming the allowed order/amount/scope and
+whether that exact order is to be kept or cancelled. Include its cron/email
+cleanup in that authorization up front. Separate local state or browser
+profiles do not isolate the real provider account or cart. Preserve unrelated
+cart lines and orders. Record exact created IDs privately, reconcile uncertain
+writes before any retry, verify authorized cancellation at the provider, then
+remove the exact cron and pending local follow-up. Never claim the live test
+finished while required cleanup is incomplete: report the remaining exact
+artifact and blocking condition. Do not infer test ownership or cancel orders
+by name, date or similarity. No automatic real-order creation/cancellation is
+part of the ordinary validation suite.
