@@ -701,6 +701,115 @@ built-in mapping remains without retaining or depending on the snapshot
 document. Repeating a confirmed save returns the exact originally bound recipe
 ID and revision even after cleanup or a later explicit recipe update.
 
+## Deterministic weekly-menu planning
+
+`meal_concierge_menu(action="plan")` is the server-owned whole-week planner.
+Its `planner_input` contains a week, optional exact dates and portions, and a
+bounded `candidates` list. Each candidate must contain exactly one built-in
+`recipe_ref: {id, revision}` or one still-valid frozen `discovery_ref`; names,
+URLs, ordinals, copied recipe documents and “latest” are rejected. Dates omitted
+by the caller are derived once from the saved dinner/eat-day profile and then
+returned as exact ISO dates in the canonical request. The service derives one
+`as_of_date` in the saved household timezone. A supplied date must equal that
+current household date for the initial plan. That exact date is frozen in the
+handoff; ranking and save do not compare it with a later wall clock.
+
+The planner resolves every exact candidate locally once per plan or save. It
+does not refetch recipe sources or call Oda/MENY. A candidate must be an active,
+full, materializable recipe that can be scaled to the exact requested portions.
+Original provider `link_only` candidates are reported as ineligible rather than
+being promoted from a title or summary. Candidate revisions, frozen discovery
+content digests, the complete bounded recipe-usage history, the complete current
+profile, current request overrides and every effective fact are included in the
+canonical input and `input_digest`.
+
+Configured allergies/sensitivities and avoid rules are hard constraints. Each
+configured rule requires server-owned authoritative evidence. V1 has no
+such safety evidence integration, rejects caller-supplied `facts.safety`, and
+therefore keeps those candidates unknown. Recipe prose, title, ingredients,
+tags, steps, notes and model classifications do not establish safety; unknown
+candidates are excluded, and the result is `needs_input` when those unknowns
+prevent a complete plan. This is a bounded evidence check, not an allergen,
+medical or nutritional guarantee. Cooldown is also hard. Its only bypass is an
+exact currently blocked `recipe_key` in this request's `cooldown_overrides`,
+with a non-empty bounded reason. Unneeded, historical or other-recipe overrides
+are rejected.
+
+Time and dietary targets are soft by default. Structured recipe
+`times.active_minutes` is used when valid. The v1 deterministic ingredient
+facet table may contribute positive fish, legume, wholegrain/potato and
+vegetable evidence, but its absence is incomplete rather than proof that a
+facet is absent. Perishability and complete dietary/vegetable facts must be
+explicit structured candidate facts; storage or reheating prose is not used.
+Explicit facts use objects with `source="explicit"`, for example:
+
+```json
+{
+  "recipe_ref": {"id": "rec_0123456789abcdef01234567", "revision": 3},
+  "facts": {
+    "active_minutes": {"source": "explicit", "value": 30},
+    "dietary_facets": {
+      "source": "explicit",
+      "values": ["legume", "vegetable"],
+      "complete": true,
+      "vegetable_types": ["tomato", "spinach"]
+    },
+    "perishability": {"source": "explicit", "value": "fresh"}
+  }
+}
+```
+
+Do not manufacture those facts from model inference. A caller may list any of
+the supported targets in `strict_targets`: `active_minutes`,
+`minimum_fish_portions`, `minimum_legume_dinners`,
+`minimum_wholegrain_or_potato_dinners` and `minimum_vegetable_types`. Missing
+strict evidence returns `needs_input`; complete known infeasibility returns
+`no_plan`. Default unknown or unsupported nutrition, cuisine/format and
+perishability factors remain named in `soft_relaxations` and are never described
+as compliant.
+
+Planner version `weekly-menu-v1` uses integer reason contributions. Each slot
+receives +9/+8/+5/+3 for positive fish/legume/wholegrain-or-potato/vegetable
+facets; active time receives +8 inside the saved target range, -2 outside it but
+within the maximum on weekdays, +2 for that same extra effort on weekends, -12
+above the soft maximum and zero when unknown. A fresh
+meal receives `2 * later-slot-count` for earlier placement; a shelf-stable meal
+receives its zero-based later position, and unknown perishability is unscored.
+No recorded matching use contributes +5; eligible recorded use gains up to +5
+as its week distance grows beyond cooldown. Whole-plan scoring adds +3 per distinct
+exact variety facet and -10 per duplicate. Exact normalized non-pantry,
+non-optional ingredient identity with the same explicit unit earns +4 per
+additional meal using it (at most two repeats per ingredient and +16 total);
+duplicate rows inside one recipe count once, while use beyond two meals incurs
+-6 each up to -24. Meeting each supported weekly diet minimum through positive
+evidence adds +10; shortfalls receive the reason-coded bounded penalty shown in
+the result. Ingredient reuse never means pantry stock or fuzzy product
+equivalence. Every returned slot and plan reason has a signed integer weight;
+the weights sum exactly to `total_score`.
+
+Ranking uses canonical candidate order and exact-reference tie breaks. It has no
+randomness and does not consult a clock after `as_of_date` is fixed. The same
+planner version and canonical input therefore return byte-identical output
+across calls and restarts. V1 accepts at most 12 candidates, seven dates, three
+explicitly requested alternatives, 2,000 recorded menu-usage rows and 250,000
+candidate/date assignment states. Exceeding any limit fails clearly; it never
+truncates or changes the candidate scope. The default returns one winner.
+“Highest-ranked” always means only within this declared policy and exact bounded
+candidate set, never objectively best.
+
+A planned result carries `input_digest`, an independent `selection_digest` for
+every exact selection, its original/relaxed hard results, all score reasons and
+a complete `save_handoff`. Pass one returned handoff back unchanged as
+`planner_handoff` to `meal_concierge_menu(action="save")`; do not reconstruct it.
+Save re-resolves the exact local references, recomputes both digests and hard
+constraints from the current profile and history, and rejects any expired ref,
+changed profile/history/fact/portion/selection or altered payload before
+mutation. The canonical date remains the one anchored by the initial plan. Save
+then freezes the exact recipe snapshots, dates, portions, reason
+breakdown and planner provenance in the menu. Repeating the same successful
+handoff is idempotent. Planning and saving never search products or change a
+provider cart, delivery, order, checkout or payment state.
+
 To favorite one unambiguously selected unsaved discovery, Hermes first saves
 its exact `discovery_ref` to the resolved destination with a stable save
 idempotency key, then
