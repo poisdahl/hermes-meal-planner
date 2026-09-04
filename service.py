@@ -1307,8 +1307,6 @@ class Application:
         for menu_id, record in (state.get("recipe_usage") or {}).items():
             if menu_id == ignore_menu_id or not isinstance(record, Mapping) or not identity_keys.intersection(record.get("recipe_keys", [])):
                 continue
-            if identity_keys.intersection(state.get("menu_planning", {}).get("retired", {}).get(menu_id, [])) and not identity_keys.intersection(record.get("cooked_keys", [])):
-                continue
             record_week = record.get("week")
             try:
                 index = self._week_index(str(record_week))
@@ -1322,6 +1320,19 @@ class Application:
                 last_ordered = max(filter(None, (last_ordered, record_week)), default=record_week)
             cooked = bool(identity_keys.intersection(record.get("cooked_keys", [])))
             not_cooked = bool(identity_keys.intersection(record.get("not_cooked_keys", [])))
+            for slot in record.get("slots", []):
+                if slot.get("recipe_key") not in identity_keys:
+                    continue
+                overlay = state.get("menu_planning", {}).get("outcomes", {}).get(slot["slot_id"])
+                if overlay is not None:
+                    cooked = overlay["outcome"] == "cooked"
+                    not_cooked = overlay["outcome"] == "not_cooked"
+                if any(slot["slot_id"] in {s["slot_id"] for s in snapshot.get("slots", []) if s["slot_id"] not in snapshot.get("historical_slot_ids", [])} for snapshot in state.get("order_snapshots", {}).values()):
+                    status = "ordered"
+                    last_ordered = max(filter(None, (last_ordered, record_week)), default=record_week)
+            retired = bool(identity_keys.intersection(state.get("menu_planning", {}).get("retired", {}).get(menu_id, [])))
+            if retired and status == "planned" and not cooked:
+                continue
             if cooked:
                 last_cooked = max(filter(None, (last_cooked, record_week)), default=record_week)
             active = (status in {"planned", "ordered"} and not not_cooked) or cooked
@@ -4294,14 +4305,21 @@ class Application:
             if not isinstance(record, dict) or slot not in record.get("slots", []):
                 raise HouseholdError("exact slot usage owner is unavailable")
             cooked = action == "mark_cooked"
-            for field, value in (("cooked_slot_ids", slot["slot_id"]), ("cooked_keys", slot["recipe_key"]),
-                                 ("not_cooked_slot_ids", slot["slot_id"]), ("not_cooked_keys", slot["recipe_key"])):
-                values = record.setdefault(field, [])
-                wanted = cooked == field.startswith("cooked")
-                if wanted and value not in values:
-                    values.append(value)
-                if not wanted and value in values:
-                    values.remove(value)
+            if owner != menu["menu_id"]:
+                outcomes = state["menu_planning"]["outcomes"]
+                if slot["slot_id"] not in outcomes and len(outcomes) >= mp.MAX_PLANNING_MENUS:
+                    raise HouseholdError("planning outcome limit reached")
+                outcomes[slot["slot_id"]] = {"outcome": "cooked" if cooked else "not_cooked", "owner_menu_id": owner,
+                    "recorded_in_menu_id": menu["menu_id"], "recipe_key": slot["recipe_key"]}
+            else:
+                for field, value in (("cooked_slot_ids", slot["slot_id"]), ("cooked_keys", slot["recipe_key"]),
+                                     ("not_cooked_slot_ids", slot["slot_id"]), ("not_cooked_keys", slot["recipe_key"])):
+                    values = record.setdefault(field, [])
+                    wanted = cooked == field.startswith("cooked")
+                    if wanted and value not in values:
+                        values.append(value)
+                    if not wanted and value in values:
+                        values.remove(value)
             result = {"menu_id": menu["menu_id"], "slot_id": slot["slot_id"], "recipe_key": slot["recipe_key"], "cooked": cooked}
             if key:
                 self._store_usage_request(state, key, signature, result)
@@ -4851,6 +4869,7 @@ class Application:
                         raise HouseholdError(f"menu revision conflict; current revision is {current.get('revision')}")
                 self._abandon_predispatch(state, reason="menu cleared")
                 if isinstance(current, Mapping):
+                    mp.retire_planned_slots(state, current)
                     usage = state.setdefault("recipe_usage", {}).get(current.get("menu_id"))
                     if isinstance(usage, dict) and usage.get("status") == "planned":
                         usage["status"] = "cancelled"
@@ -4943,6 +4962,8 @@ class Application:
                         raise HouseholdError("menu_id does not match the current menu")
                     if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or current.get("revision") != expected_revision:
                         raise HouseholdError(f"menu revision conflict; current revision is {current.get('revision')}")
+                    if current.get("supersedes"):
+                        raise HouseholdError("a successor preserves immutable lineage; use replan instead of revision edits")
                     current_usage = state.setdefault("recipe_usage", {}).get(supplied_menu_id)
                     if current.get("phase") == "ordered" or (isinstance(current_usage, Mapping) and current_usage.get("status") == "ordered"):
                         raise HouseholdError("an ordered menu is immutable; save a new menu instead")
@@ -4979,6 +5000,8 @@ class Application:
                 if blocked:
                     raise HouseholdError(f"recipe cooldown blocks this menu: {canonical(blocked)}")
                 if isinstance(current, Mapping):
+                    if current.get("menu_id") != menu_id:
+                        mp.retire_planned_slots(state, current)
                     old_usage = state.setdefault("recipe_usage", {}).get(current.get("menu_id"))
                     if isinstance(old_usage, dict) and old_usage.get("status") == "planned" and current.get("menu_id") != menu_id:
                         old_usage["status"] = "cancelled"

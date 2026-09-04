@@ -19,7 +19,7 @@ def digest(value):
 
 
 def initial_planning():
-    return {"locks": {}, "history": {}, "retired": {}, "applied": {}}
+    return {"locks": {}, "history": {}, "retired": {}, "applied": {}, "outcomes": {}}
 
 
 def menu_ref(menu):
@@ -52,6 +52,9 @@ def lock_key(menu):
 
 
 def slot_outcome(state, menu, slot):
+    outcome = state.get("menu_planning", {}).get("outcomes", {}).get(slot["slot_id"])
+    if outcome is not None:
+        return outcome["outcome"]
     owner = menu.get("slot_owners", {}).get(slot["slot_id"], menu["menu_id"])
     record = state.get("recipe_usage", {}).get(owner, {})
     if slot["slot_id"] in record.get("cooked_slot_ids", []):
@@ -71,8 +74,8 @@ def shopping_menu(menu, historical_ids=None):
 
 
 def shopping_comparison(before, after):
-    old, old_unresolved = menu_requirements(shopping_menu(before))
-    new, new_unresolved = menu_requirements(shopping_menu(after))
+    old, old_unresolved = menu_requirements(shopping_menu(before), maximum=None)
+    new, new_unresolved = menu_requirements(shopping_menu(after), maximum=None)
     old = {r["requirement_id"]: {k: v for k, v in r.items() if k != "sources"} for r in old}
     new = {r["requirement_id"]: {k: v for k, v in r.items() if k != "sources"} for r in new}
     same = sorted(k for k in old.keys() & new.keys() if old[k] == new[k])
@@ -81,3 +84,19 @@ def shopping_comparison(before, after):
             "added": [new[k] for k in sorted(new) if k not in same],
             "unresolved": {"before": old_unresolved, "after": new_unresolved},
             "cart_action": "separate_explicit_sync_or_order_reconciliation_required"}
+
+
+def retire_planned_slots(state, menu):
+    """Cancel only active planned ownership; historical records stay untouched."""
+    for slot in menu.get("slots", []):
+        if slot_outcome(state, menu, slot) == "cooked":
+            continue
+        owner = menu.get("slot_owners", {}).get(slot["slot_id"], menu["menu_id"])
+        if state.get("recipe_usage", {}).get(owner, {}).get("status") != "planned":
+            continue
+        retired = state["menu_planning"]["retired"]
+        if owner not in retired and len(retired) >= MAX_PLANNING_MENUS:
+            raise HouseholdError("planning retirement limit reached")
+        values = retired.setdefault(owner, [])
+        if slot["recipe_key"] not in values:
+            values.append(slot["recipe_key"])

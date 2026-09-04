@@ -65,7 +65,8 @@ class ReplanningTests(unittest.TestCase):
         # Carried future cooking is routed to its original usage owner exactly once.
         self.cook(locked, successor)
         state = self.store.read()
-        self.assertIn(locked['slot_id'], state['recipe_usage'][self.menu['menu_id']]['cooked_slot_ids'])
+        self.assertEqual(state['recipe_usage'][self.menu['menu_id']], before['recipe_usage'][self.menu['menu_id']])
+        self.assertEqual(state['menu_planning']['outcomes'][locked['slot_id']]['outcome'], 'cooked')
         self.assertNotIn(locked['recipe_key'], state['recipe_usage'][successor['menu_id']]['recipe_keys'])
         self.assertEqual(self.fixture.provider.calls, [])
 
@@ -113,6 +114,9 @@ class ReplanningTests(unittest.TestCase):
             with self.store.locked() as state: state[field] = None
         self.apply(prepared)
         self.assertEqual(before_snapshot, self.store.read()['order_snapshots'])
+        summary = self.app._usage_summary(self.store.read(), self.menu['slots'][1]['recipe_key'], self.menu['week'])
+        self.assertEqual(summary['last_ordered_week'], self.menu['week'])
+        self.assertFalse(summary['eligible'])
         self.assertEqual(self.fixture.provider.calls, [])
 
     def test_lineage_retires_removed_future_and_keeps_cooked_once(self):
@@ -128,6 +132,31 @@ class ReplanningTests(unittest.TestCase):
         self.assertEqual(second['slots'][:2], successor['slots'][:2])
         self.assertEqual(len(self.app._usage_summary(self.store.read(), cooked, self.menu['week'])['blocked_by']), 1)
         self.assertEqual(len(mp.shopping_menu(second)['dishes']), 2)
+        with self.assertRaisesRegex(HouseholdError, 'lineage'):
+            self.app.handle({'operation':'menu','action':'save','menu_id':second['menu_id'],'expected_revision':second['revision'],
+                'menu':{'week':second['week'],'dishes':[{'recipe_ref':self.candidates[1]['recipe_ref']} ]}})
+
+    def test_clear_and_new_save_retire_carried_planned_owners(self):
+        prepared = self.prepare(remaining_dates=['2026-09-09'], planner_input={'candidates':self.candidates[3:]})
+        successor = self.apply(prepared)['menu']
+        carried = self.menu['slots'][1]['recipe_key']
+        predecessor = deepcopy(self.store.read()['recipe_usage'][self.menu['menu_id']])
+        self.app.handle({'operation':'menu','action':'clear','menu_id':successor['menu_id'],'expected_revision':successor['revision']})
+        self.assertTrue(self.app._usage_summary(self.store.read(), carried, self.menu['week'])['eligible'])
+        self.assertEqual(predecessor, self.store.read()['recipe_usage'][self.menu['menu_id']])
+        # Recreate fixture state with the successor and exercise ordinary replacement.
+        with self.store.locked() as state:
+            state['menu'] = deepcopy(successor)
+            state['menu_planning']['retired'] = {}
+        self.app.handle({'operation':'menu','action':'save', 'menu':{'week':self.menu['week'],
+            'dishes':[{'recipe_ref':self.candidates[4]['recipe_ref']}]}})
+        self.assertTrue(self.app._usage_summary(self.store.read(), carried, self.menu['week'])['eligible'])
+        self.assertEqual(predecessor, self.store.read()['recipe_usage'][self.menu['menu_id']])
+
+    def test_structural_comparison_has_no_provider_search_limit(self):
+        rows = [{'item':f'item{i}','quantity':1,'unit':'g','scalable':True} for i in range(24)]
+        menu = {'dishes':[{'shopping_requirements':rows}], 'salads':[]}
+        self.assertEqual(len(mp.shopping_comparison(menu, menu)['unchanged']), 24)
 
     def test_legacy_and_unresolved_shopping(self):
         with self.store.locked() as state: state['menu'].pop('slots')

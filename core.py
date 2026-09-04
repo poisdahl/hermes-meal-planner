@@ -147,7 +147,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "order_change": None,
         "email_jobs": [],
         "occurrences": {},
-        "menu_planning": {"locks": {}, "history": {}, "retired": {}, "applied": {}},
+        "menu_planning": {"locks": {}, "history": {}, "retired": {}, "applied": {}, "outcomes": {}},
         "recipe_usage": {},
         "recipe_usage_requests": {},
         "order_snapshots": {},
@@ -602,10 +602,10 @@ def _migrate_state(
             raise HouseholdError("household v8 planning metadata conflicts with migration")
         if before_v9 is not None:
             before_v9(state)
-        state["menu_planning"] = {"locks": {}, "history": {}, "retired": {}, "applied": {}}
+        state["menu_planning"] = {"locks": {}, "history": {}, "retired": {}, "applied": {}, "outcomes": {}}
         state["version"] = 9
     planning = state.get("menu_planning")
-    if not isinstance(planning, dict) or set(planning) != {"locks", "history", "retired", "applied"} or any(not isinstance(v, dict) or len(v) > 2000 for v in planning.values()):
+    if not isinstance(planning, dict) or set(planning) != {"locks", "history", "retired", "applied", "outcomes"} or any(not isinstance(v, dict) or len(v) > 2000 for v in planning.values()):
         raise HouseholdError("household planning metadata is invalid")
     _validate_product_items(state.get("product_favorites"), "product_favorites")
     state.setdefault("recipe_usage", {})

@@ -124,7 +124,7 @@ def _read_fraction(value: Any, *, positive: bool = False) -> Fraction:
     return Fraction(numerator, denominator)
 
 
-def menu_requirements(menu: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def menu_requirements(menu: Any, *, maximum: int | None = MAX_REQUIREMENTS) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Aggregate only exact compatible recipe requirements."""
 
     if not isinstance(menu, Mapping):
@@ -196,8 +196,8 @@ def menu_requirements(menu: Any) -> tuple[list[dict[str, Any]], list[dict[str, A
             "unit": unit,
             "sources": value["sources"],
         })
-    if len(requirements) + len(unresolved) > MAX_REQUIREMENTS:
-        raise HouseholdError(f"product preparation supports at most {MAX_REQUIREMENTS} menu requirements")
+    if maximum is not None and len(requirements) + len(unresolved) > maximum:
+        raise HouseholdError(f"product preparation supports at most {maximum} menu requirements")
     return requirements, unresolved
 
 
