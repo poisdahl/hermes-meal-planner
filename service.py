@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+import fcntl
 import hashlib
 import html
 import json
@@ -51,6 +52,9 @@ from oda import (
 )
 from meny import MENY_CART_TIMEOUT, MENY_ORDER_TIMEOUT, MENY_READ_TIMEOUT, MenyClient, MenyOrderChangeDispatchError, meny_checkout_reviews_match, normalize_product_ref
 from recipes import RecipeError, RecipeStore, normalize_recipe, normalize_source_url, recipe_key, scale_recipe, validate_week
+from planner import (
+    MAX_CANDIDATES, MAX_HISTORY_RECORDS, PLANNER_VERSION, PlannerError, plan_week,
+)
 from recipe_libraries import (
     CAPABILITY_NAMES,
     MAX_LIBRARY_RECIPE_KEY,
@@ -795,6 +799,8 @@ class Application:
         self.recipe_label_locks_guard = threading.Lock()
         self.recipe_lifecycle_locks: dict[tuple[str, str], threading.Lock] = {}
         self.recipe_lifecycle_locks_guard = threading.Lock()
+        self.recipe_planner_lock = threading.RLock()
+        self.recipe_planner_lock_path = store.directory / "recipe-planner.lock"
         self.oda = provider_client
         self.provider = str(store.config.get("provider") or "oda").casefold()
         self.email_provider_clients = {**dict(email_provider_clients or {}), self.provider: provider_client}
@@ -906,6 +912,19 @@ class Application:
         finally:
             self.browser_lock.release()
 
+    @contextmanager
+    def _recipe_planner_operation(self):
+        with self.recipe_planner_lock:
+            descriptor = os.open(
+                self.recipe_planner_lock_path, os.O_RDWR | os.O_CREAT, 0o600
+            )
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+
     def handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(request, Mapping):
             raise HouseholdError("request must be an object")
@@ -917,7 +936,16 @@ class Application:
         if action is not None and (not isinstance(action, str) or not 1 <= len(action) <= 40):
             raise HouseholdError("action must be bounded text")
         try:
-            result = self._handle(request)
+            if operation == "recipes" or (
+                operation == "menu" and (
+                    action == "plan"
+                    or (action == "save" and request.get("planner_handoff") is not None)
+                )
+            ):
+                with self._recipe_planner_operation():
+                    result = self._handle(request)
+            else:
+                result = self._handle(request)
         except HouseholdError as exc:
             alternate_oda_email = (
                 request.get("operation") == "email" and request.get("provider") == "oda"
@@ -4270,6 +4298,289 @@ class Application:
         return result
 
     @staticmethod
+    def _default_planner_dates(week: str, profile: Mapping[str, Any]) -> list[str]:
+        match = re.fullmatch(r"(\d{4})-W(\d{2})", validate_week(week))
+        monday = date.fromisocalendar(int(match.group(1)), int(match.group(2)), 1)
+        meals = profile.get("meals")
+        if not isinstance(meals, Mapping):
+            raise PlannerError("profile meals are invalid")
+        count = meals.get("dinner_days")
+        dishes = meals.get("dishes")
+        batch_dishes = meals.get("batch_dishes")
+        eat_days = meals.get("eat_days")
+        weekdays = {
+            "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+            "friday": 4, "saturday": 5, "sunday": 6,
+        }
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 7:
+            raise PlannerError("profile dinner_days must be an integer from one to seven")
+        if dishes != count or batch_dishes != 0:
+            raise PlannerError(
+                "default deterministic planning requires one different dish per dinner day and batch_dishes=0; supply exact dates only for a current explicit count"
+            )
+        if not isinstance(eat_days, list) or len(eat_days) > 7:
+            raise PlannerError("profile eat_days must be a bounded list")
+        selected_values = {weekdays.get(str(value).casefold()) for value in eat_days}
+        if None in selected_values or len(selected_values) < count:
+            raise PlannerError("profile eat_days do not cover dinner_days")
+        selected = sorted(selected_values)
+        return [(monday + timedelta(days=offset)).isoformat() for offset in selected[:count]]
+
+    def _effective_planner_request(
+        self, value: Any, state: Mapping[str, Any], *, anchor_current_date: bool
+    ) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value).difference({
+            "week", "dates", "portions", "candidates", "strict_targets",
+            "cooldown_overrides", "alternatives", "as_of_date",
+        }):
+            raise PlannerError("planner input has unknown fields")
+        week = validate_week(value.get("week"))
+        supplied_as_of_date = value.get("as_of_date")
+        if anchor_current_date:
+            as_of_date = self._household_today(state).isoformat()
+            if supplied_as_of_date is not None and supplied_as_of_date != as_of_date:
+                raise PlannerError("planner as_of_date is not current in the household timezone")
+        else:
+            if not isinstance(supplied_as_of_date, str):
+                raise PlannerError("planner as_of_date must be an ISO date")
+            try:
+                as_of_date = date.fromisoformat(supplied_as_of_date).isoformat()
+            except ValueError as exc:
+                raise PlannerError("planner as_of_date must be an ISO date") from exc
+            if supplied_as_of_date != as_of_date:
+                raise PlannerError("planner as_of_date must be a canonical ISO date")
+        profile = state.get("profile")
+        if not isinstance(profile, Mapping):
+            raise PlannerError("household profile is invalid")
+        meals = profile.get("meals")
+        if not isinstance(meals, Mapping):
+            raise PlannerError("profile meals are invalid")
+        return {
+            "week": week,
+            "dates": deepcopy(value.get("dates")) if value.get("dates") is not None
+            else self._default_planner_dates(week, profile),
+            "portions": value.get("portions", meals.get("portions")),
+            "candidates": deepcopy(value.get("candidates")),
+            "strict_targets": deepcopy(value.get("strict_targets", [])),
+            "cooldown_overrides": deepcopy(value.get("cooldown_overrides", {})),
+            "alternatives": value.get("alternatives", 1),
+            "as_of_date": as_of_date,
+        }
+
+    @staticmethod
+    def _planner_reference(value: Any) -> tuple[dict[str, Any], str]:
+        if not isinstance(value, Mapping) or set(value).difference(
+            {"recipe_ref", "discovery_ref", "facts"}
+        ):
+            raise PlannerError("each planner candidate must contain one exact reference")
+        recipe_ref = value.get("recipe_ref")
+        discovery_ref = value.get("discovery_ref")
+        if (recipe_ref is None) == (discovery_ref is None):
+            raise PlannerError(
+                "each planner candidate requires exactly one recipe_ref or discovery_ref"
+            )
+        if recipe_ref is not None:
+            if (
+                not isinstance(recipe_ref, Mapping) or set(recipe_ref) != {"id", "revision"}
+                or not isinstance(recipe_ref.get("id"), str)
+                or re.fullmatch(r"rec_[a-f0-9]{24}", recipe_ref["id"]) is None
+                or isinstance(recipe_ref.get("revision"), bool)
+                or not isinstance(recipe_ref.get("revision"), int)
+                or recipe_ref["revision"] < 1
+            ):
+                raise PlannerError("planner recipe_ref must contain an exact id and revision")
+            reference = {"recipe_ref": {"id": recipe_ref["id"], "revision": recipe_ref["revision"]}}
+        else:
+            if (
+                not isinstance(discovery_ref, str)
+                or re.fullmatch(
+                    r"discovery:v1:[A-Za-z0-9_-]{16}:[A-Za-z0-9_-]{16,64}",
+                    discovery_ref,
+                ) is None
+            ):
+                raise PlannerError("planner discovery_ref must be bounded exact text")
+            reference = {"discovery_ref": discovery_ref}
+        return reference, canonical(reference)
+
+    def _resolve_planner_candidates(
+        self, request: Mapping[str, Any], state: Mapping[str, Any]
+    ) -> list[dict[str, Any]]:
+        history = state.get("recipe_usage")
+        if not isinstance(history, Mapping) or len(history) > MAX_HISTORY_RECORDS:
+            raise PlannerError(
+                f"planner history exceeds {MAX_HISTORY_RECORDS} records"
+            )
+        raw_candidates = request.get("candidates")
+        if not isinstance(raw_candidates, list) or not 1 <= len(raw_candidates) <= MAX_CANDIDATES:
+            raise PlannerError(
+                f"planner candidates must contain one to {MAX_CANDIDATES} entries"
+            )
+        resolved = []
+        seen = set()
+        for raw in raw_candidates:
+            reference, reference_key = self._planner_reference(raw)
+            if reference_key in seen:
+                raise PlannerError("planner candidates contain a duplicate exact reference")
+            seen.add(reference_key)
+            if "recipe_ref" in reference:
+                exact = reference["recipe_ref"]
+                stored = self.recipes.get(exact["id"], exact["revision"])
+                materialization_error = None
+                if (
+                    stored.get("status") != "active"
+                    or stored.get("revision_status", stored.get("status")) != "active"
+                ):
+                    materialization_error = "only active built-in recipe revisions can be planned"
+                key = stored["recipe_key"]
+                recipe = normalize_recipe(stored)
+            else:
+                snapshot = self.recipes.resolve_discovery(reference["discovery_ref"])
+                recipe = snapshot["recipe"]
+                key = recipe_key(recipe)
+                materialization_error = None
+            try:
+                scale_recipe(recipe, request.get("portions"))
+            except RecipeError as exc:
+                materialization_error = str(exc)
+            supplied_facts = deepcopy(raw.get("facts", {})) if isinstance(raw, Mapping) else {}
+            resolved.append({
+                "reference": reference,
+                "reference_key": reference_key,
+                "recipe": recipe,
+                "recipe_key": key,
+                "dedupe_key": recipe_key(recipe),
+                "content_digest": hashlib.sha256(canonical(recipe).encode()).hexdigest(),
+                "usage": self._usage_summary(state, key, request["week"]),
+                "facts": supplied_facts,
+                "supplied_facts": supplied_facts,
+                "materialization_error": materialization_error,
+            })
+        return resolved
+
+    def _run_planner(
+        self, request: Mapping[str, Any], resolved: list[Mapping[str, Any]],
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        history = state.get("recipe_usage")
+        if not isinstance(history, Mapping) or len(history) > MAX_HISTORY_RECORDS:
+            raise PlannerError(
+                f"planner history exceeds {MAX_HISTORY_RECORDS} records"
+            )
+        refreshed = []
+        for candidate in resolved:
+            item = deepcopy(dict(candidate))
+            item["usage"] = self._usage_summary(
+                state, item["recipe_key"], request["week"]
+            )
+            refreshed.append(item)
+        profile = state.get("profile")
+        if not isinstance(profile, Mapping):
+            raise PlannerError("household profile is invalid")
+        return plan_week(
+            request, profile=profile, candidates=refreshed, history=history
+        )
+
+    def _plan_menu(
+        self, value: Any, *, state: Mapping[str, Any] | None = None,
+        anchor_current_date: bool = True,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        snapshot = deepcopy(dict(state)) if isinstance(state, Mapping) else self.store.read()
+        request = self._effective_planner_request(
+            value, snapshot, anchor_current_date=anchor_current_date
+        )
+        resolved = self._resolve_planner_candidates(request, snapshot)
+        result = self._run_planner(request, resolved, snapshot)
+        if len(json.dumps({"ok": True, "result": {"plan": result}}, ensure_ascii=True).encode()) > MAX_REQUEST - 4_096:
+            raise PlannerError("planner result cannot fit the response transport")
+        return result, resolved, request
+
+    @staticmethod
+    def _matching_planner_handoff(
+        result: Mapping[str, Any], handoff: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        values = result.get("save_handoffs")
+        if not isinstance(values, list):
+            return None
+        supplied_digest = handoff.get("selection_digest")
+        return next((
+            value for value in values
+            if isinstance(value, Mapping)
+            and value.get("selection_digest") == supplied_digest
+            and canonical(value) == canonical(handoff)
+        ), None)
+
+    def _verify_planner_handoff(
+        self, value: Any
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        if not isinstance(value, Mapping) or set(value) != {
+            "planner_version", "input_digest", "selection_digest", "request", "selection"
+        }:
+            raise PlannerError("planner_handoff must be one complete server-returned handoff")
+        if value.get("planner_version") != PLANNER_VERSION:
+            raise PlannerError("planner_handoff uses an unsupported planner version")
+        if any(
+            re.fullmatch(r"[a-f0-9]{64}", str(value.get(field) or "")) is None
+            for field in ("input_digest", "selection_digest")
+        ):
+            raise PlannerError("planner_handoff digests are invalid")
+        result, resolved, request = self._plan_menu(
+            value.get("request"), anchor_current_date=False
+        )
+        if result.get("status") != "planned" or self._matching_planner_handoff(result, value) is None:
+            raise PlannerError("planner_handoff is stale, changed or fabricated; generate it again")
+        return result, resolved, request
+
+    def _materialize_planner_menu(
+        self, handoff: Mapping[str, Any], resolved: list[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        selection = handoff["selection"]
+        slots = selection.get("slots") if isinstance(selection, Mapping) else None
+        if not isinstance(slots, list) or not slots:
+            raise PlannerError("planner_handoff selection is invalid")
+        by_reference = {item["reference_key"]: item for item in resolved}
+        dishes = []
+        schedule = []
+        for slot in slots:
+            if not isinstance(slot, Mapping):
+                raise PlannerError("planner_handoff selection is invalid")
+            candidate = by_reference.get(slot.get("reference_key"))
+            if candidate is None or canonical(candidate["reference"]) != canonical(slot.get("reference")):
+                raise PlannerError("planner_handoff selection reference is invalid")
+            portions = slot.get("portions")
+            if "recipe_ref" in candidate["reference"]:
+                dishes.append({
+                    "recipe_ref": deepcopy(candidate["reference"]["recipe_ref"]),
+                    "portions": portions,
+                })
+            else:
+                dishes.append(scale_recipe(candidate["recipe"], portions))
+            schedule.append({
+                "day": slot.get("date"),
+                "meal": slot.get("name"),
+                "portions": portions,
+                "recipe_key": slot.get("recipe_key"),
+                "reference": deepcopy(slot.get("reference")),
+            })
+        menu = self._materialize_menu({
+            "week": handoff["request"]["week"],
+            "dishes": dishes,
+            "salads": [],
+            "schedule": schedule,
+        })
+        menu["planner_selection"] = {
+            "planner_version": handoff["planner_version"],
+            "input_digest": handoff["input_digest"],
+            "selection_digest": handoff["selection_digest"],
+            "request": deepcopy(handoff["request"]),
+            "selection": deepcopy(selection),
+        }
+        if len(canonical(menu).encode()) > MAX_MENU_BYTES:
+            raise PlannerError("planned menu is too large")
+        if len(json.dumps({"ok": True, "result": {"menu": menu}}, ensure_ascii=True).encode()) > MAX_REQUEST - 4_096:
+            raise PlannerError("planned menu cannot fit the response transport")
+        return menu
+
+    @staticmethod
     def _abandon_predispatch(state: dict[str, Any], *, reason: str) -> None:
         pending = state.get("pending_checkout")
         if not pending:
@@ -4286,6 +4597,14 @@ class Application:
         action = request.get("action", "get")
         if action == "get":
             return {"menu": deepcopy(self.store.read().get("menu"))}
+        if action == "plan":
+            setup_gate = self._setup_gate(request)
+            if setup_gate is not None:
+                return setup_gate
+            result, _resolved, _planner_request = self._plan_menu(
+                request.get("planner_input")
+            )
+            return {"plan": result}
         if action == "clear":
             with self.store.locked() as state:
                 current = state.get("menu")
@@ -4309,22 +4628,52 @@ class Application:
             if setup_gate is not None:
                 return setup_gate
             baseline_menu = deepcopy(self.store.read().get("menu"))
-            menu = self._materialize_menu(request.get("menu"))
+            planner_handoff = request.get("planner_handoff")
+            planner_context = None
+            if planner_handoff is not None:
+                if (
+                    request.get("menu") is not None
+                    or request.get("allow_repeat_keys") not in (None, [])
+                    or request.get("override_reason") not in {None, ""}
+                ):
+                    raise PlannerError(
+                        "planner save accepts planner_handoff without legacy menu or cooldown overrides"
+                    )
+                existing_planner = (
+                    baseline_menu.get("planner_selection")
+                    if isinstance(baseline_menu, Mapping) else None
+                )
+                if (
+                    isinstance(existing_planner, Mapping)
+                    and canonical(existing_planner) == canonical(planner_handoff)
+                ):
+                    return {"menu": baseline_menu, "idempotent": True}
+                _planner_result, resolved, planner_request = self._verify_planner_handoff(
+                    planner_handoff
+                )
+                menu = self._materialize_planner_menu(planner_handoff, resolved)
+                planner_context = (deepcopy(planner_handoff), resolved, planner_request)
+                override_map = dict(planner_request["cooldown_overrides"])
+            else:
+                menu = self._materialize_menu(request.get("menu"))
+                repeat_keys = request.get("allow_repeat_keys", [])
+                if not isinstance(repeat_keys, list) or len(repeat_keys) > 62 or not all(isinstance(key, str) and 1 <= len(key) <= MAX_LIBRARY_RECIPE_KEY for key in repeat_keys):
+                    raise HouseholdError("allow_repeat_keys must be a list of recipe keys")
+                override_reason = str(request.get("override_reason") or "").strip()
+                if repeat_keys and not override_reason:
+                    raise HouseholdError("a cooldown override reason is required")
+                if len(override_reason) > 500:
+                    raise HouseholdError("cooldown override reason is too long")
+                override_map = {key: override_reason for key in repeat_keys}
             supplied_menu_id = str(request.get("menu_id") or "") or None
             expected_revision = request.get("expected_revision")
-            repeat_keys = request.get("allow_repeat_keys", [])
-            if not isinstance(repeat_keys, list) or len(repeat_keys) > 62 or not all(isinstance(key, str) and 1 <= len(key) <= MAX_LIBRARY_RECIPE_KEY for key in repeat_keys):
-                raise HouseholdError("allow_repeat_keys must be a list of recipe keys")
-            repeat_aliases = {
-                alias
-                for repeat_key in repeat_keys
-                for alias in library_recipe_key_aliases(repeat_key)
-            }
-            override_reason = str(request.get("override_reason") or "").strip()
-            if repeat_keys and not override_reason:
-                raise HouseholdError("a cooldown override reason is required")
-            if len(override_reason) > 500:
-                raise HouseholdError("cooldown override reason is too long")
+            def matched_override(key: str) -> str | None:
+                aliases = library_recipe_key_aliases(key)
+                return next((
+                    reason for supplied_key, reason in override_map.items()
+                    if aliases.intersection(library_recipe_key_aliases(supplied_key))
+                ), None)
+
             digest = menu_digest(menu)
             keys = [recipe["recipe_key"] for collection in ("dishes", "salads") for recipe in menu[collection]]
             seen_keys: set[str] = set()
@@ -4341,6 +4690,20 @@ class Application:
                 current = state.get("menu")
                 if isinstance(current, Mapping) and current.get("digest") == digest:
                     return {"menu": deepcopy(current), "idempotent": True}
+                if planner_context is not None:
+                    original_handoff, resolved, planner_request = planner_context
+                    current_result = self._run_planner(
+                        planner_request, resolved, state
+                    )
+                    if (
+                        current_result.get("status") != "planned"
+                        or self._matching_planner_handoff(
+                            current_result, original_handoff
+                        ) is None
+                    ):
+                        raise PlannerError(
+                            "planner_handoff became stale before save; generate it again"
+                        )
                 if supplied_menu_id:
                     if not isinstance(current, Mapping) or current.get("menu_id") != supplied_menu_id:
                         raise HouseholdError("menu_id does not match the current menu")
@@ -4377,7 +4740,7 @@ class Application:
                         else None
                     )
                     summary = self._usage_summary(state, key, menu["week"], ignore_menu_id=ignored_menu_id)
-                    if not summary["eligible"] and not repeat_aliases.intersection(library_recipe_key_aliases(key)):
+                    if not summary["eligible"] and matched_override(key) is None:
                         blocked.append({"recipe_key": key, "usage": summary})
                 if blocked:
                     raise HouseholdError(f"recipe cooldown blocks this menu: {canonical(blocked)}")
@@ -4391,9 +4754,9 @@ class Application:
                     "week": menu["week"], "status": "planned", "recipe_keys": keys,
                     "cooked_keys": [], "not_cooked_keys": [],
                     "cooldown_overrides": {
-                        key: override_reason
+                        key: matched_override(key)
                         for key in keys
-                        if repeat_aliases.intersection(library_recipe_key_aliases(key))
+                        if matched_override(key) is not None
                     },
                     "order_id": None, "updated_at": now().isoformat(),
                 }
