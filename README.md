@@ -114,7 +114,7 @@ set `HERMES_PYTHON`, `MEAL_CONCIERGE_AGENT_BROWSER` or
 `MEAL_CONCIERGE_BROWSER_EXECUTABLE` while running the installer; their resolved
 values are saved in the private service definition.
 
-Clean installations create household state v11 with only the
+Clean installations create household state v12 with only the
 `product_favorites` list and expose the
 `meal_concierge_product_favorites` tool. When rerun for an existing installation,
 the installer stops only the meal-concierge service, creates the non-overwriting
@@ -1390,3 +1390,71 @@ finished while required cleanup is incomplete: report the remaining exact
 artifact and blocking condition. Do not infer test ownership or cancel orders
 by name, date or similarity. No automatic real-order creation/cancellation is
 part of the ordinary validation suite.
+
+
+## Complete household workflow
+
+Status now includes `workflow`: bounded menu coverage/conflict assessment, cart and
+product-plan state, delivery, checkout and email status, and one concrete next
+action. `menu assess` exposes the same coverage checks. Explicit date/portion
+scope survives replanning and batch successors. Legacy lists remain readable but
+do not establish exact dates. Assessment reports unknowns and explicit ingredient
+conflicts; it does not certify nutrition or allergy safety. Automatic checkout
+requires ready menu coverage and an applied product plan for that exact menu.
+
+Product plans use `product-plan-v2`. `ingredient_decisions` binds a source position
+(`collection`, `recipe_index`, `ingredient_index`) to `include`, optional `omit`,
+`have_all`, or `have_quantity` with a compatible unit. Quantities are pantry stock
+allocated to that source, not an inventory to subtract repeatedly. Prepared plans
+show gross/allocated/net quantities and package surplus. Fully covered needs
+require no purchase; existing cart goods must still be reconciled. Exact plan
+references and digests bind pantry, product approvals, price mode and budget.
+
+`price_mode=estimate` permits only one explicitly approved, available, regular
+price package when pant is unknown. Merchandise is an estimate and the complete
+payable amount remains null. Exact mode and lowest-cost comparison retain their
+strict complete-price requirements. `budget_ore` rejects a known minimum above
+the budget, including every known deposit; unknown totals stay unverified. It
+excludes delivery and cart fees. Checkout always reads the final provider total.
+
+Cart sync and reconcile require the current `menu_ref` (menu_id, revision, digest),
+and product approval is invalidated by changed requirements even during external
+cart drift. A manual continuation of cart_ready preserves its occurrence without
+using unattended-checkout rules. V11→v12 atomically backs up state-v11.backup.json,
+anchors existing recurring intervals once in household time, and preserves older
+predispatch manual cart_ready confirmations. Newly added intervals persist their
+anchor; an unchanged upsert keeps it. Profile/setup/reset validate exact saved
+types and practical quantity/time ranges before any state write.
+
+Cooking experience uses `feedback experience` with an exact menu-provided target
+and reported actual_active_minutes, portion_fit (too_small/right/too_large) and/or
+leftover_portions. Inspect, undo and reset include these events. Plans display
+relevant experience; it does not silently change ranking, profile or recipes.
+
+The MCP surface separates recipe reads, discovery, writes, favorites, labels,
+lifecycle and cooking. `meal_concierge_cooking` needs expected_revision plus a
+slot ID for structured menus, or week/recipe identity for legacy records. Refresh
+the Hermes MCP connection when upgrading so its tool schemas match the service.
+
+Mealie imports journal provider context before dispatch and exact slug/UUID as
+soon as returned. `recipe_lifecycle import_recovery` reconciles the exact create,
+including after restart or loss of the POST response. It never repeats a create
+or blindly patches a stub. An unchanged empty import can use explicit
+delete_prepare/delete_confirm; closing recovery with that confirmed deletion ID
+allows a later new intent with a new key. Edited/ambiguous records remain
+unresolved. Lifecycle deletion reads a raw digest for incomplete native records
+without inventing recipe content. Mealie's [native recipe schema](https://github.com/mealie-recipes/mealie/blob/v3.24.0/mealie/schema/recipe/recipe.py)
+and [create endpoint](https://github.com/mealie-recipes/mealie/blob/v3.24.0/mealie/routes/recipe/recipe_crud_routes.py)
+remain the provider contract. Existing migration copies retain their own journal
+and reconciliation flow.
+
+### Code responsibilities
+
+`service.py` owns the household application, synchronization, request routing and
+Unix socket process. Concrete operation classes share that same instance:
+`recipe_operations.py` handles library/discovery/lifecycle operations,
+`planning_operations.py` handles menus/feedback/products/cart,
+`order_operations.py` handles delivery/order/checkout, and `email_operations.py`
+handles recipe email. `service_common.py` holds shared normalization/rendering
+helpers. Pure planner, product, feedback and batch logic remain separate modules.
+There are no additional services, registries or public-data stores.

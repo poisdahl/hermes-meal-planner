@@ -836,6 +836,16 @@ class MealieAdapter(RecipeLibraryAdapter):
             )
         return result
 
+    def get_lifecycle_snapshot(self, reference):
+        """Deletion can inspect incomplete native records without inventing recipe content."""
+        reference = validate_library_recipe_ref(reference)
+        if reference["library_id"] != self.library_id:
+            raise RecipeLibraryError("Mealie lifecycle reference names the wrong library")
+        raw = self._get_raw(_provider_id(reference["recipe_id"]))
+        return {"name": _text(raw.get("name"), "recipe name", 300),
+                "library_recipe_ref": self._reference(raw),
+                "lifecycle_digest": hashlib.sha256(_canonical(raw).encode()).hexdigest()}
+
     def delete_recipe(
         self,
         library_recipe_ref: Mapping[str, str],
@@ -1088,6 +1098,9 @@ class MealieAdapter(RecipeLibraryAdapter):
     def create_from_snapshot(
         self, snapshot: Mapping[str, Any], operation: Mapping[str, Any]
     ) -> Mapping[str, Any]:
+        return self.create_with_progress(snapshot, operation, lambda progress: None)
+
+    def create_with_progress(self, snapshot, operation, record_progress):
         if self.read_only:
             raise RecipeLibraryDefiniteError("Mealie connection is read-only")
         try:
@@ -1104,6 +1117,7 @@ class MealieAdapter(RecipeLibraryAdapter):
             raise RecipeLibraryUncertainError("Mealie recipe creation outcome is uncertain") from None
         try:
             slug = _text(slug, "created recipe slug", 300)
+            record_progress({"slug": slug})
             raw_stub = self._request("GET", f"/api/recipes/{quote(slug or '', safe='')}")
             if not isinstance(raw_stub, Mapping):
                 raise RecipeLibraryError("Mealie created recipe response is incompatible")
@@ -1113,6 +1127,7 @@ class MealieAdapter(RecipeLibraryAdapter):
             ):
                 raise RecipeLibraryError("Mealie created recipe response is incompatible")
             recipe_id = _provider_id(raw_stub.get("id"))
+            record_progress({"slug": slug, "library_recipe_ref": self._reference(raw_stub)})
             raw = self._request(
                 "PATCH", f"/api/recipes/{quote(recipe_id, safe='')}", body=payload
             )
@@ -1124,6 +1139,40 @@ class MealieAdapter(RecipeLibraryAdapter):
         except Exception:
             raise RecipeLibraryUncertainError("Mealie recipe creation outcome is uncertain") from None
         return {"library_recipe_ref": recipe["library_recipe_ref"], "recipe": recipe}
+
+    def inspect_incomplete_create(self, snapshot, operation, progress):
+        """Locate only the exact journalled stub. Never overwrite it during recovery."""
+        payload, document = self._native_payload(snapshot, operation)
+        origin = self._origin(document, operation)
+        slug = _text(progress.get("slug"), "created recipe slug", 300, required=False)
+        reference = progress.get("library_recipe_ref")
+        if not slug:
+            marker = _marker(origin["operation_id"] or "")
+            page = self._request("GET", "/api/recipes", query=[("page", "1"), ("perPage", "50"), ("search", f'"{marker}"')])
+            items, number, total, pages = self._page(page, expected_per_page=50)
+            if number != 1 or total != 1 or pages != 1 or len(items) != 1:
+                return None
+            raw = self._get_raw(_provider_id(items[0].get("id")))
+            slug = _text(raw.get("slug"), "created recipe slug", 300)
+        else:
+            raw = self._get_raw(_provider_id(reference["recipe_id"])) if reference else self._request(
+                "GET", f"/api/recipes/{quote(slug, safe='')}"
+            )
+        if not isinstance(raw, Mapping):
+            return None
+        if self._native_matches(raw, payload, document):
+            recipe = self._create_result(raw, snapshot)
+            return {"complete": True, "library_recipe_ref": recipe["library_recipe_ref"], "recipe": recipe}
+        stub_name = f"Hermes import {_marker(origin['operation_id'] or '')}"
+        if raw.get("slug") != slug or raw.get("name") != stub_name:
+            return None
+        # An edited stub is ordinary user content; its removal is not proposed.
+        for field in ("recipeIngredient", "recipeInstructions", "notes", "tags"):
+            if raw.get(field):
+                return None
+        if raw.get("description") or raw.get("orgURL") or raw.get("extras"):
+            return None
+        return {"complete": False, "slug": slug, "library_recipe_ref": self._reference(raw)}
 
     def reconcile_create(
         self, snapshot: Mapping[str, Any], operation: Mapping[str, Any]

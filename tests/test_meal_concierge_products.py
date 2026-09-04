@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from copy import deepcopy
 from datetime import datetime, timezone
 import json
@@ -967,7 +971,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 {provider.milk["product_ref"]: 2},
             )
             provider.call = original_call
-            restored = app.handle({
+            restored = app.handle({"menu_ref": app._cart_menu_ref(app.store.read().get("menu")),
                 "operation": "cart", "action": "reconcile",
                 "decision": "restore_missing",
                 "cart_digest": first["cart_plan"]["cart_digest"],
@@ -1343,7 +1347,7 @@ class MenuCostComparisonTests(unittest.TestCase):
 
     def test_budget_preflight_no_search_and_maximum_alternatives(self):
         from unittest import mock
-        with mock.patch("service.MAX_REQUIREMENTS", 2):
+        with mock.patch("planning_operations.MAX_REQUIREMENTS", 2):
             result = self.compare()
         self.assertEqual(self.calls, [])
         self.assertEqual(result["status"], "unavailable")

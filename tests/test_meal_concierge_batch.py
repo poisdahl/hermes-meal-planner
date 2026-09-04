@@ -164,7 +164,7 @@ class BatchMigrationTests(unittest.TestCase):
             current=StateStore(directory,fixtures.CONFIG)
             backup=Path(directory)/'state-v10.backup.json'
             self.assertEqual(json.loads(backup.read_text()),old); self.assertEqual(backup.stat().st_mode&0o777,0o600)
-            self.assertEqual(current.read()['version'],11); self.assertEqual(current.read()['profile']['meals']['batch_dishes'],0)
+            self.assertEqual(current.read()['version'],12); self.assertEqual(current.read()['profile']['meals']['batch_dishes'],0)
             raw=backup.read_bytes(); StateStore(directory,fixtures.CONFIG); self.assertEqual(raw,backup.read_bytes())
             old['version']=99; store.path.write_text(json.dumps(old))
             with self.assertRaisesRegex(HouseholdError,'newer'): StateStore(directory,fixtures.CONFIG)

@@ -29,6 +29,8 @@ class CancellationPreconditionError(HouseholdError):
     """Cancellation stopped before the final provider control was dispatched."""
 
 
+STATE_VERSION = 12
+
 RECIPE_SOURCE_IDS = ("internal", "oda", "meny", "themealdb", "wikibooks")
 DEFAULT_RECIPE_SOURCES = {source: True for source in RECIPE_SOURCE_IDS}
 
@@ -124,8 +126,9 @@ def valid_email_address(value: Any) -> bool:
 def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
+    validate_profile(profile)
     return {
-        "version": 11,
+        "version": STATE_VERSION,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -172,6 +175,71 @@ def _merge(target: dict[str, Any], changes: Mapping[str, Any]) -> None:
             _merge(target[key], value)
         else:
             target[key] = deepcopy(value)
+
+
+def validate_profile(profile: Mapping[str, Any]) -> None:
+    """Validate editable household values at the write boundary."""
+    def check(value: Any, default: Any, path: str) -> None:
+        if isinstance(default, dict):
+            if not isinstance(value, Mapping) or set(value) != set(default):
+                raise HouseholdError(f"profile {path} has invalid fields")
+            for key, child in default.items():
+                check(value[key], child, f"{path}.{key}".strip("."))
+        elif isinstance(default, bool):
+            if not isinstance(value, bool):
+                raise HouseholdError(f"profile {path} must be true or false")
+        elif isinstance(default, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise HouseholdError(f"profile {path} must be a non-negative finite number")
+            if isinstance(default, int) and not isinstance(value, int):
+                raise HouseholdError(f"profile {path} must be an integer")
+        elif isinstance(default, str):
+            if not isinstance(value, str) or len(value) > 4000:
+                raise HouseholdError(f"profile {path} must be bounded text")
+        elif isinstance(default, list):
+            if not isinstance(value, list) or len(value) > 100:
+                raise HouseholdError(f"profile {path} must be a bounded list")
+            if path == "diet.leafy_green_days" and all(type(x) is int for x in value):
+                if len(value) != len(set(value)) or any(not 1 <= x <= 7 for x in value):
+                    raise HouseholdError("profile leafy_green_days must contain distinct day numbers from 1 to 7")
+                return
+            numeric = path in {"meals.target_active_minutes", "diet.fish_grams_per_person"}
+            if numeric:
+                if len(value) != 2 or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0 for x in value) or value[0] > value[1]:
+                    raise HouseholdError(f"profile {path} must be an ordered pair of non-negative numbers")
+            elif any(not isinstance(x, str) or not x.strip() or len(x) > 500 for x in value):
+                raise HouseholdError(f"profile {path} must contain bounded non-empty text")
+    check(profile, DEFAULT_PROFILE, "")
+    meals = profile["meals"]
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in meals["target_active_minutes"]) or meals["target_active_minutes"][1] > meals["maximum_active_minutes"]:
+        raise HouseholdError("profile active-time targets must be integers within maximum_active_minutes")
+    for field, minimum, maximum in (("people", 1, 100), ("portions", 1, 100), ("dinner_days", 0, 7), ("dishes", 0, 31), ("batch_dishes", 0, 31), ("salads", 0, 31), ("guest_meals", 0, 31), ("maximum_active_minutes", 1, 1440)):
+        value = meals[field]
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise HouseholdError(f"profile meals.{field} must be an integer from {minimum} to {maximum}")
+    days = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+    for field in ("cook_days", "eat_days"):
+        values = [x.casefold() for x in meals[field]]
+        if len(values) != len(set(values)) or not set(values).issubset(days):
+            raise HouseholdError(f"profile meals.{field} must contain distinct weekdays")
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", meals["dinner_time"]) is None:
+        raise HouseholdError("profile dinner_time must use HH:MM")
+    if any(not 0 <= value <= 1 for value in profile["diet"]["plate"].values()):
+        raise HouseholdError("profile plate fractions must be between zero and one")
+
+
+def recurring_schedule(value: Any, today: date) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or not set(value).issubset({"every", "unit", "anchor"}):
+        raise HouseholdError("recurring item schedule is invalid")
+    result = deepcopy(dict(value))
+    unit = result.get("unit")
+    if result.get("anchor") is None:
+        result["anchor"] = today.strftime("%G-W%V") if unit == "weeks" else today.strftime("%Y-%m")
+    try:
+        due_recurring({"schedule": result}, today)
+    except (TypeError, ValueError) as exc:
+        raise HouseholdError("recurring item schedule is invalid") from exc
+    return result
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -459,11 +527,12 @@ def _migrate_state(
     before_v9: Callable[[Mapping[str, Any]], None] | None = None,
     before_v10: Callable[[Mapping[str, Any]], None] | None = None,
     before_v11: Callable[[Mapping[str, Any]], None] | None = None,
+    before_v12: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 11:
+    if version > 12:
         raise HouseholdError("household state is newer than this meal concierge")
     if version >= 6 and "favorites" in state:
         raise HouseholdError("household state contains the retired favorites key")
@@ -622,6 +691,17 @@ def _migrate_state(
             before_v11(state)
         state["batch_outcomes"] = {"sources": {}, "leftovers": {}}
         state["version"] = 11
+    if state["version"] == 11:
+        if before_v12 is not None:
+            before_v12(state)
+        zone = ZoneInfo(str(state.get("schedule", {}).get("timezone") or "Europe/Oslo"))
+        today = datetime.now(zone).date()
+        for item in state.get("recurring_items", []):
+            item["schedule"] = recurring_schedule(item.get("schedule"), today)
+        pending = state.get("pending_checkout")
+        if isinstance(pending, dict) and pending.get("status") == "awaiting_confirmation" and pending.get("occurrence") and "automatic_checkout" not in pending and state.get("schedule", {}).get("mode") == "cart_ready":
+            pending["automatic_checkout"] = False
+        state["version"] = 12
     batch = state.get("batch_outcomes")
     if not isinstance(batch, dict) or set(batch) != {"sources", "leftovers"} or any(not isinstance(v,dict) or len(v)>2000 for v in batch.values()):
         raise HouseholdError("household batch outcomes are invalid")
@@ -802,6 +882,12 @@ class StateStore:
                 if not backup.exists():
                     _atomic_json(backup, value)
 
+            def backup_v11(value: Mapping[str, Any]) -> None:
+                if source_version == 11:
+                    backup = self.directory / "state-v11.backup.json"
+                    if not backup.exists():
+                        _atomic_json(backup, value)
+
             _migrate_state(
                 state,
                 self.config,
@@ -811,6 +897,7 @@ class StateStore:
                 before_v9=backup_v8,
                 before_v10=backup_v9,
                 before_v11=backup_v10,
+                before_v12=backup_v11,
             )
             state_household = state.get("household")
             configured_household = str(self.config["household"])
@@ -859,6 +946,7 @@ class StateStore:
     def update_profile(self, changes: Mapping[str, Any]) -> dict[str, Any]:
         with self.locked() as state:
             _merge(state["profile"], changes)
+            validate_profile(state["profile"])
             return deepcopy(state["profile"])
 
     def reset_profile(self, paths: list[str] | None = None) -> dict[str, Any]:
@@ -878,6 +966,7 @@ class StateStore:
                     if not isinstance(source, dict) or parts[-1] not in source or not isinstance(target, dict):
                         raise HouseholdError(f"unknown profile field: {path}")
                     target[parts[-1]] = deepcopy(source[parts[-1]])
+            validate_profile(state["profile"])
             return deepcopy(state["profile"])
 
 
