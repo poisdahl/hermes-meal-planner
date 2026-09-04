@@ -4838,6 +4838,70 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertFalse(any(tool in {"get_order", "order_tracking"} for tool, _arguments in main.calls))
         self.assertEqual(app.handle({"operation": "email", "action": "status"})["jobs"][0]["provider"], "oda")
 
+    def _external_cancel_fixture(self, status="pending"):
+        ordered = self.app.handle({"operation": "menu", "action": "save", "menu": menu("2026-W40")})["menu"]
+        ordered.update(phase="ordered", order_id="external-cancel")
+        with self.store.locked() as state:
+            state["email_jobs"] = [{"provider": "oda", "order_id": "external-cancel", "delivery_date": date.today().isoformat(), "status": status,
+                "recipient_snapshot": "owner@example.test", "menu_snapshot": ordered, "automation_protocol": 4}]
+        return {"operation": "email", "provider": "oda", "order_id": "external-cancel"}
+
+    def test_owner_confirmed_external_cancellation_closes_followup_without_provider_calls(self):
+        request = self._external_cancel_fixture()
+        before = self.store.read()
+        with self.assertRaisesRegex(HouseholdError, "owner must explicitly"):
+            self.app.handle({**request, "action": "cancel_followup"})
+        self.assertEqual(self.store.read(), before)
+        self.oda.calls.clear()
+        result = self.app.handle({**request, "action": "cancel_followup", "owner_confirmed_cancelled": True})
+        self.assertTrue(result["cancelled"])
+        self.assertEqual(self.oda.calls, [])
+        job = self.store.read()["email_jobs"][0]
+        self.assertEqual(job["status"], "cancelled")
+        self.assertNotIn("menu_snapshot", job)
+        self.assertEqual(result, self.app.handle({**request, "action": "cancel_followup", "owner_confirmed_cancelled": True}))
+        plan = self.app.handle({"operation": "email", "action": "automation_plan"})
+        self.assertEqual(plan["updates"], [])
+        self.assertEqual(plan["removals"], [result["automation_cleanup"]])
+
+    def test_external_cancellation_tracking_closes_job_even_without_order_details(self):
+        for action in ("due", "reconcile"):
+            request = self._external_cancel_fixture()
+            original = self.oda.call
+            def call(tool, arguments):
+                if tool == "get_order":
+                    raise AssertionError("cancelled order details need not remain available")
+                if tool == "order_tracking":
+                    return {"order_id": "external-cancel", "status": "cancelled"}
+                return original(tool, arguments)
+            with mock.patch.object(self.oda, "call", side_effect=call):
+                result = self.app.handle({**request, "action": action})
+            self.assertFalse(result["send"])
+            self.assertEqual(result["automation_cleanup"]["action"], "remove")
+            self.assertEqual(self.store.read()["email_jobs"][0]["status"], "cancelled")
+
+    def test_external_cancellation_unknown_or_wrong_identity_preserves_followup(self):
+        for response in (HouseholdError("login required"), HouseholdError("not found"), TimeoutError("timeout"), {"order_id": "another", "status": "cancelled"}):
+            request = self._external_cancel_fixture()
+            before = self.store.read()
+            with mock.patch.object(self.oda, "call", side_effect=response if isinstance(response, Exception) else None, return_value=response):
+                with self.assertRaises((HouseholdError, TimeoutError)):
+                    self.app.handle({**request, "action": "reconcile"})
+            self.assertEqual(self.store.read(), before)
+
+    def test_cancel_followup_preserves_other_provider_and_uncertain_send(self):
+        request = self._external_cancel_fixture()
+        with self.store.locked() as state:
+            other = deepcopy(state["email_jobs"][0]); other["provider"] = "meny"
+            state["email_jobs"].append(other)
+        self.app.handle({**request, "action": "cancel_followup", "owner_confirmed_cancelled": True})
+        self.assertEqual([job["status"] for job in self.store.read()["email_jobs"]], ["cancelled", "pending"])
+        request = self._external_cancel_fixture(status="sending")
+        before = self.store.read()
+        with self.assertRaisesRegex(HouseholdError, "send outcome needs reconciliation"):
+            self.app.handle({**request, "action": "cancel_followup", "owner_confirmed_cancelled": True})
+        self.assertEqual(self.store.read(), before)
+
     def test_cancelled_old_oda_email_does_not_mutate_same_id_meny_state(self):
         ordered = self.app.handle({"operation": "menu", "action": "save", "menu": menu("2026-W40")})["menu"]
         ordered.update({"phase": "ordered", "order_id": "same"})

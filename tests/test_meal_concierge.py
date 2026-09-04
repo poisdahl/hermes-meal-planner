@@ -429,12 +429,12 @@ class CoreTestsBase:
         )
         module.meal_concierge_email(
             "ack_automation", order_id="order-1", delivery_date="2026-09-05",
-            automation_key="meal-concierge-email-0123456789abcdef", automation_digest="a" * 64, protocol=4,
+            automation_key="meal-concierge-email-0123456789abcdef", automation_digest="a" * 64, protocol=4, owner_confirmed_cancelled=False,
         )
         module.rpc.assert_called_with(
             "email", action="ack_automation", order_id="order-1", delivery_date="2026-09-05",
             provider=None, claim_token=None, automation_key="meal-concierge-email-0123456789abcdef",
-            automation_digest="a" * 64, protocol=4,
+            automation_digest="a" * 64, protocol=4, owner_confirmed_cancelled=False,
         )
 
     def test_cart_summary_rejects_huge_provider_quantity_as_a_bounded_error(self):
@@ -7406,7 +7406,11 @@ class FlowTests(unittest.TestCase):
         self.app.handle({"operation": "email", **result["automation_ack"]})
         self.oda.tracking = "cancelled"
         result = self.app.handle({"operation": "email", "action": "due", "order_id": "old"})
-        self.assertEqual(result, {"send": False, "reason": "order cancelled"})
+        self.assertFalse(result["send"])
+        self.assertEqual(result["reason"], "order cancelled")
+        self.assertEqual(result["automation_cleanup"]["action"], "remove")
+        self.assertEqual(result["automation_cleanup"]["provider"], "oda")
+        self.assertEqual(result["automation_cleanup"]["order_id"], "old")
 
     def test_test_email_returns_escaped_html_without_consuming_job(self):
         menu = {
