@@ -982,7 +982,7 @@ class Application:
                         result = self._handle(request)
                 else:
                     result = self._handle(request)
-            elif operation in {"recipes", "feedback"} or (
+            elif operation in {"recipes", "feedback", "migration"} or (
                 operation == "menu" and (
                     action == "plan"
                 )
@@ -1037,6 +1037,9 @@ class Application:
             return self._items(request, "product_favorites")
         if operation == "recurring":
             return self._recurring(request)
+        if operation == "migration":
+            from recipe_migration import Migration
+            return Migration(self).handle(request)
         if operation == "recipes":
             return self._recipes(request)
         if operation == "menu":
@@ -1542,7 +1545,7 @@ class Application:
         if library_id == "builtin":
             return {
                 "provider": "builtin",
-                "server_version": "4",
+                "server_version": "5",
                 "read_only": False,
                 **{
                     name: name in {
@@ -2114,6 +2117,7 @@ class Application:
         *,
         expected_favorite_revision: Any,
         idempotency_key: Any,
+        dispatch_before: str | None = None,
     ) -> dict[str, Any]:
         library_id = reference["library_id"]
         if library_id not in self.recipe_libraries:
@@ -2228,7 +2232,7 @@ class Application:
                     operation["operation_id"], "confirmed", result=current
                 )
                 return self._favorite_operation_response(confirmed)
-            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"], dispatch_before=dispatch_before)
             if not claimed.get("claimed"):
                 return self._favorite_operation_response(claimed)
             try:
@@ -2455,6 +2459,7 @@ class Application:
         *,
         expected_label_revision: Any,
         idempotency_key: Any,
+        dispatch_before: str | None = None,
     ) -> dict[str, Any]:
         recipe_ref = validate_library_recipe_ref(recipe_reference)
         label_ref = validate_library_label_ref(label_reference)
@@ -2629,7 +2634,7 @@ class Application:
                     ),
                 )
                 return self._label_operation_response(confirmed)
-            claimed = self.recipes.claim_library_dispatch(operation["operation_id"])
+            claimed = self.recipes.claim_library_dispatch(operation["operation_id"], dispatch_before=dispatch_before)
             if not claimed.get("claimed"):
                 return self._label_operation_response(claimed)
             try:
@@ -4148,6 +4153,7 @@ class Application:
                 request.get("library_label_ref"),
                 request.get("present"),
                 expected_label_revision=request.get("expected_label_revision"),
+                dispatch_before=request.get("_migration_expires_at"),
                 idempotency_key=request.get("idempotency_key"),
             )
         if action == "create_label":
@@ -4167,11 +4173,13 @@ class Application:
                     reference,
                     request.get("is_favorite"),
                     expected_favorite_revision=request.get("expected_favorite_revision"),
+                    dispatch_before=request.get("_migration_expires_at"),
                     idempotency_key=request.get("idempotency_key"),
                 )
             return self._set_external_favorite(
                 reference,
                 request.get("is_favorite"),
+                dispatch_before=request.get("_migration_expires_at"),
                 expected_favorite_revision=request.get(
                     "expected_favorite_revision"
                 ),
