@@ -52,6 +52,9 @@ def lock_key(menu):
 
 
 def slot_outcome(state, menu, slot):
+    leftover = state.get("batch_outcomes", {}).get("leftovers", {}).get(slot["slot_id"])
+    if leftover is not None:
+        return leftover["outcome"]
     outcome = state.get("menu_planning", {}).get("outcomes", {}).get(slot["slot_id"])
     if outcome is not None:
         return outcome["outcome"]
@@ -65,7 +68,8 @@ def slot_outcome(state, menu, slot):
 
 
 def shopping_menu(menu, historical_ids=None):
-    result = deepcopy(menu)
+    import batch_planning
+    result = batch_planning.shopping(menu)
     historical = set(menu.get("historical_slot_ids", []) if historical_ids is None else historical_ids)
     keys = {s["recipe_key"] for s in menu.get("slots", []) if s["slot_id"] in historical}
     for collection in ("dishes", "salads"):
@@ -89,6 +93,8 @@ def shopping_comparison(before, after):
 def retire_planned_slots(state, menu):
     """Cancel only active planned ownership; historical records stay untouched."""
     for slot in menu.get("slots", []):
+        if slot.get("kind") == "leftover":
+            continue
         if slot_outcome(state, menu, slot) == "cooked":
             continue
         owner = menu.get("slot_owners", {}).get(slot["slot_id"], menu["menu_id"])
