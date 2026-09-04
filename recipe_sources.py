@@ -66,7 +66,7 @@ def fetch_json(url: str, params: Mapping[str, Any], *, timeout: float, maximum: 
     encoded = urlencode({key: str(value) for key, value in params.items()})
     request = Request(
         f"{url}?{encoded}",
-        headers={"Accept": "application/json", "User-Agent": "Hermes-Meal-Planner/1.7 (private household recipe discovery)"},
+        headers={"Accept": "application/json", "User-Agent": "Meal-Concierge/1.7 (private household recipe discovery)"},
     )
     try:
         with build_opener(_SameHostRedirect(parsed.hostname)).open(request, timeout=timeout) as response:
@@ -176,7 +176,7 @@ class TheMealDBSource:
                 "fetched_at": self.clock(), "content_hash": _hash(value),
                 "source_revision_id": _text(value.get("dateModified"), maximum=100) or None,
                 "permanent_url": None,
-                "changes": "Normalized into Meal Planner's structured format; artwork was not copied.",
+                "changes": "Normalized into Meal Concierge's structured format; artwork was not copied.",
             },
         }
         return normalize_recipe(recipe)
@@ -355,7 +355,7 @@ class WikibooksSource:
             "rights": {
                 "storage": "full", "license": "CC BY-SA 4.0",
                 "license_url": WIKIBOOKS_LICENSE_URL,
-                "credit": f"Wikibooks contributors, permanent revision {revision}; normalized by Meal Planner.",
+                "credit": f"Wikibooks contributors, permanent revision {revision}; normalized by Meal Concierge.",
             },
             "external_snapshot": {
                 "fetched_at": self.clock(), "content_hash": _hash({"title": final_title, "revision": revision, "html": body}),

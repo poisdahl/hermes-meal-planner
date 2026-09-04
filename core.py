@@ -125,7 +125,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
     _merge(profile, config.get("profile_overrides", {}))
     return {
-        "version": 7,
+        "version": 8,
         "household": str(config["household"]),
         "provider": str(config.get("provider") or "oda").casefold(),
         "profile": profile,
@@ -452,12 +452,13 @@ def _migrate_state(
     config: Mapping[str, Any],
     before_v6: Callable[[Mapping[str, Any]], None] | None = None,
     before_v7: Callable[[Mapping[str, Any]], None] | None = None,
+    before_v8: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> None:
     version = state.get("version", 1)
     if isinstance(version, bool) or not isinstance(version, int) or version < 1:
         raise HouseholdError("household state version is invalid")
-    if version > 7:
-        raise HouseholdError("household state is newer than this meal planner")
+    if version > 8:
+        raise HouseholdError("household state is newer than this meal concierge")
     if version >= 6 and "favorites" in state:
         raise HouseholdError("household state contains the retired favorites key")
     if version == 1:
@@ -583,6 +584,17 @@ def _migrate_state(
         delivery["strategy"] = "keep_selected"
         state["delivery_selection"] = None
         state["version"] = 7
+    if state["version"] == 7:
+        if before_v8 is not None:
+            before_v8(state)
+        for job in state.get("email_jobs", []):
+            if not isinstance(job, dict):
+                continue
+            automation_key = job.get("automation_key")
+            if isinstance(automation_key, str) and re.fullmatch(r"meal-planner-email-[a-f0-9]{16}", automation_key):
+                job["automation_key"] = "meal-concierge-email-" + automation_key.rsplit("-", 1)[-1]
+                job["automation_protocol"] = 0
+        state["version"] = 8
     _validate_product_items(state.get("product_favorites"), "product_favorites")
     state.setdefault("recipe_usage", {})
     state.setdefault("recipe_usage_requests", {})
@@ -727,7 +739,20 @@ class StateStore:
                 if not backup.exists():
                     _atomic_json(backup, value)
 
-            _migrate_state(state, self.config, before_v6=backup_v5, before_v7=backup_v6)
+            def backup_v7(value: Mapping[str, Any]) -> None:
+                if source_version != 7:
+                    return
+                backup = self.directory / "state-v7.backup.json"
+                if not backup.exists():
+                    _atomic_json(backup, value)
+
+            _migrate_state(
+                state,
+                self.config,
+                before_v6=backup_v5,
+                before_v7=backup_v6,
+                before_v8=backup_v7,
+            )
             state_household = state.get("household")
             configured_household = str(self.config["household"])
             if state_household is None:

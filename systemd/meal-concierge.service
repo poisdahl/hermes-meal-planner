@@ -1,0 +1,27 @@
+[Unit]
+Description=Meal Concierge for one household
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="HERMES_HOME=@HERMES_HOME@"
+Environment="HERMES_PYTHON=@HERMES_PYTHON@"
+Environment="MEAL_CONCIERGE_AGENT_BROWSER=@AGENT_BROWSER@"
+Environment="MEAL_CONCIERGE_BROWSER_EXECUTABLE=@BROWSER_EXECUTABLE@"
+Environment="PATH=@RUNTIME_PATH@"
+Environment="MEAL_CONCIERGE_HOME=@PRIVATE_ROOT@"
+Environment="MEAL_CONCIERGE_CONFIG=@CONFIG_PATH@"
+Environment="MEAL_CONCIERGE_STATE=@PRIVATE_ROOT@/state"
+Environment="MEAL_CONCIERGE_SOCKET=@SOCKET_PATH@"
+Environment="MEAL_CONCIERGE_BROWSER_HOME=@PRIVATE_ROOT@/browser"
+Environment="MEAL_CONCIERGE_BROWSER_PROFILE=@PRIVATE_ROOT@/browser/profile"
+Environment="MEAL_CONCIERGE_BROWSER_SOCKET_DIR=@BROWSER_SOCKET_DIRECTORY@"
+ExecStart="@SOURCE_ROOT@/run-service.sh"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

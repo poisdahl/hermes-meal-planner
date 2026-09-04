@@ -1,13 +1,13 @@
 ---
-name: meal-planner
+name: meal-concierge
 description: Plan weekly meals and use this household's configured Oda or MENY provider for products, recipes, cart and supported order steps.
 ---
 
-# Hermes meal planner
+# Meal Concierge
 
 Natural language is the interface. Use the tools discovered from the
-meal_planner MCP server for every grocery or weekly-menu request. Hermes may
-display them as mcp__meal_planner__meal_planner_*; the server is already bound
+meal_concierge MCP server for every grocery or weekly-menu request. Hermes may
+display them as mcp__meal_concierge__meal_concierge_*; the server is already bound
 to this agent's configured household and provider. Never infer or switch
 either from names in a message. The integration chooses its MCP or browser
 path and owns login, durable state, scheduling, email and order protections.
@@ -75,7 +75,7 @@ For a product-favorite or recurring add, pass product search's `product_id` and
 `name` through the tool's top-level `product_id` and `product_name` arguments;
 do not construct an item object. “Save this product as a favorite,” “list
 favorite products,” and equivalent requests use
-`meal_planner_product_favorites`. This local provider-bound list never changes
+`meal_concierge_product_favorites`. This local provider-bound list never changes
 the cart. Never route “favorite this recipe” to the product tool. Recipe
 favorites use recipe `set_favorite` with the exact returned
 `library_recipe_ref`, explicit desired `is_favorite`, optional observed

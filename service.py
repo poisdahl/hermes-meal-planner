@@ -92,7 +92,7 @@ SCHEDULE_OCCURRENCE_LEASE = timedelta(minutes=5)
 MAX_EXTERNAL_FAVORITE_SEARCH_PAGES = 10
 LIBRARY_SEARCH_CURSOR_PREFIX = "library-search:v1:"
 EMAIL_CLAIM_LEASE = timedelta(minutes=5)
-EMAIL_AUTOMATION_PROTOCOL = 3
+EMAIL_AUTOMATION_PROTOCOL = 4
 UNRESOLVED_CHECKOUT_STATUSES = {"clicking", "uncertain", "awaiting_user_payment"}
 SCHEDULE_WEEKDAYS = {
     "monday": 0,
@@ -244,7 +244,7 @@ def email_automation_key(provider: str, order_id: str) -> str:
     if provider not in {"oda", "meny"}:
         raise HouseholdError("email provider is invalid")
     order_id = safe_order_id(order_id)
-    return f"meal-planner-email-{hashlib.sha256(f'{provider}:{order_id}'.encode()).hexdigest()[:16]}"
+    return f"meal-concierge-email-{hashlib.sha256(f'{provider}:{order_id}'.encode()).hexdigest()[:16]}"
 
 
 def email_automation_prompt(provider: str, order_id: str, delivery_date: str, automation_key: str) -> str:
@@ -256,11 +256,11 @@ def email_automation_prompt(provider: str, order_id: str, delivery_date: str, au
             raise ValueError
     except (TypeError, ValueError) as exc:
         raise HouseholdError("delivery_date must be a canonical ISO date") from exc
-    if re.fullmatch(r"meal-planner-email-[a-f0-9]{16}", automation_key) is None:
+    if re.fullmatch(r"meal-concierge-email-[a-f0-9]{16}", automation_key) is None:
         raise HouseholdError("email automation key is invalid")
     return (
         f"Opprett eller oppdater den ene automatiseringen {automation_key}. På {delivery_date}: "
-        f"kall meal_planner_email action=due provider={provider} for ordre {order_id}. "
+        f"kall meal_concierge_email action=due provider={provider} for ordre {order_id}. "
         f"Hvis claim=true, kall begin_send provider={provider} med returnert claim_token rett før senderen. Bare hvis dispatch=true, "
         "send nøyaktig returnert recipient, subject og HTML én gang. Etter vellykket sending: kall mark_sent "
         f"provider={provider} for samme ordre {order_id} med returnert claim_token. Ved en uttrykkelig definitiv sendefeil "
@@ -1074,8 +1074,8 @@ class Application:
             "configuration_required": required,
             "configuration_status": (state.get("setup") or {}).get("status"),
             "current": self._setup_summary(state),
-            "question": "Keep all current/default Meal Planner settings? Answer once, or provide only the values you want to change." if required else None,
-            "next": "Call meal_planner_setup action=apply with keep_current=true, or keep_current=false and only the requested changes." if required else "Use action=rerun to review this configuration again.",
+            "question": "Keep all current/default Meal Concierge settings? Answer once, or provide only the values you want to change." if required else None,
+            "next": "Call meal_concierge_setup action=apply with keep_current=true, or keep_current=false and only the requested changes." if required else "Use action=rerun to review this configuration again.",
         }
 
     def _setup_gate(self, request: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -3370,12 +3370,12 @@ class Application:
         if len(rendered_email.encode()) > MAX_EMAIL_HTML_BYTES:
             raise HouseholdError("menu recipes exceed the deliverable email size limit")
         if len(json.dumps({"ok": True, "result": {"html": rendered_email}}, ensure_ascii=True).encode()) > MAX_REQUEST - 4_096:
-            raise HouseholdError("menu recipe email cannot fit the meal planner response transport")
+            raise HouseholdError("menu recipe email cannot fit the meal concierge response transport")
         if len(canonical(result).encode()) > MAX_MENU_BYTES:
             raise HouseholdError("menu is too large")
         response_probe = {"ok": True, "result": {"menu": result}}
         if len(json.dumps(response_probe, ensure_ascii=True).encode()) > MAX_REQUEST - 4_096:
-            raise HouseholdError("menu cannot fit the meal planner response transport")
+            raise HouseholdError("menu cannot fit the meal concierge response transport")
         return result
 
     @staticmethod
@@ -4030,7 +4030,7 @@ class Application:
         if action == "get":
             cart = self.oda.call("get_cart", {}, deadline=request.get("_deadline"), allow_recovery=request.get("_allow_browser_recovery") is True) if self.provider == "meny" else self.oda.call("get_cart", {})
             plan = self.store.read().get("cart_plan")
-            return {**cart, **({"meal_planner_cart_plan": self._cart_plan_view(plan, cart_summary(cart))} if isinstance(plan, Mapping) else {})}
+            return {**cart, **({"meal_concierge_cart_plan": self._cart_plan_view(plan, cart_summary(cart))} if isinstance(plan, Mapping) else {})}
         if action in {"change", "apply", "set", "update"}:
             deadline = time.monotonic() + MENY_CART_TIMEOUT if self.provider == "meny" else None
             operations = request.get("operations")
@@ -6520,7 +6520,7 @@ class Application:
                 if self.email_automation_profile:
                     payload["automation_environment"] = {"HERMES_WORKSPACE_AUTOMATION_PROFILE": self.email_automation_profile}
                 if len(json.dumps({"ok": True, "result": payload}, ensure_ascii=True).encode()) > MAX_REQUEST - 1_024:
-                    raise HouseholdError("claimed email cannot fit the meal planner response transport")
+                    raise HouseholdError("claimed email cannot fit the meal concierge response transport")
                 jobs[0]["status"] = "sending"
                 jobs[0].pop("claim_expires_at", None)
                 jobs[0]["dispatch_started_at"] = now().isoformat()
@@ -6598,7 +6598,7 @@ class Server:
             try:
                 line, separator, _remainder = data.partition(b"\n")
                 if not separator or len(line) > MAX_REQUEST:
-                    raise HouseholdError("request exceeds the meal planner size limit")
+                    raise HouseholdError("request exceeds the meal concierge size limit")
                 request = strict_json_loads(line)
                 if not isinstance(request, dict):
                     raise HouseholdError("request must be an object")
@@ -6608,7 +6608,7 @@ class Server:
             try:
                 encoded = (json.dumps(response, ensure_ascii=True, allow_nan=False) + "\n").encode()
                 if len(encoded) > MAX_REQUEST:
-                    encoded = (json.dumps({"ok": False, "error": "response exceeds the meal planner size limit"}) + "\n").encode()
+                    encoded = (json.dumps({"ok": False, "error": "response exceeds the meal concierge size limit"}) + "\n").encode()
             except (TypeError, ValueError, UnicodeError):
                 encoded = (json.dumps({"ok": False, "error": "response contains an invalid JSON value"}) + "\n").encode()
             try:
@@ -6653,14 +6653,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--config", type=Path, required=True)
     result.add_argument("--state", type=Path, required=True)
     result.add_argument("--tokens", type=Path)
-    result.add_argument("--socket", type=Path, default=Path("/tmp/meal-planner.sock"))
+    result.add_argument("--socket", type=Path, default=Path("/tmp/meal-concierge.sock"))
     result.add_argument("--socket-group", type=int, default=os.getgid())
     result.add_argument("--agent-uid", type=int, default=os.getuid())
     result.add_argument("--browser-binary", type=Path, default=Path("agent-browser"))
     result.add_argument("--browser-executable", type=Path, default=Path(os.environ.get("AGENT_BROWSER_EXECUTABLE_PATH", "/usr/bin/chromium")))
-    result.add_argument("--browser-profile", type=Path, default=Path.home() / ".meal-planner-browser" / "profile")
-    result.add_argument("--browser-home", type=Path, default=Path.home() / ".meal-planner-browser")
-    result.add_argument("--browser-socket-directory", type=Path, default=Path("/tmp/meal-planner-browser"))
+    result.add_argument("--browser-profile", type=Path, default=Path.home() / ".meal-concierge-browser" / "profile")
+    result.add_argument("--browser-home", type=Path, default=Path.home() / ".meal-concierge-browser")
+    result.add_argument("--browser-socket-directory", type=Path, default=Path("/tmp/meal-concierge-browser"))
     result.add_argument("--browser-cdp")
     result.add_argument("--browser-uid", type=int, default=os.getuid())
     result.add_argument("--browser-gid", type=int, default=os.getgid())
