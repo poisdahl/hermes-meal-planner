@@ -141,6 +141,7 @@ def meal_concierge_recipes(
     archived: bool | None = None,
     confirmation_id: str | None = None,
     menu_id: str | None = None,
+    slot_id: str | None = None,
     idempotency_key: str | None = None,
     interactive: bool = True,
 ) -> dict[str, Any]:
@@ -157,7 +158,7 @@ def meal_concierge_recipes(
         label_name=label_name, present=present,
         expected_label_revision=expected_label_revision,
         archived=archived, confirmation_id=confirmation_id,
-        menu_id=menu_id, idempotency_key=idempotency_key,
+        menu_id=menu_id, slot_id=slot_id, idempotency_key=idempotency_key,
         interactive=interactive,
     )
 
@@ -191,9 +192,9 @@ def meal_concierge_orders(action: Literal["list", "get", "change_begin", "change
     return rpc("orders", action=action, order_id=order_id, confirmation_id=confirmation_id, idempotency_key=idempotency_key, limit=limit)
 
 
-@server.tool(description="Get, deterministically plan, save or clear the current complete menu. Plan accepts a bounded candidate list containing only exact built-in recipe_ref values or still-valid discovery_ref values. It returns one ranked winner by default and a complete digest-bound save_handoff; pass that object back unchanged as planner_handoff to save. Candidate facts may contain only structured non-safety facts explicitly supplied by the user or an authoritative source—never model inference or recipe prose. V1 rejects caller safety assertions; configured safety rules therefore remain unknown and block autonomous planning. Unknown default time, nutrition and perishability facts are named and unscored. Explicit strict_targets make supported unknowns blocking. Highest-ranked means only within the returned planner version and exact candidate scope, not objectively best. Planner save re-resolves locally, revalidates profile/history/hard constraints/digests, freezes the selected snapshots and changes no provider cart. Legacy save still accepts a menu with exact recipe refs or complete inline recipes.")
-def meal_concierge_menu(action: Literal["get", "plan", "save", "clear"] = "get", menu: dict[str, Any] | None = None, planner_input: dict[str, Any] | None = None, planner_handoff: dict[str, Any] | None = None, menu_id: str | None = None, expected_revision: int | None = None, allow_repeat_keys: list[str] | None = None, override_reason: str | None = None, interactive: bool = True) -> dict[str, Any]:
-    return rpc("menu", action=action, menu=menu, planner_input=planner_input, planner_handoff=planner_handoff, menu_id=menu_id, expected_revision=expected_revision, allow_repeat_keys=allow_repeat_keys or [], override_reason=override_reason, interactive=interactive)
+@server.tool(description="Get, deterministically plan, save or clear the current complete menu. Plan accepts a bounded candidate list containing only exact built-in recipe_ref values or still-valid discovery_ref values. It returns one ranked winner by default and a complete digest-bound save_handoff; pass that object back unchanged as planner_handoff to save. Candidate facts may contain only structured non-safety facts explicitly supplied by the user or an authoritative source—never model inference or recipe prose. V1 rejects caller safety assertions; configured safety rules therefore remain unknown and block autonomous planning. Unknown default time, nutrition and perishability facts are named and unscored. Explicit strict_targets make supported unknowns blocking. Highest-ranked means only within the returned planner version and exact candidate scope, not objectively best. Planner save re-resolves locally, revalidates profile/history/hard constraints/digests, freezes the selected snapshots and changes no provider cart. Legacy save still accepts a menu with exact recipe refs or complete inline recipes. Structured menus expose stable slot IDs. Lock is explicit desired state for exact menu_ref and slot_id. replan_prepare accepts exact remaining_dates and planner_input, optionally locked_slot_ids, and returns one complete replan for unchanged replan_apply. Past/cooked/locked slots are carried and history remains immutable through a linked successor; any cart/order change requires a separate explicit action. Legacy schedules are never guessed into slots.")
+def meal_concierge_menu(action: Literal["get", "plan", "save", "clear", "lock", "replan_prepare", "replan_apply"] = "get", menu: dict[str, Any] | None = None, planner_input: dict[str, Any] | None = None, planner_handoff: dict[str, Any] | None = None, menu_id: str | None = None, expected_revision: int | None = None, allow_repeat_keys: list[str] | None = None, override_reason: str | None = None, interactive: bool = True, menu_ref: dict[str, Any] | None = None, slot_id: str | None = None, locked: bool | None = None, remaining_dates: list[str] | None = None, locked_slot_ids: list[str] | None = None, as_of_date: str | None = None, replan: dict[str, Any] | None = None) -> dict[str, Any]:
+    return rpc("menu", menu_ref=menu_ref, slot_id=slot_id, locked=locked, remaining_dates=remaining_dates, locked_slot_ids=locked_slot_ids, as_of_date=as_of_date, replan=replan, action=action, menu=menu, planner_input=planner_input, planner_handoff=planner_handoff, menu_id=menu_id, expected_revision=expected_revision, allow_repeat_keys=allow_repeat_keys or [], override_reason=override_reason, interactive=interactive)
 
 
 @server.tool(description="Show/update/disable the weekly run and guarded scheduled-checkout settings, including delivery.strategy keep_selected or cheapest. Cheapest stops cart_ready unless every hard-filtered candidate has an exact price. A scheduled checkout stops for confirmation under fresh policy and may dispatch within its total/delivery guards under standing policy.")

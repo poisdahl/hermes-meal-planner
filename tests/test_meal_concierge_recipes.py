@@ -2451,7 +2451,7 @@ class StateMigrationTests(unittest.TestCase):
             (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
             store = StateStore(root, {**CONFIG, "household": "Hus A", "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertIn("product_favorites", migrated)
             self.assertNotIn("favorites", migrated)
             self.assertEqual(migrated["profile"]["recipes"]["repeat_cooldown_weeks"], 6)
@@ -2491,6 +2491,7 @@ class StateMigrationTests(unittest.TestCase):
             root = Path(directory)
             legacy = meal_core.initial_state({**CONFIG, "provider": "oda"})
             legacy["version"] = 2
+            legacy.pop("menu_planning", None)
             legacy.pop("order_snapshot_providers")
             snapshot = {
                 "menu_id": "menu_old", "revision": 1, "digest": "digest-old",
@@ -2508,7 +2509,7 @@ class StateMigrationTests(unittest.TestCase):
 
             store = StateStore(root, {**CONFIG, "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertEqual(migrated["email_jobs"][0]["provider"], "oda")
             self.assertEqual(migrated["email_jobs"][0]["status"], "pending")
             self.assertEqual(migrated["order_snapshot_providers"]["order-old"], "oda")
@@ -2529,6 +2530,7 @@ class StateMigrationTests(unittest.TestCase):
             root = Path(directory)
             legacy = meal_core.initial_state({**CONFIG, "provider": "oda"})
             legacy["version"] = 2
+            legacy.pop("menu_planning", None)
             legacy["order_snapshots"] = []
             (root / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
             with self.assertRaisesRegex(HouseholdError, "recipe lifecycle state is invalid"):
@@ -2540,12 +2542,13 @@ class StateMigrationTests(unittest.TestCase):
             root = Path(directory)
             legacy = meal_core.initial_state({**CONFIG, "provider": "oda"})
             legacy["version"] = 3
+            legacy.pop("menu_planning", None)
             legacy.pop("cart_plan")
             (root / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
 
             migrated = StateStore(root, {**CONFIG, "provider": "oda"}).read()
 
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertIsNone(migrated["cart_plan"])
             backup = json.loads((root / "state-v3.backup.json").read_text(encoding="utf-8"))
             self.assertEqual(backup["version"], 3)
@@ -2556,6 +2559,7 @@ class StateMigrationTests(unittest.TestCase):
             root = Path(directory)
             legacy = meal_core.initial_state({**CONFIG, "provider": "oda"})
             legacy["version"] = 4
+            legacy.pop("menu_planning", None)
             legacy.pop("setup")
             legacy["profile"]["recipes"].pop("sources")
             (root / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
@@ -2566,7 +2570,7 @@ class StateMigrationTests(unittest.TestCase):
                 "profile_overrides": {"recipes": {"sources": {"themealdb": False}}},
             }).read()
 
-            self.assertEqual(migrated["version"], 8)
+            self.assertEqual(migrated["version"], 9)
             self.assertEqual(migrated["setup"]["status"], "needs_review")
             self.assertFalse(migrated["profile"]["recipes"]["sources"]["themealdb"])
             self.assertTrue(migrated["profile"]["recipes"]["sources"]["wikibooks"])
