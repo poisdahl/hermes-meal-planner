@@ -651,6 +651,28 @@ class RecipeStore:
         if cursor.rowcount != 1:
             raise RecipeError("recipe bank migration could not advance schema version")
 
+    def _migrate_v4_to_v5(self, connection: sqlite3.Connection) -> None:
+        connection.execute("""CREATE TABLE migration_plans (
+            plan_id TEXT PRIMARY KEY, digest TEXT NOT NULL, preview TEXT NOT NULL,
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL
+        )""")
+        connection.execute("""CREATE TABLE migration_items (
+            plan_id TEXT NOT NULL REFERENCES migration_plans(plan_id) ON DELETE CASCADE,
+            item_id INTEGER NOT NULL, frozen TEXT NOT NULL, progress TEXT NOT NULL,
+            PRIMARY KEY(plan_id, item_id)
+        )""")
+        connection.execute("""CREATE TABLE migration_mappings (
+            source_library TEXT NOT NULL, source_id TEXT NOT NULL,
+            destination_library TEXT NOT NULL, source_version TEXT NOT NULL,
+            document_digest TEXT NOT NULL, destination_ref TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(source_library, source_id, destination_library)
+        )""")
+        if connection.execute(
+            "UPDATE metadata SET value='5' WHERE key='schema_version' AND value='4'"
+        ).rowcount != 1:
+            raise RecipeError("recipe bank migration could not advance schema version")
+
     def _schema(self, connection: sqlite3.Connection) -> None:
         metadata = self._metadata(connection)
         if metadata is None:
@@ -668,7 +690,7 @@ class RecipeStore:
                 "INSERT INTO metadata(key, value) VALUES('schema_version', '1')"
             )
             version = "1"
-        if version not in {"1", "2", "3", "4"}:
+        if version not in {"1", "2", "3", "4", "5"}:
             raise RecipeError("recipe bank schema is newer than this meal concierge")
         row = connection.execute("SELECT value FROM metadata WHERE key='household'").fetchone()
         if row is None:
@@ -688,6 +710,9 @@ class RecipeStore:
             version = "3"
         if version == "3":
             self._migrate_v3_to_v4(connection)
+            version = "4"
+        if version == "4":
+            self._migrate_v4_to_v5(connection)
         namespace = connection.execute(
             "SELECT value FROM metadata WHERE key='discovery_namespace'"
         ).fetchone()
@@ -737,6 +762,26 @@ class RecipeStore:
             ("library_operations", "operation_id"),
             ("library_mappings", "library_id, source_identity, snapshot_digest"),
             ("library_connection_controls", "library_id"),
+        ):
+            digest.update(table.encode())
+            for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
+                digest.update(_canonical(list(row)).encode())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _v4_digest(connection: sqlite3.Connection) -> str:
+        digest = hashlib.sha256()
+        for table, order in (
+            ("metadata", "key"),
+            ("recipes", "id"),
+            ("revisions", "recipe_id, revision"),
+            ("idempotency", "key"),
+            ("discovery_snapshots", "discovery_ref"),
+            ("discovery_bindings", "destination, discovery_ref"),
+            ("library_operations", "operation_id"),
+            ("library_mappings", "library_id, source_identity, snapshot_digest"),
+            ("library_connection_controls", "library_id"),
+            ("recipe_favorites", "library_id, recipe_id"),
         ):
             digest.update(table.encode())
             for row in connection.execute(f"SELECT * FROM {table} ORDER BY {order}"):
@@ -949,6 +994,80 @@ class RecipeStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    def _validate_v4_backup(self, backup: Path, current: sqlite3.Connection) -> None:
+        try:
+            backup_status = backup.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RecipeError("existing recipe v4 backup is invalid") from exc
+        if not stat.S_ISREG(backup_status.st_mode):
+            raise RecipeError("existing recipe v4 backup is invalid")
+        try:
+            live_status = self.path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+        if (backup_status.st_dev, backup_status.st_ino) == (live_status.st_dev, live_status.st_ino):
+            raise RecipeError("existing recipe v4 backup is invalid")
+        try:
+            source = sqlite3.connect(
+                f"{backup.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            try:
+                if source.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                    raise RecipeError("existing recipe v4 backup is invalid")
+                metadata = dict(source.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('household', 'schema_version')"
+                ).fetchall())
+                if metadata != {"household": self.household, "schema_version": "4"}:
+                    raise RecipeError("existing recipe v4 backup is invalid")
+                if self._v4_digest(source) != self._v4_digest(current):
+                    raise RecipeError("existing recipe v4 backup is stale")
+            finally:
+                source.close()
+        except sqlite3.Error as exc:
+            raise RecipeError("existing recipe v4 backup is invalid") from exc
+        if backup_status.st_mode & 0o777 != 0o600:
+            raise RecipeError("existing recipe v4 backup is not private")
+
+    def _backup_v4(self, connection: sqlite3.Connection) -> None:
+        backup = self.path.with_name("recipes-v4.backup.sqlite3")
+        try:
+            backup.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            self._validate_v4_backup(backup, connection)
+            return
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".recipes-v4.backup.", suffix=".sqlite3", dir=backup.parent
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.close(descriptor)
+            source = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0
+            )
+            destination = sqlite3.connect(str(temporary), timeout=2.0)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+            os.chmod(temporary, 0o600)
+            self._validate_v4_backup(temporary, connection)
+            with temporary.open("rb") as copied:
+                os.fsync(copied.fileno())
+            try:
+                os.link(temporary, backup, follow_symlinks=False)
+            except FileExistsError:
+                self._validate_v4_backup(backup, connection)
+            directory_descriptor = os.open(backup.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def _connect(self, target: str | None = None) -> sqlite3.Connection:
         if target is None:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -966,7 +1085,7 @@ class RecipeStore:
             if metadata is not None:
                 if metadata.get("household") not in {None, self.household}:
                     raise RecipeError("recipe bank belongs to a different household")
-                if metadata.get("schema_version") not in {None, "1", "2", "3", "4"}:
+                if metadata.get("schema_version") not in {None, "1", "2", "3", "4", "5"}:
                     raise RecipeError("recipe bank schema is newer than this meal concierge")
             recipes_exist = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recipes'"
@@ -1012,7 +1131,16 @@ class RecipeStore:
             )
             if nonempty_v3:
                 self._backup_v3(connection)
+            if (target is None and existed and metadata is not None
+                and metadata.get("schema_version") == "4"
+                and any(connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+                        for table in ("recipes", "revisions", "idempotency", "discovery_snapshots",
+                                      "discovery_bindings", "library_operations", "library_mappings",
+                                      "library_connection_controls", "recipe_favorites"))):
+                self._backup_v4(connection)
             self._schema(connection)
+            from recipe_migration import cleanup
+            cleanup(connection)
             self._cleanup_library_data(connection)
             self._cleanup_discoveries(connection)
             connection.commit()
@@ -1614,7 +1742,7 @@ class RecipeStore:
         ).isoformat()
         connection.execute(
             "DELETE FROM library_operations WHERE status='failed' "
-            "AND (error_code IS NULL OR error_code!='recipe_deleted') AND updated_at <= ?",
+            "AND kind!='migration' AND (idempotency_key IS NULL OR idempotency_key NOT LIKE 'mig:%') AND (error_code IS NULL OR error_code!='recipe_deleted') AND updated_at <= ?",
             (cutoff,),
         )
 
@@ -3335,12 +3463,12 @@ class RecipeStore:
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
-    def _save(self, connection: sqlite3.Connection, recipe: Mapping[str, Any], status: str, key: str | None, created_via: str) -> dict[str, Any]:
+    def _save(self, connection: sqlite3.Connection, recipe: Mapping[str, Any], status: str, key: str | None, created_via: str, *, migration_identity: str | None = None) -> dict[str, Any]:
         request_hash = _hash({"recipe": recipe, "status": status})
         if existing := self._idem(connection, key, "save", request_hash):
             return existing
         content_hash = _hash(recipe)
-        source_identity = source_key(recipe)
+        source_identity = migration_identity or source_key(recipe)
         if source_identity:
             duplicate = connection.execute("SELECT * FROM recipes WHERE source_key=?", (source_identity,)).fetchone()
             if duplicate is not None:

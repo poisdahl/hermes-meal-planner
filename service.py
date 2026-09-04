@@ -982,7 +982,7 @@ class Application:
                         result = self._handle(request)
                 else:
                     result = self._handle(request)
-            elif operation in {"recipes", "feedback"} or (
+            elif operation in {"recipes", "feedback", "migration"} or (
                 operation == "menu" and (
                     action == "plan"
                 )
@@ -1037,6 +1037,9 @@ class Application:
             return self._items(request, "product_favorites")
         if operation == "recurring":
             return self._recurring(request)
+        if operation == "migration":
+            from recipe_migration import Migration
+            return Migration(self).handle(request)
         if operation == "recipes":
             return self._recipes(request)
         if operation == "menu":
@@ -1542,7 +1545,7 @@ class Application:
         if library_id == "builtin":
             return {
                 "provider": "builtin",
-                "server_version": "4",
+                "server_version": "5",
                 "read_only": False,
                 **{
                     name: name in {

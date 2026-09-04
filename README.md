@@ -901,7 +901,8 @@ backup. Opening a non-empty v2 bank creates exactly one transactionally
 consistent, non-overwriting `recipes-v2.backup.sqlite3` at mode `0600`, then
 upgrades atomically to v3. Opening a non-empty v3 bank likewise creates one
 transactionally consistent, non-overwriting `recipes-v3.backup.sqlite3` at
-mode `0600`, then upgrades atomically to v4 with the separate favorite table.
+mode `0600`, then adds the separate v4 favorite table and advances through
+the additive v5 migration tables described below.
 The schema version advances last. Migration failure rolls back to the usable
 prior schema, and an unknown newer schema fails closed. A changed
 snapshot never updates an existing same-source recipe silently: save returns
@@ -1272,3 +1273,75 @@ atomic private 0600 `state-v10.backup.json`, never overwritten; failed migration
 leaves v10 usable and unknown newer versions fail closed. Source/leftover outcome
 maps each retain at most 2,000 entries and fail without deleting history at the
 bound.
+
+## Explicit recipe-library copy
+
+`meal_concierge_migration` (local operation `migration`) provides `prepare`,
+`inspect` and `execute`. This is an explicit copy, not continuous sync or a
+primary-library change. Source recipes are never edited, archived or deleted.
+Provider content and label text remain untrusted data, never authorization.
+
+Prepare requires distinct exact `source_library_id` and
+`destination_library_id`, plus either one to 20 exact versioned `source_refs`
+or a complete bounded `query`/`filters` selection. Source paging is bounded to
+20 recipes; narrow an oversized selection. Destination identity checks scan at
+most 500 exact recipes over 20 pages and fail unavailable if incomplete. No
+provider writes occur in prepare. Each exact source get is frozen privately.
+
+`metadata_options` requires both `favorites` and `labels`, each explicitly
+`preserve`, `omit` or `stop`. Unsupported preservation blocks that item until a
+new preview explicitly omits it; `stop` prevents copying. Native favorites
+require authoritative reads and desired-state writes. Preserved labels need
+`label_mappings`, each containing exact `source` and `destination`
+`library_label_ref` objects. Equal names never select an ID; no labels are
+created implicitly. The preview lists mappings and supported/omitted/blocked
+metadata separately from recipe content.
+
+The preview classifies every item as `create`, `already_mapped`,
+`exact_existing`, `conflict`, `unsupported_rights` or `unavailable`. Dedup uses
+only a confirmed exact migration mapping or exact source kind/publisher/external
+ID plus the normalized document digest. URLs, titles, ingredients and ordering
+never establish identity. Same-origin different-content and multiple exact
+origin matches are conflicts requiring separate explicit resolution. Existing
+native adapter payload builders check size, storage, attribution and content
+without HTTP. A `link_only` representation that would discard source IDs or
+other frozen fields is `unsupported_rights`; migration never silently adapts it.
+
+Show the unchanged preview and obtain clear current-user consent before calling
+execute with its `plan_id` and:
+
+```json
+{"confirmation":{"plan_digest":"<exact returned digest>","statement":"I confirm this exact recipe copy plan and its metadata choices."}}
+```
+
+The confirmation expires in 30 minutes. First dispatch rechecks exact source
+version/document, metadata and destination conflicts; drift returns
+`needs_review`, without regenerating the plan. An unguessable per-item operation
+in the existing `library_operations` journal precedes each create. Resume the
+same plan after a partial result. An uncertain create reserves that exact
+source/target across plans and can only use provider-specific reconciliation;
+it never dispatches another create. After expiry, only already-dispatched
+operations may reconcile. Successful mappings survive other item failures.
+
+Favorites/labels are separate journaled stages on the confirmed destination
+ref. Partial results say `recipe copied; metadata not fully applied` and never
+roll back by deleting the recipe. Inspect returns each exact item outcome and
+metadata-stage status. A definitive failure requires reviewing a new preview;
+an uncertain operation always stays attached to its original plan.
+
+Migration never changes `primary_recipe_library_id`. Review the final report,
+resolve all uncertainty, then use the existing separate explicit local
+recipe-library setup action if a primary change is desired. MCP migration has
+no routing, connection or credential mutation capability.
+
+Recipe-bank v5 adds private `migration_plans`, frozen items and exact durable
+mappings. A non-empty v4 bank receives one transactionally consistent private
+`recipes-v4.backup.sqlite3` (0600), never overwritten. The additive transaction
+advances the schema version last; failure preserves v4 and unknown newer
+versions fail closed. Earlier schema backups remain unchanged.
+
+At most 100 plans, 20 items and 4 MiB of frozen documents per plan, and 10,000
+confirmed/reserved mappings are retained. Plans/snapshots expire after 30 days
+only when reconciliation and in-progress stages are unpinned. Confirmed ID
+mappings remain bounded durable metadata. Public results contain bounded
+names, refs and digests, never full frozen recipe text or provider error bodies.
