@@ -62,7 +62,7 @@ from product_planner import (
     build_product_plan,
     cart_requirements as prepared_cart_requirements,
     menu_requirements as exact_menu_requirements,
-    validate_product_plan,
+    validate_product_plan, product_plan_digest,
 )
 from product_observations import MAX_PRODUCTS
 from recipe_libraries import (
@@ -4905,7 +4905,7 @@ class Application:
         observations = {}
         cache = search_cache if search_cache is not None else {}
         for requirement in requirements:
-            query = requirement["identity"] if search_cache is not None else requirement["search"]
+            query = requirement["identity"]
             if query in cache:
                 observations[requirement["requirement_id"]] = deepcopy(cache[query])
                 continue
@@ -5165,7 +5165,25 @@ class Application:
                 candidate_approvals=request.get("candidate_approvals"),
                 deadline=deadline,
             )
-            return {"product_plan": plan}
+            result = {"product_plan": plan}
+            previous = request.get("previous_product_plan")
+            if previous is not None:
+                previous = validate_product_plan(previous, previous.get("product_plan_digest") if isinstance(previous, Mapping) else None)
+                old_binding = previous["binding"]
+                same_selection = (
+                    old_binding.get("kind") == "planner_selection"
+                    and canonical(old_binding.get("planner_handoff")) == canonical(menu.get("planner_selection"))
+                )
+                if not same_selection and canonical(old_binding) != canonical(binding):
+                    raise HouseholdError("previous product plan does not bind this exact menu selection")
+                old_facts = {k: v for k, v in previous.items() if k != "binding"}
+                new_facts = {k: v for k, v in plan.items() if k != "binding"}
+                result["observation_drift"] = {
+                    "status": "unchanged" if product_plan_digest(old_facts) == product_plan_digest(new_facts) else "changed",
+                    "previous_product_plan_digest": previous["product_plan_digest"],
+                    "current_product_plan_digest": plan["product_plan_digest"],
+                }
+            return result
         if action == "apply":
             if request.get("cart_change_requested") is not True:
                 return {

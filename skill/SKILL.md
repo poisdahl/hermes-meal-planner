@@ -346,7 +346,10 @@ plan and its totals/scope/digest, and the unchanged selected save handoff. Pass
 that handoff to menu save. The claim is only “lowest verified product cost among
 these N exact menu alternatives and their declared provider candidate scopes”.
 Meal Concierge never locks a price. Later product/cart preparation reads current
-facts again and reports drift; it never changes saved recipes implicitly.
+facts again; pass the chosen comparison `product_plan` as `previous_product_plan`
+to `products.prepare` with the exact saved `menu_ref` to receive explicit
+`observation_drift` (`changed`/`unchanged`). This baseline is recommendation
+provenance only, never apply authority. It never changes saved recipes implicitly.
 Delivery, cart-level bags and fees are excluded. The later provider-authoritative
 checkout summary remains the final price authority. Comparison performs only
 bounded product observations; it never authorizes cart, order or payment changes.

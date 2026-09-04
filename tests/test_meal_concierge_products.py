@@ -1297,9 +1297,12 @@ class MenuCostComparisonTests(unittest.TestCase):
         self.app.handle({"operation": "menu", "action": "save", "planner_handoff": chosen})
         saved = self.fixture.store.read()["menu"]
         self.prices["ris"] = 999
-        fresh = self.app.handle({"operation": "products", "action": "prepare", "menu_ref": self.app._cart_menu_ref(saved),
+        refreshed = self.app.handle({"operation": "products", "action": "prepare", "menu_ref": self.app._cart_menu_ref(saved),
+            "previous_product_plan": result["alternatives"][0]["product_plan"],
             "candidate_approvals": [{"requirement_id": row["requirement_id"], "candidate_refs": [row["identity"]]}
-              for row in result["alternatives"][0]["product_plan"]["requirements"]]})["product_plan"]
+              for row in result["alternatives"][0]["product_plan"]["requirements"]]})
+        fresh = refreshed["product_plan"]
+        self.assertEqual(refreshed["observation_drift"]["status"], "changed")
         self.assertEqual(fresh["totals"]["total_payable_ore"], 999)
         self.assertEqual(saved, self.fixture.store.read()["menu"])
         self.assertEqual({c[0] for c in self.calls}, {"product_search"})
