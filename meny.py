@@ -29,6 +29,7 @@ from core import (
     oslo_local_timestamp,
     validate_delivery_slot,
 )
+from product_observations import normalize_meny_product_search
 
 
 class MenyOrderChangeDispatchError(HouseholdError):
@@ -903,12 +904,28 @@ class MenyClient:
     if (visiblePaths.length === 0) return JSON.stringify({ready:false, identity:true, route:true, authenticated:true, root_count:1, heading_count:1, products:[], recipes:[]});
     if (seenProducts.has(path)) return JSON.stringify({ready:false, identity:true, route:true, authenticated:true, root_count:1, heading_count:1, products:[], recipes:[]});
     seenProducts.add(path);
-    const name = norm(card.querySelector('h3')?.innerText);
+    const names = [...card.querySelectorAll('h3')].filter(visible);
+    const subtitles = [...card.querySelectorAll('.ws-product-vertical__subtitle')].filter(visible);
+    const prices = [...card.querySelectorAll('.ws-price__main')].filter(visible);
+    const originalPrices = [...card.querySelectorAll('.ws-price__original')].filter(visible).map(node => norm(node.innerText));
+    const unitPrices = [...card.querySelectorAll('.ws-price__per-unit')].filter(visible).map(node => norm(node.innerText));
+    const campaignTags = [...card.querySelectorAll('.ws-campaign-tag')].filter(visible).map(node => norm(node.innerText));
+    const campaigns = [...card.querySelectorAll('a[href*="/kampanjer/"]')].filter(visible).map(node => norm(node.innerText));
+    const deposits = [...card.querySelectorAll('.ws-price__recycle')].filter(visible).map(node => norm(node.innerText));
+    const buyButtons = [...card.querySelectorAll('.ws-add-to-cart__button')].filter(visible);
+    const unavailable = [...card.querySelectorAll('.ws-product-label--type-unavailable')].filter(visible).filter(x => norm(x.innerText) === 'Midlertidig utsolgt');
+    if (names.length !== 1 || subtitles.length > 1 || prices.length > 1 || originalPrices.length > 1 || unitPrices.length > 1 || campaignTags.length > 1 || campaigns.length > 1 || deposits.length > 1 || buyButtons.length > 1 || unavailable.length > 1) return JSON.stringify({ready:false, identity:true, route:true, authenticated:true, root_count:1, heading_count:1, products:[], recipes:[]});
+    const name = norm(names[0].innerText);
     if (!name) return JSON.stringify({ready:false, identity:true, route:true, authenticated:true, root_count:1, heading_count:1, products:[], recipes:[]});
-    const packageText = norm(card.querySelector('[class*="product__subtitle"]')?.innerText || card.querySelector('h3')?.parentElement?.innerText).replace(name, '').trim();
-    const price = norm(card.querySelector('strong')?.innerText).match(/\d+(?:[ .]\d{3})*,\d{2}\s*kr/i)?.[0] || null;
-    const offer = norm(card.querySelector('a[href*="/kampanjer/"]')?.innerText) || null;
-    products.push({product_id:path, product_url:location.origin + path, name, package:packageText || null, price, offer});
+    const packageText = norm(subtitles[0]?.innerText);
+    const price = norm(prices[0]?.innerText) || null;
+    const originalPrice = originalPrices[0] || null;
+    const unitPrice = unitPrices[0] || null;
+    const campaignTag = campaignTags[0] || null;
+    const campaign = campaigns[0] || null;
+    const deposit = deposits[0] || null;
+    const available = unavailable.length === 1 ? false : buyButtons.length === 1 ? !buyButtons[0].disabled : null;
+    products.push({product_id:path, product_url:location.origin + path, name, package:packageText || null, price, original_price:originalPrice, unit_price:unitPrice, campaign_tag:campaignTag, campaign, deposit, available});
   }
   const recipes = [];
   const seenRecipes = new Set();
@@ -963,7 +980,84 @@ class MenyClient:
         ):
             raise HouseholdError("MENY search results did not finish rendering")
         values = result[kind][:limit]
-        return {"provider": "meny", "query": query, kind: values}
+        response = {"provider": "meny", "query": query, kind: values}
+        if kind != "products":
+            return response
+        for product in values:
+            if (
+                product.get("available") is True
+                and isinstance(product.get("price"), str)
+                and re.fullmatch(r"(?:0|[1-9]\d{0,6}),\d{2}\s*kr", product["price"], re.IGNORECASE)
+            ):
+                product.update(self._product_price_details(product))
+        normalized = normalize_meny_product_search(response)
+        normalized["scope"]["requested_size"] = limit
+        return normalized
+
+    def _product_price_details(self, product: Mapping[str, Any]) -> dict[str, Any]:
+        path = product.get("product_id")
+        if not isinstance(path, str) or not path.startswith("/varer/"):
+            raise HouseholdError("MENY product result id is invalid")
+        self._open(BASE_URL + path)
+        result: dict[str, Any] = {}
+        for attempt in range(2):
+            for _ in range(20):
+                result = self._eval(r"""
+(() => {
+  const expectedPath = EXPECTED;
+  const norm = value => (value || '').normalize('NFC').replace(/\s+/g, ' ').trim();
+  const visible = x => { const style=getComputedStyle(x), box=x.getBoundingClientRect(); return style.display!=='none' && style.visibility!=='hidden' && box.width>0 && box.height>0; };
+  const identity = location.origin === 'https://meny.no' && location.pathname === expectedPath && !location.search && !location.hash;
+  const authenticated = [...document.querySelectorAll('button')].filter(visible).filter(x => norm(x.getAttribute('aria-label') || x.innerText).startsWith('Brukermeny'));
+  const mains = [...document.querySelectorAll('main')].filter(visible);
+  const primary = mains.length === 1 ? [...mains[0].querySelectorAll('.ws-product-details__primary-info')].filter(visible) : [];
+  const priceRoots = primary.length === 1 ? [...primary[0].querySelectorAll('.ws-price')].filter(visible) : [];
+  const current = priceRoots.length === 1 ? [...priceRoots[0].querySelectorAll('.ws-price__main')].filter(visible) : [];
+  const currentLabels = current.length === 1
+    ? [current[0].getAttribute('aria-label'), ...[...current[0].querySelectorAll('[aria-label]')].filter(visible).map(x => x.getAttribute('aria-label'))].map(norm).filter(Boolean)
+    : [];
+  const originals = priceRoots.length === 1 ? [...priceRoots[0].querySelectorAll('.ws-price__original')].filter(visible) : [];
+  const originalLabels = originals.map(x => norm(x.getAttribute('aria-label'))).filter(Boolean);
+  const recycle = priceRoots.length === 1 ? [...priceRoots[0].querySelectorAll('.ws-price__recycle')].filter(visible).map(x => norm(x.innerText)) : [];
+  const ready = identity && authenticated.length === 1 && mains.length === 1 && primary.length === 1 && priceRoots.length === 1 && current.length === 1 && currentLabels.length === 1 && originals.length <= 1 && originalLabels.length === originals.length && recycle.length <= 1;
+  return JSON.stringify({ready, identity, authenticated:authenticated.length === 1, main_count:mains.length, primary_count:primary.length, price_count:priceRoots.length, current_count:current.length, current_labels:currentLabels, original_count:originals.length, original_labels:originalLabels, recycle});
+})()
+""".replace("EXPECTED", json.dumps(path, ensure_ascii=False)))
+                if result.get("identity") is not True:
+                    raise HouseholdError("MENY product detail route changed")
+                if result.get("authenticated") is not True:
+                    self._sleep(0.25)
+                    continue
+                if result.get("ready") is True:
+                    break
+                self._sleep(0.25)
+            if result.get("ready") is True:
+                break
+            if attempt == 0:
+                self._invoke("reload")
+        if result.get("authenticated") is not True:
+            self._require_login()
+        if result.get("ready") is not True:
+            raise HouseholdError("MENY product price details did not finish rendering")
+        current_labels = result["current_labels"]
+        original_labels = result["original_labels"]
+        recycle = result["recycle"]
+        if not isinstance(current_labels, list) or len(current_labels) != 1:
+            raise HouseholdError("MENY product price details changed")
+        if not isinstance(original_labels, list) or len(original_labels) > 1:
+            raise HouseholdError("MENY product price details changed")
+        if recycle == []:
+            deposit_status = "none"
+        elif recycle == ["+ pant"]:
+            deposit_status = "present_unknown"
+        else:
+            raise HouseholdError("MENY product deposit details changed")
+        return {
+            "detail_price": current_labels[0],
+            "detail_original_price": original_labels[0] if original_labels else None,
+            "deposit_status": deposit_status,
+            "detail_deposit": "+ pant" if deposit_status == "present_unknown" else None,
+        }
 
     def _select_recipe_results(self, query: str) -> None:
         state: dict[str, Any] = {}
@@ -1741,7 +1835,8 @@ __DELIVERY_BINDING__
     const quantity = Number.parseInt(norm(select.selectedOptions?.[0]?.innerText), 10);
     if (!Number.isInteger(quantity) || quantity < 1) return JSON.stringify({ready:false, authenticated:authenticated.length === 1, root_count:1, item_root_count:itemRoots.length, control_count:controls.length});
     const name = label.replace(/^\d+\s+stk,\s*endre mengde\s+/i, '');
-    const priceText = norm(root.querySelector('strong')?.innerText).match(/\d+(?:[ .]\d{3})*,\d{2}\s*kr/i)?.[0] || null;
+    const linePrices = [...root.querySelectorAll('strong')].filter(visible).map(x => norm(x.innerText)).filter(x => /^\d+(?:[ .]\d{3})*,\d{2}\s*kr$/i.test(x));
+    const priceText = linePrices.length === 1 ? linePrices[0] : null;
     const price = priceText ? Number(priceText.replace(/\s*kr/i, '').replace(/ /g, '').replace(',', '.')) : null;
     items.push({product_id:paths[0], name, quantity, price});
   }
