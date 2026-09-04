@@ -30,6 +30,12 @@ CAPABILITY_NAMES = (
     "favorite_read",
     "favorite_write_desired_state",
     "favorite_conditional_write",
+    "label_read",
+    "label_apply_existing",
+    "label_remove",
+    "label_create",
+    "label_conditional_write",
+    "label_reconcile",
     "reconcile_create",
     "reconcile_archive",
     "reconcile_delete",
@@ -42,6 +48,10 @@ WRITE_CAPABILITIES = {
     "delete",
     "favorite_write_desired_state",
     "favorite_conditional_write",
+    "label_apply_existing",
+    "label_remove",
+    "label_create",
+    "label_conditional_write",
 }
 MAX_LIBRARY_CONNECTIONS = 20
 MAX_SECRET_BYTES = 16 * 1024
@@ -66,6 +76,10 @@ class RecipeLibraryExternalMissingError(RecipeLibraryDefiniteError):
 
 class RecipeLibraryFavoriteConflictError(RecipeLibraryDefiniteError):
     """A provider-side conditional favorite write lost a revision race."""
+
+
+class RecipeLibraryLabelConflictError(RecipeLibraryDefiniteError):
+    """A provider-side conditional label write lost a revision race."""
 
 
 def _exact_text(value: Any, field: str, maximum: int, *, required: bool = True) -> str | None:
@@ -102,6 +116,45 @@ def validate_library_recipe_ref(value: Any) -> dict[str, str]:
     }
     if value.get("version") is not None:
         result["version"] = _exact_text(value.get("version"), "library_recipe_ref.version", 300) or ""
+    return result
+
+
+def normalize_label_name(value: Any) -> tuple[str, str]:
+    """Return a safe display name and its comparison key."""
+    if not isinstance(value, str):
+        raise RecipeLibraryError("recipe library label name must be text")
+    display = " ".join(unicodedata.normalize("NFC", value).split())
+    if (
+        not display
+        or len(display) > 100
+        or any(
+            ord(character) < 32
+            or ord(character) == 127
+            or 0xD800 <= ord(character) <= 0xDFFF
+            for character in display
+        )
+    ):
+        raise RecipeLibraryError("recipe library label name is invalid")
+    comparison = unicodedata.normalize("NFKC", display).casefold()
+    return display, comparison
+
+
+def validate_library_label_ref(value: Any) -> dict[str, str]:
+    if not isinstance(value, Mapping) or set(value) - {"library_id", "label_id", "version"}:
+        raise RecipeLibraryError(
+            "library_label_ref must contain only library_id, label_id and version"
+        )
+    result = {
+        "library_id": validate_library_id(value.get("library_id"), allow_builtin=False),
+        "label_id": _exact_text(
+            value.get("label_id"), "library_label_ref.label_id", 300
+        )
+        or "",
+    }
+    if value.get("version") is not None:
+        result["version"] = _exact_text(
+            value.get("version"), "library_label_ref.version", 300
+        ) or ""
     return result
 
 
@@ -332,6 +385,34 @@ class RecipeLibraryAdapter(ABC):
         expected_favorite_revision: Any = None,
     ) -> None:
         raise RecipeLibraryDefiniteError("recipe library favorite mutation is unsupported")
+
+    def list_labels(self) -> list[Mapping[str, Any]]:
+        raise RecipeLibraryDefiniteError("recipe library label reads are unsupported")
+
+    def get_recipe_labels(
+        self, library_recipe_ref: Mapping[str, str]
+    ) -> list[Mapping[str, Any]]:
+        raise RecipeLibraryDefiniteError("recipe library label reads are unsupported")
+
+    def set_label(
+        self,
+        library_recipe_ref: Mapping[str, str],
+        library_label_ref: Mapping[str, str],
+        present: bool,
+        *,
+        expected_label_revision: Any = None,
+    ) -> None:
+        raise RecipeLibraryDefiniteError("recipe library label mutation is unsupported")
+
+    def create_label(self, name: str, *, idempotency_key: str) -> Mapping[str, Any]:
+        raise RecipeLibraryDefiniteError("recipe library label creation is unsupported")
+
+    def reconcile_label_create(
+        self, name: str, operation: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        raise RecipeLibraryDefiniteError(
+            "recipe library label creation reconciliation is unsupported"
+        )
 
 
 def verified_capabilities(adapter: RecipeLibraryAdapter, connection: Mapping[str, Any]) -> dict[str, Any]:

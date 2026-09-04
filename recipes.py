@@ -24,7 +24,9 @@ from urllib.parse import urlsplit, urlunsplit
 from core import HouseholdError
 from recipe_libraries import (
     RecipeLibraryError,
+    normalize_label_name,
     validate_library_id,
+    validate_library_label_ref,
     validate_library_recipe_ref,
 )
 
@@ -1305,12 +1307,141 @@ class RecipeStore:
             "claimed": claimed,
         }
 
+    @staticmethod
+    def _label_operation(
+        row: sqlite3.Row, *, created: bool = False, claimed: bool = False
+    ) -> dict[str, Any]:
+        try:
+            metadata = json.loads(row["request_metadata"])
+            if not isinstance(metadata, Mapping) or metadata.get("action") not in {
+                "create",
+                "apply",
+                "remove",
+            }:
+                raise RecipeError("recipe library journal is unavailable")
+            action = metadata["action"]
+            label_ref = None
+            recipe_ref = None
+            name = None
+            normalized_name = None
+            expected = None
+            if action == "create":
+                if set(metadata) != {"action", "name", "normalized_name"}:
+                    raise RecipeError("recipe library journal is unavailable")
+                name, normalized_name = normalize_label_name(metadata.get("name"))
+                if normalized_name != metadata.get("normalized_name") or row["target_recipe_id"] is not None:
+                    raise RecipeError("recipe library journal is unavailable")
+            else:
+                if set(metadata) - {
+                    "action",
+                    "library_label_ref",
+                    "expected_label_revision",
+                }:
+                    raise RecipeError("recipe library journal is unavailable")
+                label_ref = validate_library_label_ref(metadata.get("library_label_ref"))
+                if label_ref["library_id"] != row["library_id"]:
+                    raise RecipeError("recipe library journal is unavailable")
+                recipe_ref = validate_library_recipe_ref({
+                    "library_id": row["library_id"],
+                    "recipe_id": row["target_recipe_id"],
+                    "version": row["provider_version"],
+                })
+                expected = _favorite_revision(
+                    metadata.get("expected_label_revision"),
+                    "expected_label_revision",
+                )
+            label_result = None
+            if row["result_metadata"]:
+                raw_result = json.loads(row["result_metadata"])
+                if (
+                    not isinstance(raw_result, Mapping)
+                    or set(raw_result) - {
+                        "library_id",
+                        "library_label_ref",
+                        "name",
+                        "normalized_name",
+                        "library_recipe_ref",
+                        "present",
+                        "idempotent",
+                        "reconciled",
+                    }
+                    or raw_result.get("library_id") != row["library_id"]
+                ):
+                    raise RecipeError("recipe library journal is unavailable")
+                returned_label = validate_library_label_ref(
+                    raw_result.get("library_label_ref")
+                )
+                if returned_label["library_id"] != row["library_id"]:
+                    raise RecipeError("recipe library journal is unavailable")
+                returned_name, returned_normalized = normalize_label_name(
+                    raw_result.get("name")
+                )
+                if returned_normalized != raw_result.get("normalized_name"):
+                    raise RecipeError("recipe library journal is unavailable")
+                label_result = dict(raw_result)
+                label_result.update({
+                    "library_label_ref": returned_label,
+                    "name": returned_name,
+                    "normalized_name": returned_normalized,
+                })
+                if action == "create":
+                    if returned_normalized != normalized_name or any(
+                        key in label_result for key in ("library_recipe_ref", "present")
+                    ):
+                        raise RecipeError("recipe library journal is unavailable")
+                else:
+                    returned_recipe = validate_library_recipe_ref(
+                        raw_result.get("library_recipe_ref")
+                    )
+                    if (
+                        returned_recipe["library_id"] != row["library_id"]
+                        or returned_recipe["recipe_id"] != row["target_recipe_id"]
+                        or returned_label["label_id"] != label_ref["label_id"]
+                        or raw_result.get("present") != (action == "apply")
+                    ):
+                        raise RecipeError("recipe library journal is unavailable")
+                    label_result["library_recipe_ref"] = returned_recipe
+                    if not isinstance(label_result.get("present"), bool):
+                        raise RecipeError("recipe library journal is unavailable")
+                for key in ("idempotent", "reconciled"):
+                    if key in label_result and not isinstance(label_result[key], bool):
+                        raise RecipeError("recipe library journal is unavailable")
+            if row["status"] == "confirmed" and label_result is None:
+                raise RecipeError("recipe library journal is unavailable")
+        except (json.JSONDecodeError, TypeError, RecipeLibraryError) as exc:
+            raise RecipeError("recipe library journal is unavailable") from exc
+        return {
+            "operation_id": row["operation_id"],
+            "kind": row["kind"],
+            "action": action,
+            "library_id": row["library_id"],
+            "target_recipe_id": row["target_recipe_id"],
+            "request_digest": row["request_digest"],
+            "idempotency_key": row["idempotency_key"],
+            "library_recipe_ref": recipe_ref,
+            "library_label_ref": label_ref,
+            "name": name,
+            "normalized_name": normalized_name,
+            "expected_label_revision": expected,
+            "status": row["status"],
+            "result": label_result,
+            "error_code": row["error_code"],
+            "error": row["error_text"],
+            "dispatched_at": row["dispatched_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "created": created,
+            "claimed": claimed,
+        }
+
     @classmethod
     def _operation(
         cls, row: sqlite3.Row, *, created: bool = False, claimed: bool = False
     ) -> dict[str, Any]:
         if row["kind"] == "favorite":
             return cls._favorite_operation(row, created=created, claimed=claimed)
+        if row["kind"] == "label":
+            return cls._label_operation(row, created=created, claimed=claimed)
         return cls._library_operation(row, created=created, claimed=claimed)
 
     def _cleanup_library_data(self, connection: sqlite3.Connection) -> None:
@@ -1580,6 +1711,213 @@ class RecipeStore:
                     (operation_id,),
                 ).fetchone()
                 return self._favorite_operation(row, created=True)
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def begin_library_label_create(
+        self, library_id: Any, name: Any, *, idempotency_key: Any
+    ) -> dict[str, Any]:
+        try:
+            library = validate_library_id(library_id, allow_builtin=False)
+            display, normalized_name = normalize_label_name(name)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        key = self._idempotency_key(idempotency_key)
+        if key is None:
+            raise RecipeError("idempotency_key is required")
+        metadata = {
+            "action": "create",
+            "name": display,
+            "normalized_name": normalized_name,
+        }
+        digest = _hash({"kind": "label", "library_id": library, **metadata})
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM library_connection_controls WHERE library_id=?",
+                    (library,),
+                ).fetchone() is not None:
+                    raise RecipeError("recipe library connection is disabled")
+                if connection.execute(
+                    "SELECT 1 FROM idempotency WHERE key=?", (key,)
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "idempotency key was already used with different content"
+                    )
+                keyed = connection.execute(
+                    "SELECT * FROM library_operations WHERE idempotency_key=?",
+                    (key,),
+                ).fetchall()
+                if keyed:
+                    if (
+                        len(keyed) != 1
+                        or keyed[0]["kind"] != "label"
+                        or keyed[0]["library_id"] != library
+                        or keyed[0]["request_digest"] != digest
+                    ):
+                        raise RecipeError(
+                            "idempotency key was already used for another library operation"
+                        )
+                    return self._label_operation(keyed[0])
+                self._cleanup_library_data(connection)
+                if connection.execute(
+                    "SELECT 1 FROM library_operations WHERE kind='label' "
+                    "AND library_id=? AND target_recipe_id IS NULL AND source_identity=? "
+                    "AND status IN ('pending','uncertain') LIMIT 1",
+                    (library, normalized_name),
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "another creation for this normalized label name is pending or uncertain"
+                    )
+                if connection.execute(
+                    "SELECT COUNT(*) FROM library_operations"
+                ).fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
+                    raise RecipeError("recipe library operation journal is full")
+                operation_id = f"libop:v1:{secrets.token_urlsafe(18)}"
+                timestamp = _now()
+                connection.execute("""INSERT INTO library_operations(
+                    operation_id, kind, library_id, discovery_ref, target_recipe_id,
+                    request_digest, request_metadata, idempotency_key, status,
+                    source_identity, snapshot_digest, result_metadata,
+                    provider_recipe_id, provider_version, error_code, error_text,
+                    dispatched_at, created_at, updated_at
+                ) VALUES(?, 'label', ?, NULL, NULL, ?, ?, ?, 'pending', ?, NULL,
+                    NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)""", (
+                    operation_id,
+                    library,
+                    digest,
+                    _canonical(metadata),
+                    key,
+                    normalized_name,
+                    timestamp,
+                    timestamp,
+                ))
+                return self._label_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone(),
+                    created=True,
+                )
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def begin_library_label_change(
+        self,
+        library_recipe_ref: Any,
+        library_label_ref: Any,
+        present: Any,
+        *,
+        expected_label_revision: Any = None,
+        idempotency_key: Any,
+    ) -> dict[str, Any]:
+        try:
+            recipe_ref = validate_library_recipe_ref(library_recipe_ref)
+            label_ref = validate_library_label_ref(library_label_ref)
+        except RecipeLibraryError as exc:
+            raise RecipeError(str(exc)) from exc
+        if (
+            recipe_ref["library_id"] == "builtin"
+            or label_ref["library_id"] != recipe_ref["library_id"]
+        ):
+            raise RecipeError(
+                "external label operation requires exact refs from one external library"
+            )
+        if not isinstance(present, bool):
+            raise RecipeError("present must be true or false")
+        expected = _favorite_revision(
+            expected_label_revision, "expected_label_revision"
+        )
+        key = self._idempotency_key(idempotency_key)
+        if key is None:
+            raise RecipeError("idempotency_key is required")
+        metadata: dict[str, Any] = {
+            "action": "apply" if present else "remove",
+            "library_label_ref": label_ref,
+        }
+        if expected is not None:
+            metadata["expected_label_revision"] = expected
+        digest = _hash({
+            "kind": "label",
+            "library_recipe_ref": recipe_ref,
+            **metadata,
+        })
+        library = recipe_ref["library_id"]
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if connection.execute(
+                    "SELECT 1 FROM library_connection_controls WHERE library_id=?",
+                    (library,),
+                ).fetchone() is not None:
+                    raise RecipeError("recipe library connection is disabled")
+                if connection.execute(
+                    "SELECT 1 FROM idempotency WHERE key=?", (key,)
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "idempotency key was already used with different content"
+                    )
+                keyed = connection.execute(
+                    "SELECT * FROM library_operations WHERE idempotency_key=?",
+                    (key,),
+                ).fetchall()
+                if keyed:
+                    if (
+                        len(keyed) != 1
+                        or keyed[0]["kind"] != "label"
+                        or keyed[0]["library_id"] != library
+                        or keyed[0]["target_recipe_id"] != recipe_ref["recipe_id"]
+                        or keyed[0]["request_digest"] != digest
+                    ):
+                        raise RecipeError(
+                            "idempotency key was already used for another library operation"
+                        )
+                    return self._label_operation(keyed[0])
+                self._cleanup_library_data(connection)
+                if connection.execute(
+                    "SELECT 1 FROM library_operations WHERE kind='label' "
+                    "AND library_id=? AND target_recipe_id=? "
+                    "AND status IN ('pending','uncertain') LIMIT 1",
+                    (library, recipe_ref["recipe_id"]),
+                ).fetchone() is not None:
+                    raise RecipeError(
+                        "another label operation for this exact external recipe is "
+                        "pending or uncertain; retry its original idempotency key"
+                    )
+                if connection.execute(
+                    "SELECT COUNT(*) FROM library_operations"
+                ).fetchone()[0] >= MAX_LIBRARY_OPERATIONS:
+                    raise RecipeError("recipe library operation journal is full")
+                operation_id = f"libop:v1:{secrets.token_urlsafe(18)}"
+                timestamp = _now()
+                connection.execute("""INSERT INTO library_operations(
+                    operation_id, kind, library_id, discovery_ref, target_recipe_id,
+                    request_digest, request_metadata, idempotency_key, status,
+                    source_identity, snapshot_digest, result_metadata,
+                    provider_recipe_id, provider_version, error_code, error_text,
+                    dispatched_at, created_at, updated_at
+                ) VALUES(?, 'label', ?, NULL, ?, ?, ?, ?, 'pending', ?, NULL,
+                    NULL, ?, ?, NULL, NULL, NULL, ?, ?)""", (
+                    operation_id,
+                    library,
+                    recipe_ref["recipe_id"],
+                    digest,
+                    _canonical(metadata),
+                    key,
+                    label_ref["label_id"],
+                    recipe_ref["recipe_id"],
+                    recipe_ref.get("version"),
+                    timestamp,
+                    timestamp,
+                ))
+                return self._label_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone(),
+                    created=True,
+                )
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 
@@ -1914,6 +2252,145 @@ class RecipeStore:
                     "SELECT * FROM library_operations WHERE operation_id=?",
                     (operation,),
                 ).fetchone())
+        except sqlite3.Error as exc:
+            raise RecipeError("recipe bank is unavailable") from exc
+
+    def finish_library_label(
+        self,
+        operation_id: Any,
+        status: Any,
+        *,
+        result: Any = None,
+        error_code: Any = None,
+        error: Any = None,
+    ) -> dict[str, Any]:
+        operation = _bounded_text(
+            operation_id, "operation_id", required=True, maximum=80
+        )
+        if re.fullmatch(r"libop:v1:[A-Za-z0-9_-]{16,64}", operation or "") is None:
+            raise RecipeError("recipe library operation was not found")
+        if status not in {"confirmed", "failed", "uncertain"}:
+            raise RecipeError("recipe library operation status is invalid")
+        label_result = None
+        if result is not None:
+            if not isinstance(result, Mapping):
+                raise RecipeError("recipe library label result is invalid")
+            allowed = {
+                "library_id",
+                "library_label_ref",
+                "name",
+                "normalized_name",
+                "library_recipe_ref",
+                "present",
+                "idempotent",
+                "reconciled",
+            }
+            if set(result) - allowed:
+                raise RecipeError("recipe library label result is invalid")
+            try:
+                label_ref = validate_library_label_ref(
+                    result.get("library_label_ref")
+                )
+                name, normalized_name = normalize_label_name(result.get("name"))
+            except RecipeLibraryError as exc:
+                raise RecipeError(str(exc)) from exc
+            if (
+                result.get("library_id") != label_ref["library_id"]
+                or result.get("normalized_name") != normalized_name
+            ):
+                raise RecipeError("recipe library label result is invalid")
+            label_result = {
+                "library_id": label_ref["library_id"],
+                "library_label_ref": label_ref,
+                "name": name,
+                "normalized_name": normalized_name,
+            }
+            if "library_recipe_ref" in result:
+                try:
+                    label_result["library_recipe_ref"] = validate_library_recipe_ref(
+                        result["library_recipe_ref"]
+                    )
+                except RecipeLibraryError as exc:
+                    raise RecipeError(str(exc)) from exc
+            if "present" in result:
+                if not isinstance(result["present"], bool):
+                    raise RecipeError("recipe library label result is invalid")
+                label_result["present"] = result["present"]
+            for name_key in ("idempotent", "reconciled"):
+                if name_key in result:
+                    if not isinstance(result[name_key], bool):
+                        raise RecipeError("recipe library label result is invalid")
+                    label_result[name_key] = result[name_key]
+        if (status == "confirmed") != (label_result is not None):
+            raise RecipeError(
+                "confirmed recipe library label operation requires exactly one result"
+            )
+        code = _bounded_text(error_code, "recipe library error_code", maximum=80)
+        if code is not None and re.fullmatch(r"[a-z][a-z0-9_]{0,79}", code) is None:
+            raise RecipeError("recipe library error_code is invalid")
+        error_text = _bounded_text(error, "recipe library error", maximum=500)
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT * FROM library_operations WHERE operation_id=?",
+                    (operation,),
+                ).fetchone()
+                if row is None or row["kind"] != "label":
+                    raise RecipeError("recipe library operation was not found")
+                if row["status"] in {"confirmed", "failed"}:
+                    return self._label_operation(row)
+                metadata = json.loads(row["request_metadata"])
+                if label_result is not None:
+                    label_ref = label_result["library_label_ref"]
+                    if label_ref["library_id"] != row["library_id"]:
+                        raise RecipeError(
+                            "recipe library label result does not match the bound target"
+                        )
+                    if metadata["action"] == "create":
+                        if (
+                            label_result["normalized_name"]
+                            != metadata["normalized_name"]
+                            or "library_recipe_ref" in label_result
+                            or "present" in label_result
+                        ):
+                            raise RecipeError(
+                                "recipe library label result does not match the bound target"
+                            )
+                    else:
+                        recipe_ref = label_result.get("library_recipe_ref")
+                        requested_label = validate_library_label_ref(
+                            metadata["library_label_ref"]
+                        )
+                        if (
+                            recipe_ref is None
+                            or recipe_ref["library_id"] != row["library_id"]
+                            or recipe_ref["recipe_id"] != row["target_recipe_id"]
+                            or label_ref["label_id"] != requested_label["label_id"]
+                            or label_result.get("present")
+                            != (metadata["action"] == "apply")
+                        ):
+                            raise RecipeError(
+                                "recipe library label result does not match the bound target"
+                            )
+                timestamp = _now()
+                connection.execute("""UPDATE library_operations SET
+                    status=?, result_metadata=?, error_code=?, error_text=?, updated_at=?
+                    WHERE operation_id=?""", (
+                    status,
+                    _canonical(label_result) if label_result is not None else None,
+                    code,
+                    error_text,
+                    timestamp,
+                    operation,
+                ))
+                self._cleanup_library_data(connection)
+                return self._label_operation(
+                    connection.execute(
+                        "SELECT * FROM library_operations WHERE operation_id=?",
+                        (operation,),
+                    ).fetchone()
+                )
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
 

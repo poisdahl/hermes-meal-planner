@@ -20,6 +20,7 @@ from recipe_libraries import (
     RecipeLibraryError,
     RecipeLibraryExternalMissingError,
     RecipeLibraryUncertainError,
+    normalize_label_name,
     normalize_library_origin,
     reject_authenticated_redirect,
     require_authenticated_origin,
@@ -34,6 +35,7 @@ MINIMUM_MEALIE_VERSION_TEXT = ".".join(str(part) for part in MINIMUM_MEALIE_VERS
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EXTRA_BYTES = 512 * 1024
 MAX_SEARCH_PAGE = 1_000_000
+MAX_LABELS = 1_000
 ORIGIN_EXTRA = "hermes_origin"
 RECIPE_EXTRA = "hermes_recipe"
 MARKER_EXTRA = "hermes_operation_marker"
@@ -137,6 +139,8 @@ class MealieAdapter(RecipeLibraryAdapter):
         self._opener = opener or build_opener(_NoRedirects())
         self._favorite_read = False
         self._favorite_user_id: str | None = None
+        self._label_read = False
+        self._label_create = False
 
     def _request(
         self,
@@ -239,6 +243,11 @@ class MealieAdapter(RecipeLibraryAdapter):
             if not isinstance(user, Mapping):
                 raise RecipeLibraryError("Mealie authenticated-user probe is incompatible")
             favorite_user_id = _provider_id(user.get("id"))
+            can_organize = user.get("canOrganize")
+            if not isinstance(can_organize, bool):
+                raise RecipeLibraryError(
+                    "Mealie authenticated-user organizer permission is incompatible"
+                )
             page = self._request(
                 "GET", "/api/recipes", query=[("page", "1"), ("perPage", "1")]
             )
@@ -250,6 +259,23 @@ class MealieAdapter(RecipeLibraryAdapter):
             except _MealieHTTPStatus as exc:
                 if exc.status == 404:
                     favorite_read = False
+                else:
+                    raise
+            label_read = True
+            try:
+                labels = self._request(
+                    "GET",
+                    "/api/organizers/tags",
+                    query=[("page", "1"), ("perPage", "1")],
+                )
+                label_items, _page, _total, _pages = self._page(
+                    labels, expected_per_page=1
+                )
+                for item in label_items:
+                    self._label(item)
+            except _MealieHTTPStatus as exc:
+                if exc.status == 404:
+                    label_read = False
                 else:
                     raise
         except RecipeLibraryError:
@@ -269,11 +295,17 @@ class MealieAdapter(RecipeLibraryAdapter):
         capabilities["favorite_read"] = favorite_read
         capabilities["favorite_write_desired_state"] = favorite_read and not self.read_only
         capabilities["favorite_reconcile"] = favorite_read
+        capabilities["label_read"] = label_read
+        capabilities["label_create"] = (
+            label_read and can_organize and not self.read_only
+        )
         if self.read_only:
             capabilities["create_from_discovery"] = False
             capabilities["reconcile_create"] = False
         self._favorite_read = favorite_read
         self._favorite_user_id = favorite_user_id
+        self._label_read = label_read
+        self._label_create = capabilities["label_create"]
         return {
             "provider": "mealie",
             "server_version": version,
@@ -350,6 +382,32 @@ class MealieAdapter(RecipeLibraryAdapter):
             if not isinstance(item, Mapping):
                 raise RecipeLibraryError("Mealie recipe tags are incompatible")
             result.append(_text(item.get("name"), "recipe tag", 80) or "")
+        return result
+
+    def _label(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise RecipeLibraryError("Mealie recipe tag is incompatible")
+        label_id = _provider_id(value.get("id"))
+        name, normalized_name = normalize_label_name(value.get("name"))
+        return {
+            "library_id": self.library_id,
+            "library_label_ref": {
+                "library_id": self.library_id,
+                "label_id": label_id,
+            },
+            "name": name,
+            "normalized_name": normalized_name,
+        }
+
+    def _labels(self, value: Any) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or len(value) > MAX_LABELS:
+            raise RecipeLibraryError("Mealie recipe tags are incompatible")
+        result = [self._label(item) for item in value]
+        identities = [item["library_label_ref"]["label_id"] for item in result]
+        if len(identities) != len(set(identities)):
+            raise RecipeLibraryError("Mealie recipe tags are incompatible")
         return result
 
     def _summary(self, value: Any) -> dict[str, Any]:
@@ -838,6 +896,84 @@ class MealieAdapter(RecipeLibraryAdapter):
         except (_MealieTransportFailure, RecipeLibraryError):
             raise RecipeLibraryUncertainError(
                 "Mealie favorite mutation outcome is uncertain"
+            ) from None
+
+    def list_labels(self) -> list[Mapping[str, Any]]:
+        if not self._label_read:
+            raise RecipeLibraryDefiniteError("Mealie tag reads are unsupported")
+        result: list[dict[str, Any]] = []
+        page = 1
+        try:
+            while True:
+                raw = self._request(
+                    "GET",
+                    "/api/organizers/tags",
+                    query=[("page", str(page)), ("perPage", "100")],
+                )
+                items, returned_page, total, total_pages = self._page(
+                    raw, expected_per_page=100
+                )
+                if returned_page != page or total > MAX_LABELS:
+                    raise RecipeLibraryError("Mealie tag list is incompatible")
+                result.extend(self._labels(items))
+                if page >= total_pages:
+                    break
+                page += 1
+        except _MealieHTTPStatus as exc:
+            if exc.status in {401, 403}:
+                raise RecipeLibraryError("Mealie tag read needs_auth") from None
+            raise RecipeLibraryError("Mealie tag read failed") from None
+        except _MealieTransportFailure:
+            raise RecipeLibraryError("Mealie tag read is unavailable") from None
+        identities = [item["library_label_ref"]["label_id"] for item in result]
+        if len(result) != total or len(identities) != len(set(identities)):
+            raise RecipeLibraryError("Mealie tag list is incompatible")
+        return result
+
+    def get_recipe_labels(
+        self, library_recipe_ref: Mapping[str, str]
+    ) -> list[Mapping[str, Any]]:
+        if not self._label_read:
+            raise RecipeLibraryDefiniteError("Mealie tag reads are unsupported")
+        reference = validate_library_recipe_ref(library_recipe_ref)
+        if reference["library_id"] != self.library_id:
+            raise RecipeLibraryError("Mealie recipe reference names the wrong library")
+        raw = self._get_raw(_provider_id(reference["recipe_id"]))
+        return self._labels(raw.get("tags"))
+
+    def create_label(self, name: str, *, idempotency_key: str) -> Mapping[str, Any]:
+        if not self._label_create or self.read_only:
+            raise RecipeLibraryDefiniteError("Mealie tag creation is unsupported")
+        display, normalized_name = normalize_label_name(name)
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise RecipeLibraryDefiniteError("Mealie tag idempotency key is invalid")
+        try:
+            raw = self._request(
+                "POST",
+                "/api/organizers/tags",
+                body={"name": display},
+                expected=(201,),
+            )
+            result = self._label(raw)
+            if result["normalized_name"] != normalized_name:
+                raise RecipeLibraryUncertainError(
+                    "Mealie tag creation response is incompatible"
+                )
+            return result
+        except _MealieHTTPStatus as exc:
+            if 400 <= exc.status < 500 and exc.status != 408:
+                message = (
+                    "Mealie tag creation needs_auth"
+                    if exc.status in {401, 403}
+                    else "Mealie rejected tag creation"
+                )
+                raise RecipeLibraryDefiniteError(message) from None
+            raise RecipeLibraryUncertainError(
+                "Mealie tag creation outcome is uncertain"
+            ) from None
+        except _MealieTransportFailure:
+            raise RecipeLibraryUncertainError(
+                "Mealie tag creation outcome is uncertain"
             ) from None
 
     @staticmethod

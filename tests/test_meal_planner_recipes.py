@@ -35,14 +35,17 @@ from recipe_libraries import (  # noqa: E402
     RecipeLibraryError,
     RecipeLibraryExternalMissingError,
     RecipeLibraryFavoriteConflictError,
+    RecipeLibraryLabelConflictError,
     RecipeLibraryUncertainError,
     library_recipe_key,
     load_library_secret,
     normalize_library_configuration,
+    normalize_label_name,
     reject_authenticated_redirect,
     require_authenticated_origin,
     secret_path,
     validate_library_recipe_ref,
+    validate_library_label_ref,
 )
 import recipe_library_setup as library_setup  # noqa: E402
 from recipe_library_mealie import (  # noqa: E402
@@ -365,6 +368,120 @@ class SyntheticLibraryAdapter(RecipeLibraryAdapter):
                 self.favorite_revision = f"{self.favorite_revision}-next"
         if self.favorite_set_mode == "uncertain_after_state":
             raise RecipeLibraryUncertainError("secret lost response detail")
+
+
+class SyntheticLabelAdapter(RecipeLibraryAdapter):
+    def __init__(
+        self,
+        library_id="family-mealie",
+        *,
+        read_only=False,
+        write=False,
+        conditional=False,
+        reconcile=True,
+        set_mode="confirmed",
+        create_mode="confirmed",
+    ):
+        self.library_id = library_id
+        self.read_only = read_only
+        self.write = write
+        self.conditional = conditional
+        self.reconcile = reconcile
+        self.set_mode = set_mode
+        self.create_mode = create_mode
+        self.recipe_ref = {
+            "library_id": library_id,
+            "recipe_id": "provider-recipe",
+            "version": "recipe-v1",
+        }
+        self.labels = [self._label("label-a", "Weekday", "label-v1")]
+        self.recipe_label_ids: set[str] = set()
+        self.list_calls = 0
+        self.recipe_read_calls = 0
+        self.write_calls = 0
+        self.create_calls = 0
+        self.reconcile_calls = 0
+
+    def _label(self, label_id, name, version=None):
+        display, normalized = normalize_label_name(name)
+        reference = {"library_id": self.library_id, "label_id": label_id}
+        if version is not None:
+            reference["version"] = version
+        return {
+            "library_id": self.library_id,
+            "library_label_ref": reference,
+            "name": display,
+            "normalized_name": normalized,
+        }
+
+    def capabilities(self):
+        capabilities = {name: False for name in CAPABILITY_NAMES}
+        capabilities["label_read"] = True
+        capabilities["label_apply_existing"] = self.write and not self.read_only
+        capabilities["label_remove"] = self.write and not self.read_only
+        capabilities["label_create"] = not self.read_only
+        capabilities["label_conditional_write"] = (
+            self.write and self.conditional and not self.read_only
+        )
+        capabilities["label_reconcile"] = self.reconcile
+        return {
+            "provider": "mealie",
+            "server_version": "2026.9",
+            "read_only": self.read_only,
+            **capabilities,
+        }
+
+    def list_labels(self):
+        self.list_calls += 1
+        return deepcopy(self.labels)
+
+    def get_recipe_labels(self, reference):
+        self.recipe_read_calls += 1
+        if self.set_mode == "missing":
+            raise RecipeLibraryExternalMissingError("secret missing detail")
+        return [
+            deepcopy(label)
+            for label in self.labels
+            if label["library_label_ref"]["label_id"] in self.recipe_label_ids
+        ]
+
+    def set_label(
+        self, recipe_ref, label_ref, present, *, expected_label_revision=None
+    ):
+        self.write_calls += 1
+        if self.set_mode == "definite":
+            raise RecipeLibraryDefiniteError("secret provider rejection detail")
+        if self.set_mode == "conditional_conflict":
+            raise RecipeLibraryLabelConflictError("secret conflict detail")
+        if self.set_mode == "uncertain_before_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        label_id = label_ref["label_id"]
+        if present:
+            self.recipe_label_ids.add(label_id)
+        else:
+            self.recipe_label_ids.discard(label_id)
+        if self.set_mode == "uncertain_after_state":
+            raise RecipeLibraryUncertainError("secret lost response detail")
+
+    def create_label(self, name, *, idempotency_key):
+        self.create_calls += 1
+        if self.create_mode == "definite":
+            raise RecipeLibraryDefiniteError("secret provider rejection detail")
+        created = self._label("label-created", name, "label-v1")
+        if self.create_mode != "uncertain_before_state":
+            self.labels.append(created)
+        if self.create_mode.startswith("uncertain"):
+            raise RecipeLibraryUncertainError("secret lost response detail")
+        return deepcopy(created)
+
+    def reconcile_label_create(self, name, operation):
+        self.reconcile_calls += 1
+        matches = [
+            label
+            for label in self.labels
+            if label["normalized_name"] == normalize_label_name(name)[1]
+        ]
+        return deepcopy(matches[0]) if len(matches) == 1 else None
 
 
 class RecipeStoreTests(unittest.TestCase):
@@ -1772,6 +1889,38 @@ class RecipeStoreTests(unittest.TestCase):
 
 
 class RecipeLibraryContractTests(unittest.TestCase):
+    def test_label_names_and_refs_are_exact_bounded_and_library_scoped(self):
+        self.assertEqual(normalize_label_name("  Weekday\tMeals  "), ("Weekday Meals", "weekday meals"))
+        reference = validate_library_label_ref({
+            "library_id": "family-mealie",
+            "label_id": "provider-label-id",
+            "version": "v1",
+        })
+        self.assertEqual(reference["label_id"], "provider-label-id")
+        for invalid in (
+            {"library_id": "builtin", "label_id": "one"},
+            {"library_id": "family-mealie", "label_id": " one"},
+            {"library_id": "family-mealie", "label_id": "one", "name": "fallback"},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(RecipeLibraryError):
+                validate_library_label_ref(invalid)
+        for invalid_name in ("", "\x00command", "x" * 101):
+            with self.subTest(invalid_name=invalid_name), self.assertRaises(RecipeLibraryError):
+                normalize_label_name(invalid_name)
+        read_only = SyntheticLabelAdapter(read_only=True, reconcile=True)
+        checked = library_module.verified_capabilities(
+            read_only,
+            {
+                "library_id": read_only.library_id,
+                "provider": "mealie",
+                "base_url": "https://recipes.example",
+                "read_only": True,
+            },
+        )
+        self.assertTrue(checked["label_read"])
+        self.assertTrue(checked["label_reconcile"])
+        self.assertFalse(checked["label_create"])
+
     def test_configuration_defaults_to_builtin_and_enforces_exact_ids_and_origins(self):
         self.assertEqual(normalize_library_configuration({}), {
             "primary_recipe_library_id": "builtin",
@@ -5090,6 +5239,303 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertIsNone(result["next_eligible_week"])
 
+    def _label_app(self, adapter, suffix):
+        settings = {
+            **CONFIG,
+            "recipe_libraries": [{
+                "library_id": adapter.library_id,
+                "provider": "mealie",
+                "base_url": "https://recipes.example",
+                "read_only": adapter.read_only,
+            }],
+        }
+        return Application(
+            StateStore(Path(self.temp.name) / suffix, settings),
+            self.oda,
+            self.browser,
+            recipe_library_adapters={adapter.library_id: adapter},
+        )
+
+    def test_external_labels_list_exact_ids_create_explicitly_and_reject_duplicate_names(self):
+        adapter = SyntheticLabelAdapter()
+        app = self._label_app(adapter, "labels-create")
+        listed = app.handle({
+            "operation": "recipes",
+            "action": "list_labels",
+            "library_id": adapter.library_id,
+        })
+        self.assertEqual(
+            listed["labels"][0]["library_label_ref"],
+            {"library_id": adapter.library_id, "label_id": "label-a", "version": "label-v1"},
+        )
+        self.assertEqual(listed["labels"][0]["normalized_name"], "weekday")
+        created = app.handle({
+            "operation": "recipes",
+            "action": "create_label",
+            "library_id": adapter.library_id,
+            "label_name": "Dinner",
+            "idempotency_key": "create-label-dinner",
+        })
+        self.assertEqual((created["status"], created["name"]), ("confirmed", "Dinner"))
+        repeated = app.handle({
+            "operation": "recipes",
+            "action": "create_label",
+            "library_id": adapter.library_id,
+            "label_name": "Dinner",
+            "idempotency_key": "create-label-dinner",
+        })
+        self.assertEqual(repeated["library_label_ref"], created["library_label_ref"])
+        self.assertEqual(adapter.create_calls, 1)
+        duplicate = app.handle({
+            "operation": "recipes",
+            "action": "create_label",
+            "library_id": adapter.library_id,
+            "label_name": "  DINNER  ",
+            "idempotency_key": "create-label-duplicate",
+        })
+        self.assertEqual(
+            (duplicate["status"], duplicate["error_code"]),
+            ("failed", "label_name_conflict"),
+        )
+        self.assertEqual(adapter.create_calls, 1)
+
+    def test_external_label_desired_state_is_exact_idempotent_and_preserves_other_labels(self):
+        adapter = SyntheticLabelAdapter(write=True)
+        other = adapter._label("label-b", "Keep me", "label-v1")
+        adapter.labels.append(other)
+        adapter.recipe_label_ids.add("label-b")
+        app = self._label_app(adapter, "labels-desired-state")
+        applied = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": adapter.recipe_ref,
+            "library_label_ref": adapter.labels[0]["library_label_ref"],
+            "present": True,
+            "idempotency_key": "apply-label-a",
+        })
+        self.assertEqual((applied["status"], applied["present"]), ("confirmed", True))
+        self.assertEqual(adapter.recipe_label_ids, {"label-a", "label-b"})
+        repeated = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": adapter.recipe_ref,
+            "library_label_ref": adapter.labels[0]["library_label_ref"],
+            "present": True,
+            "idempotency_key": "apply-label-a",
+        })
+        self.assertEqual(repeated["library_label_ref"]["label_id"], "label-a")
+        self.assertEqual(adapter.write_calls, 1)
+        removed = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": adapter.recipe_ref,
+            "library_label_ref": adapter.labels[0]["library_label_ref"],
+            "present": False,
+            "idempotency_key": "remove-label-a",
+        })
+        self.assertEqual((removed["status"], removed["present"]), ("confirmed", False))
+        self.assertEqual(adapter.recipe_label_ids, {"label-b"})
+
+    def test_duplicate_normalized_label_names_require_the_exact_provider_id(self):
+        adapter = SyntheticLabelAdapter(write=True)
+        adapter.labels.append(adapter._label("label-b", "  WEEKDAY  ", "label-v2"))
+        app = self._label_app(adapter, "labels-duplicate-names")
+        listed = app.handle({
+            "operation": "recipes",
+            "action": "list_labels",
+            "library_id": adapter.library_id,
+        })["labels"]
+        self.assertEqual(
+            [item["normalized_name"] for item in listed],
+            ["weekday", "weekday"],
+        )
+        applied = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": adapter.recipe_ref,
+            "library_label_ref": listed[1]["library_label_ref"],
+            "present": True,
+            "idempotency_key": "apply-second-duplicate-label",
+        })
+        self.assertEqual(applied["library_label_ref"]["label_id"], "label-b")
+        self.assertEqual(adapter.recipe_label_ids, {"label-b"})
+
+    def test_external_label_capability_read_only_conditional_timeout_and_malformed_gates(self):
+        readonly = SyntheticLabelAdapter(read_only=True, write=True)
+        app = self._label_app(readonly, "labels-readonly")
+        rejected = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": readonly.recipe_ref,
+            "library_label_ref": readonly.labels[0]["library_label_ref"],
+            "present": True,
+            "idempotency_key": "readonly-label",
+        })
+        self.assertEqual((rejected["status"], rejected["error_code"]), ("failed", "unsupported"))
+        self.assertEqual(readonly.write_calls, 0)
+
+        nonconditional = SyntheticLabelAdapter(write=True)
+        app = self._label_app(nonconditional, "labels-nonconditional")
+        rejected = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": nonconditional.recipe_ref,
+            "library_label_ref": nonconditional.labels[0]["library_label_ref"],
+            "present": True,
+            "expected_label_revision": "label-v1",
+            "idempotency_key": "conditional-label",
+        })
+        self.assertEqual(
+            (rejected["status"], rejected["error_code"]),
+            ("failed", "unsupported_conditional"),
+        )
+        self.assertEqual(nonconditional.write_calls, 0)
+
+        conditional = SyntheticLabelAdapter(write=True, conditional=True)
+        conditional.recipe_label_ids.add("label-a")
+        app = self._label_app(conditional, "labels-stale-conditional")
+        stale = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": conditional.recipe_ref,
+            "library_label_ref": conditional.labels[0]["library_label_ref"],
+            "present": False,
+            "expected_label_revision": "stale-label-version",
+            "idempotency_key": "stale-conditional-label",
+        })
+        self.assertEqual(
+            (stale["status"], stale["error_code"]),
+            ("failed", "label_conflict"),
+        )
+        self.assertEqual(conditional.write_calls, 0)
+
+        uncertain = SyntheticLabelAdapter(write=True, set_mode="uncertain_after_state")
+        app = self._label_app(uncertain, "labels-timeout")
+        reconciled = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": uncertain.recipe_ref,
+            "library_label_ref": uncertain.labels[0]["library_label_ref"],
+            "present": True,
+            "idempotency_key": "timeout-label",
+        })
+        self.assertEqual((reconciled["status"], reconciled["present"]), ("confirmed", True))
+        self.assertTrue(reconciled["reconciled"])
+        self.assertEqual(uncertain.write_calls, 1)
+
+        delayed = SyntheticLabelAdapter(write=True, set_mode="uncertain_before_state")
+        app = self._label_app(delayed, "labels-delayed-reconcile")
+        request = {
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": delayed.recipe_ref,
+            "library_label_ref": delayed.labels[0]["library_label_ref"],
+            "present": True,
+            "idempotency_key": "delayed-timeout-label",
+        }
+        self.assertEqual(app.handle(request)["status"], "uncertain")
+        delayed.read_only = True
+        delayed.recipe_label_ids.add("label-a")
+        retried = app.handle(request)
+        self.assertEqual((retried["status"], retried["present"]), ("confirmed", True))
+        self.assertTrue(retried["reconciled"])
+        self.assertEqual(delayed.write_calls, 1)
+
+        malformed = SyntheticLabelAdapter(write=True)
+        malformed.list_labels = lambda: [{"name": "missing exact identity"}]
+        app = self._label_app(malformed, "labels-malformed")
+        failed = app.handle({
+            "operation": "recipes",
+            "action": "set_label",
+            "library_recipe_ref": malformed.recipe_ref,
+            "library_label_ref": malformed.labels[0]["library_label_ref"],
+            "present": True,
+            "idempotency_key": "malformed-label",
+        })
+        self.assertEqual((failed["status"], failed["error_code"]), ("failed", "unavailable"))
+        self.assertEqual(malformed.write_calls, 0)
+
+    def test_external_label_create_lost_response_is_reconciled_only_when_advertised(self):
+        adapter = SyntheticLabelAdapter(create_mode="uncertain_after_state", reconcile=True)
+        app = self._label_app(adapter, "labels-create-timeout")
+        result = app.handle({
+            "operation": "recipes",
+            "action": "create_label",
+            "library_id": adapter.library_id,
+            "label_name": "Lunch",
+            "idempotency_key": "create-label-timeout",
+        })
+        self.assertEqual((result["status"], result["name"]), ("confirmed", "Lunch"))
+        self.assertTrue(result["reconciled"])
+        self.assertEqual((adapter.create_calls, adapter.reconcile_calls), (1, 1))
+
+        no_reconcile = SyntheticLabelAdapter(
+            create_mode="uncertain_after_state", reconcile=False
+        )
+        app = self._label_app(no_reconcile, "labels-create-no-reconcile")
+        uncertain = app.handle({
+            "operation": "recipes",
+            "action": "create_label",
+            "library_id": no_reconcile.library_id,
+            "label_name": "Lunch",
+            "idempotency_key": "create-label-uncertain",
+        })
+        self.assertEqual(uncertain["status"], "uncertain")
+        repeated = app.handle({
+            "operation": "recipes",
+            "action": "create_label",
+            "library_id": no_reconcile.library_id,
+            "label_name": "Lunch",
+            "idempotency_key": "create-label-uncertain",
+        })
+        self.assertEqual(repeated["status"], "uncertain")
+        self.assertEqual(no_reconcile.create_calls, 1)
+        no_reconcile.reconcile = True
+        reconciled_retry = app.handle({
+            "operation": "recipes",
+            "action": "create_label",
+            "library_id": no_reconcile.library_id,
+            "label_name": "Lunch",
+            "idempotency_key": "create-label-uncertain",
+        })
+        self.assertEqual(reconciled_retry["status"], "confirmed")
+        self.assertTrue(reconciled_retry["reconciled"])
+        self.assertEqual(no_reconcile.create_calls, 1)
+
+    def test_concurrent_equal_external_label_requests_serialize_to_one_write(self):
+        adapter = SyntheticLabelAdapter(write=True)
+        app = self._label_app(adapter, "labels-concurrent")
+        barrier = threading.Barrier(3)
+        results = []
+        errors = []
+
+        def apply(key):
+            try:
+                barrier.wait()
+                results.append(app.handle({
+                    "operation": "recipes",
+                    "action": "set_label",
+                    "library_recipe_ref": adapter.recipe_ref,
+                    "library_label_ref": adapter.labels[0]["library_label_ref"],
+                    "present": True,
+                    "idempotency_key": key,
+                }))
+            except Exception as exc:  # pragma: no cover - assertion captures it
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=apply, args=(f"concurrent-label-{index}",))
+            for index in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual([item["status"] for item in results], ["confirmed"] * 2)
+        self.assertEqual(adapter.write_calls, 1)
+
 
 class _FakeMealieResponse:
     def __init__(self, status, value):
@@ -5154,6 +5600,7 @@ class MealieAdapterTests(unittest.TestCase):
             (200, self.fixture["authenticated_user"]),
             (200, self.fixture["recipe_page"]),
             (200, self.fixture["favorites"]),
+            (200, self.fixture["tag_page"]),
         )
 
     @staticmethod
@@ -5229,20 +5676,24 @@ class MealieAdapterTests(unittest.TestCase):
             (200, self.fixture["authenticated_user"]),
             (200, self.fixture["recipe_page"]),
             (200, self.fixture["favorites"]),
+            (200, self.fixture["tag_page"]),
         )
         capabilities = adapter.capabilities()
         self.assertEqual(capabilities["server_version"], "v3.24.0")
         for name in (
             "search", "get", "create_from_discovery", "reconcile_create",
             "favorite_read", "favorite_write_desired_state", "favorite_reconcile",
+            "label_read", "label_create",
         ):
             self.assertTrue(capabilities[name])
         for name in (
             "conditional_update", "archive_desired_state", "delete",
             "favorite_conditional_write", "reconcile_archive", "reconcile_delete",
+            "label_apply_existing", "label_remove", "label_conditional_write",
+            "label_reconcile",
         ):
             self.assertFalse(capabilities[name])
-        self.assertEqual([request.method for request, _timeout in opener.requests], ["GET"] * 4)
+        self.assertEqual([request.method for request, _timeout in opener.requests], ["GET"] * 5)
         self.assertTrue(all(request.headers["Authorization"] == "Bearer fixture-token-never-serialized" for request, _ in opener.requests))
 
         read_only = {**self.connection, "read_only": True}
@@ -5251,6 +5702,7 @@ class MealieAdapterTests(unittest.TestCase):
             (200, self.fixture["authenticated_user"]),
             (200, self.fixture["recipe_page"]),
             (200, self.fixture["favorites"]),
+            (200, self.fixture["tag_page"]),
             connection=read_only,
         )
         checked = library_module.verified_capabilities(adapter, read_only)
@@ -5258,10 +5710,12 @@ class MealieAdapterTests(unittest.TestCase):
         self.assertTrue(checked["get"])
         self.assertTrue(checked["favorite_read"])
         self.assertTrue(checked["favorite_reconcile"])
+        self.assertTrue(checked["label_read"])
         self.assertFalse(checked["create_from_discovery"])
         self.assertFalse(checked["reconcile_create"])
         self.assertFalse(checked["favorite_write_desired_state"])
         self.assertFalse(checked["favorite_conditional_write"])
+        self.assertFalse(checked["label_create"])
 
     def test_incompatible_version_authentication_and_redirects_fail_without_following(self):
         old = {**self.fixture["app_about"], "version": "v3.23.1"}
@@ -5333,6 +5787,51 @@ class MealieAdapterTests(unittest.TestCase):
             self.assertIn(self.fixture["authenticated_user"]["id"], request.full_url)
             self.assertIn(self.recipe_id, request.full_url)
             self.assertNotIn("fixture-vegetable-soup", request.full_url)
+
+    def test_exact_tag_read_and_explicit_create_shapes_without_recipe_replacement(self):
+        tag_page = deepcopy(self.fixture["tag_page"])
+        tag_page["perPage"] = 100
+        adapter, opener = self.adapter(
+            *self.capability_responses(),
+            (200, tag_page),
+            (200, self.fixture["recipe_get"]),
+            (201, self.fixture["tag_create"]["response"]),
+        )
+        capabilities = adapter.capabilities()
+        self.assertTrue(capabilities["label_read"])
+        self.assertTrue(capabilities["label_create"])
+        self.assertFalse(capabilities["label_apply_existing"])
+        self.assertFalse(capabilities["label_remove"])
+        labels = adapter.list_labels()
+        self.assertEqual(
+            labels[0]["library_label_ref"],
+            {
+                "library_id": "family-mealie",
+                "label_id": "55555555-5555-4555-8555-555555555555",
+            },
+        )
+        attached = adapter.get_recipe_labels({
+            "library_id": "family-mealie",
+            "recipe_id": self.recipe_id,
+        })
+        self.assertEqual(attached, labels)
+        created = adapter.create_label(
+            "weekday", idempotency_key="stable-create-label-key"
+        )
+        self.assertEqual(
+            created["library_label_ref"]["label_id"],
+            "66666666-6666-4666-8666-666666666666",
+        )
+        writes = [
+            request for request, _timeout in opener.requests
+            if request.method != "GET"
+        ]
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(
+            writes[0].full_url,
+            "https://recipes.example/api/organizers/tags",
+        )
+        self.assertEqual(json.loads(writes[0].data), {"name": "weekday"})
 
     def test_native_favorite_missing_false_and_mutation_failure_classification(self):
         missing_rating = HTTPError(
@@ -5661,6 +6160,7 @@ class MealieAdapterTests(unittest.TestCase):
             (200, self.fixture["authenticated_user"]),
             (200, self.fixture["recipe_page"]),
             (200, self.fixture["favorites"]),
+            (200, self.fixture["tag_page"]),
         )
         adapter, opener = self.adapter(
             *capability_responses,
@@ -5852,6 +6352,7 @@ class RecipeSageAdapterTests(unittest.TestCase):
             (200, self.fixture["validate_session"]),
             (200, self.fixture["authenticated_user"]),
             (200, self.fixture["recipe_page"]),
+            (200, self.fixture["labels"]),
         )
 
     def test_sanitized_fixture_and_read_only_probe_match_hosted_contract(self):
@@ -5891,17 +6392,22 @@ class RecipeSageAdapterTests(unittest.TestCase):
         )
         capabilities = adapter.capabilities()
         self.assertEqual(capabilities["server_version"], HOSTED_VERIFIED_VERSION)
-        for name in ("search", "get", "create_from_discovery", "reconcile_create"):
+        for name in (
+            "search", "get", "create_from_discovery", "reconcile_create",
+            "label_read", "label_create",
+        ):
             self.assertTrue(capabilities[name])
         for name in (
             "conditional_update", "archive_desired_state", "delete", "favorite_read",
             "favorite_write_desired_state", "favorite_conditional_write",
             "reconcile_archive", "reconcile_delete", "favorite_reconcile",
+            "label_apply_existing", "label_remove", "label_conditional_write",
+            "label_reconcile",
         ):
             self.assertFalse(capabilities[name])
         self.assertEqual(
             [request.method for request, _timeout in opener.requests],
-            ["GET", "GET", "GET", "POST"],
+            ["GET", "GET", "GET", "POST", "GET"],
         )
         self.assertNotIn("Authorization", opener.requests[0][0].headers)
         self.assertTrue(
@@ -5918,7 +6424,98 @@ class RecipeSageAdapterTests(unittest.TestCase):
         self.assertTrue(checked["search"])
         self.assertTrue(checked["get"])
         self.assertFalse(checked["create_from_discovery"])
+        self.assertTrue(checked["label_read"])
+        self.assertFalse(checked["label_create"])
         self.assertFalse(checked["reconcile_create"])
+
+    def test_exact_label_read_and_explicit_create_shapes_without_recipe_replacement(self):
+        adapter, opener = self.adapter(
+            *self.capability_responses(),
+            (200, self.fixture["labels"]),
+            (200, self.fixture["recipe_get"]),
+            (200, self.fixture["label_create"]["response"]),
+        )
+        capabilities = adapter.capabilities()
+        self.assertTrue(capabilities["label_read"])
+        self.assertTrue(capabilities["label_create"])
+        self.assertFalse(capabilities["label_apply_existing"])
+        self.assertFalse(capabilities["label_remove"])
+        labels = adapter.list_labels()
+        self.assertEqual(
+            labels[0]["library_label_ref"],
+            {
+                "library_id": "family-recipesage",
+                "label_id": "44444444-4444-4444-8444-444444444444",
+                "version": "2026-08-24T12:00:00.000Z",
+            },
+        )
+        attached = adapter.get_recipe_labels({
+            "library_id": "family-recipesage",
+            "recipe_id": self.recipe_id,
+        })
+        self.assertEqual(
+            attached[0]["library_label_ref"]["label_id"],
+            "44444444-4444-4444-8444-444444444444",
+        )
+        self.assertEqual(
+            attached[0]["library_label_ref"]["version"],
+            "2026-08-24T12:00:00.000Z",
+        )
+        created = adapter.create_label(
+            "weekday", idempotency_key="stable-create-label-key"
+        )
+        self.assertEqual(
+            created["library_label_ref"]["label_id"],
+            "55555555-5555-4555-8555-555555555555",
+        )
+        writes = [
+            request for request, _timeout in opener.requests
+            if request.method == "POST"
+            and request.full_url.endswith("/compat/v2/labels/createLabel")
+        ]
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(
+            json.loads(writes[0].data),
+            {"title": "weekday", "labelGroupId": None},
+        )
+
+    def test_recipe_label_relations_require_matching_owned_nested_identity(self):
+        cases = {
+            "mismatched label": (
+                "id",
+                "66666666-6666-4666-8666-666666666666",
+                "incompatible",
+            ),
+            "cross-owner label": (
+                "userId",
+                "77777777-7777-4777-8777-777777777777",
+                "different account",
+            ),
+        }
+        for name, (field, value, error) in cases.items():
+            with self.subTest(name=name):
+                raw = deepcopy(self.fixture["recipe_get"])
+                raw["recipeLabels"][0]["label"][field] = value
+                adapter, _ = self.adapter((200, raw))
+                with self.assertRaisesRegex(RecipeLibraryError, error):
+                    adapter.get_recipe_labels({
+                        "library_id": "family-recipesage",
+                        "recipe_id": self.recipe_id,
+                    })
+
+    def test_label_create_rejects_provider_name_rewrites_before_dispatch(self):
+        adapter, opener = self.adapter()
+        for name in ("foo,bar", "unlabeled", ",,,"):
+            with self.subTest(name=name):
+                for _attempt in range(2):
+                    with self.assertRaisesRegex(
+                        RecipeLibraryDefiniteError,
+                        "reject or transform|would transform",
+                    ):
+                        adapter.create_label(
+                            name, idempotency_key=f"provider-rewrite-{name}"
+                        )
+        self.assertEqual(opener.requests, [])
 
     def test_versions_selfhost_prefix_authentication_and_redirects(self):
         old = deepcopy(self.fixture["openapi"])

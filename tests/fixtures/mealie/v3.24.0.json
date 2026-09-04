@@ -21,7 +21,9 @@
     "favorite_read": "GET /api/users/self/favorites",
     "favorite_exact_read": "GET /api/users/self/ratings/{immutable-recipe-id}",
     "favorite_add": "POST /api/users/{authenticated-user-id}/favorites/{immutable-recipe-id}",
-    "favorite_remove": "DELETE /api/users/{authenticated-user-id}/favorites/{immutable-recipe-id}"
+    "favorite_remove": "DELETE /api/users/{authenticated-user-id}/favorites/{immutable-recipe-id}",
+    "tag_list": "GET /api/organizers/tags?page={page}&perPage={bounded}",
+    "tag_create": "POST /api/organizers/tags"
   },
   "app_about": {
     "production": true,
@@ -52,7 +54,7 @@
     "canInvite": false,
     "canManage": false,
     "canManageHousehold": false,
-    "canOrganize": false,
+    "canOrganize": true,
     "groupId": "33333333-3333-4333-8333-333333333333",
     "groupSlug": "fixture-group",
     "householdId": "44444444-4444-4444-8444-444444444444",
@@ -314,5 +316,31 @@
     "remove_status": 200,
     "conditional_revision": null,
     "evidence": "Mealie v3.24.0 routes and integration tests use exact add/remove endpoints and read back native UserRatingSummary state; no ETag or favorite revision is exposed."
+  },
+  "tag_page": {
+    "page": 1,
+    "perPage": 1,
+    "total": 1,
+    "totalPages": 1,
+    "next": null,
+    "previous": null,
+    "items": [{
+      "id": "55555555-5555-4555-8555-555555555555",
+      "groupId": "33333333-3333-4333-8333-333333333333",
+      "name": "fixture",
+      "slug": "fixture"
+    }]
+  },
+  "tag_create": {
+    "request": {"name": "weekday"},
+    "response": {
+      "id": "66666666-6666-4666-8666-666666666666",
+      "groupId": "33333333-3333-4333-8333-333333333333",
+      "name": "weekday",
+      "slug": "weekday"
+    },
+    "requires_authenticated_user_canOrganize": true,
+    "conditional_recipe_tag_write": false,
+    "evidence": "Mealie v3.24.0 creates a standalone group tag by exact response ID. Recipe association uses whole-recipe PUT/PATCH without a provider-enforced conditional token, so apply/remove is disabled."
   }
 }
