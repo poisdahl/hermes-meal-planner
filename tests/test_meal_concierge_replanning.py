@@ -195,7 +195,7 @@ class ReplanMigrationTests(unittest.TestCase):
                 legacy['menu'] = {'schedule':[{'day':'Monday','meal':'unknown'}]}
                 store.path.write_text(json.dumps(legacy))
                 migrated = StateStore(directory, CONFIG)
-                self.assertEqual(migrated.read()['version'], 11)
+                self.assertEqual(migrated.read()['version'], 12)
                 self.assertEqual(migrated.read()['menu'], legacy['menu'])
                 backup = Path(directory)/f'state-v{version}.backup.json'
                 self.assertEqual(json.loads(backup.read_text()), legacy)

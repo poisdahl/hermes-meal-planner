@@ -430,7 +430,7 @@ if [[ "$existing_install" == true ]]; then
 from mcp_server import rpc
 
 status = rpc("status")
-if status.get("state_version") != 8 or "product_favorites_count" not in status or "favorites" in status:
+if status.get("state_version") != 12 or "product_favorites_count" not in status or "favorites" in status:
     raise SystemExit("meal-concierge status does not expose canonical v8 state")
 PY
     then

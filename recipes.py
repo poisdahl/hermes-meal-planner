@@ -1349,6 +1349,7 @@ class RecipeStore:
             "request_digest": row["request_digest"],
             "idempotency_key": row["idempotency_key"],
             "requested_status": request_metadata["status"],
+            "provider_progress": deepcopy(request_metadata.get("provider_progress", {})),
             "status": row["status"],
             "source_identity": row["source_identity"],
             "snapshot_digest": row["snapshot_digest"],
@@ -2910,6 +2911,55 @@ class RecipeStore:
                 )
         except sqlite3.Error as exc:
             raise RecipeError("recipe bank is unavailable") from exc
+
+    def record_library_create_progress(self, operation_id, progress):
+        if not isinstance(progress, Mapping) or set(progress) - {"slug", "library_recipe_ref", "provider_principal", "provider_binding"}:
+            raise RecipeError("invalid import progress")
+        slug = _bounded_text(progress.get("slug"), "import slug", maximum=300)
+        reference = progress.get("library_recipe_ref")
+        if reference is not None:
+            reference = validate_library_recipe_ref(reference)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM library_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            if row is None or row["kind"] != "create" or row["status"] not in {"pending", "uncertain"}:
+                raise RecipeError("import is not awaiting recovery")
+            metadata = json.loads(row["request_metadata"])
+            previous = metadata.get("provider_progress", {})
+            if (previous.get("slug") and slug and previous["slug"] != slug) or (reference and reference["library_id"] != row["library_id"]):
+                raise RecipeError("import progress identity changed")
+            if previous.get("library_recipe_ref") and previous["library_recipe_ref"]["recipe_id"] != (reference or previous["library_recipe_ref"])["recipe_id"]:
+                raise RecipeError("import progress identity changed")
+            for key, maximum in (("provider_principal", 300), ("provider_binding", 64)):
+                value = _bounded_text(progress.get(key), key, required=True, maximum=maximum)
+                if previous.get(key, value) != value:
+                    raise RecipeError("import progress provider context changed")
+            metadata["provider_progress"] = {**previous, **dict(progress)}
+            if slug:
+                metadata["provider_progress"]["slug"] = slug
+            if reference:
+                metadata["provider_progress"]["library_recipe_ref"] = reference
+            connection.execute("UPDATE library_operations SET request_metadata=?, updated_at=? WHERE operation_id=?", (_canonical(metadata), _now(), operation_id))
+
+    def close_removed_library_import(self, operation_id, deletion_operation_id):
+        """Release only a create whose exact partial recipe was explicitly deleted."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM library_operations WHERE operation_id=?", (operation_id,)).fetchone()
+            deletion = connection.execute("SELECT * FROM library_operations WHERE operation_id=?", (deletion_operation_id,)).fetchone()
+            if row is None or row["kind"] != "create":
+                raise RecipeError("import operation was not found")
+            if row["status"] == "failed" and row["error_code"] == "incomplete_import_removed":
+                return self._library_operation(row)
+            progress = json.loads(row["request_metadata"]).get("provider_progress", {})
+            ref = progress.get("library_recipe_ref", {})
+            if row["status"] != "uncertain" or not ref or deletion is None or deletion["kind"] != "delete" or deletion["status"] != "confirmed" or deletion["library_id"] != row["library_id"] or deletion["target_recipe_id"] != ref.get("recipe_id"):
+                raise RecipeError("confirmed deletion of this exact incomplete import is required")
+            deletion_context = json.loads(deletion["request_metadata"])
+            if any(not progress.get(key) or progress[key] != deletion_context.get(key) for key in ("provider_binding", "provider_principal")):
+                raise RecipeError("import cleanup provider context changed")
+            connection.execute("UPDATE library_operations SET status='failed', discovery_ref=NULL, error_code='incomplete_import_removed', error_text='Exact incomplete import removed; a new explicit save requires a new idempotency key', updated_at=? WHERE operation_id=?", (_now(), operation_id))
+            return self._library_operation(connection.execute("SELECT * FROM library_operations WHERE operation_id=?", (operation_id,)).fetchone())
 
     def finish_library_create(
         self,

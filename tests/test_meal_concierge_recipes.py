@@ -2451,7 +2451,7 @@ class StateMigrationTests(unittest.TestCase):
             (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
             store = StateStore(root, {**CONFIG, "household": "Hus A", "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 11)
+            self.assertEqual(migrated["version"], 12)
             self.assertIn("product_favorites", migrated)
             self.assertNotIn("favorites", migrated)
             self.assertEqual(migrated["profile"]["recipes"]["repeat_cooldown_weeks"], 6)
@@ -2511,7 +2511,7 @@ class StateMigrationTests(unittest.TestCase):
 
             store = StateStore(root, {**CONFIG, "provider": "oda"})
             migrated = store.read()
-            self.assertEqual(migrated["version"], 11)
+            self.assertEqual(migrated["version"], 12)
             self.assertEqual(migrated["email_jobs"][0]["provider"], "oda")
             self.assertEqual(migrated["email_jobs"][0]["status"], "pending")
             self.assertEqual(migrated["order_snapshot_providers"]["order-old"], "oda")
@@ -2554,7 +2554,7 @@ class StateMigrationTests(unittest.TestCase):
 
             migrated = StateStore(root, {**CONFIG, "provider": "oda"}).read()
 
-            self.assertEqual(migrated["version"], 11)
+            self.assertEqual(migrated["version"], 12)
             self.assertIsNone(migrated["cart_plan"])
             backup = json.loads((root / "state-v3.backup.json").read_text(encoding="utf-8"))
             self.assertEqual(backup["version"], 3)
@@ -2578,7 +2578,7 @@ class StateMigrationTests(unittest.TestCase):
                 "profile_overrides": {"recipes": {"sources": {"themealdb": False}}},
             }).read()
 
-            self.assertEqual(migrated["version"], 11)
+            self.assertEqual(migrated["version"], 12)
             self.assertEqual(migrated["setup"]["status"], "needs_review")
             self.assertFalse(migrated["profile"]["recipes"]["sources"]["themealdb"])
             self.assertTrue(migrated["profile"]["recipes"]["sources"]["wikibooks"])
@@ -2709,7 +2709,7 @@ class RecipeFlowTests(unittest.TestCase):
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         if prepared.get("cart_reconciliation_required"):
             digest = prepared["cart_plan"]["cart_digest"]
-            self.app.handle({
+            self.app.handle({"menu_ref": self.app._cart_menu_ref(self.app.store.read().get("menu")),
                 "operation": "cart", "action": "reconcile",
                 "decision": "keep_current", "cart_digest": digest,
             })
@@ -4454,7 +4454,7 @@ class RecipeFlowTests(unittest.TestCase):
                 self.assertEqual(requirement["query"], "carrot")
                 app.handle({"operation": "catalog", "action": "products", "query": requirement["query"], "limit": 1})
                 product_id = MENY_PRODUCT if provider_name == "meny" else "10"
-                app.handle({
+                app.handle({"menu_ref": app._cart_menu_ref(app.store.read().get("menu")),
                     "operation": "cart", "action": "sync",
                     "requirements": [{"product_id": product_id, "product_name": "Carrot", "quantity": 2}],
                 })
@@ -7047,6 +7047,7 @@ class MealieAdapterTests(unittest.TestCase):
         )
         adapter, opener = self.adapter(
             *capability_responses,
+            (200, self.fixture["authenticated_user"]),
             (201, "fixture-created"), stub_response, patch_response,
             *capability_responses,
             exact_get_response,

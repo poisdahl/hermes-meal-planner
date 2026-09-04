@@ -11,8 +11,7 @@ MAX_EVENTS = 500
 RETENTION_DAYS = 180
 
 
-def effective(events, as_of_date):
-    today = date.fromisoformat(as_of_date)
+def _visibility(events):
     disabled = set()
     suppressed = set()
     for event in reversed(events):
@@ -22,6 +21,26 @@ def effective(events, as_of_date):
             disabled.update(event['targets'])
         elif event['kind'] == 'reset':
             suppressed.update((target, event.get('recipe_key')) for target in event['targets'])
+    return disabled, suppressed
+
+
+def experiences(events, recipe_keys=None):
+    disabled, suppressed = _visibility(events)
+    result = []
+    for event in events:
+        if event['kind'] != 'experience' or event['event_id'] in disabled:
+            continue
+        key = event['binding']['target']['recipe_key']
+        if (event['event_id'], None) in suppressed or (event['event_id'], key) in suppressed or recipe_keys is not None and key not in recipe_keys:
+            continue
+        result.append({'event_id': event['event_id'], 'date': event['date'], 'recipe_key': key,
+                       'experience': deepcopy(event['binding']['experience']), 'reason': event.get('reason')})
+    return result
+
+
+def effective(events, as_of_date):
+    today = date.fromisoformat(as_of_date)
+    disabled, suppressed = _visibility(events)
     active = []
     totals = {}
     for event in events:

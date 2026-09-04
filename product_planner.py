@@ -15,7 +15,7 @@ import unicodedata
 from core import HouseholdError
 
 
-PRODUCT_PLAN_VERSION = "product-plan-v1"
+PRODUCT_PLAN_VERSION = "product-plan-v2"
 MAX_REQUIREMENTS = 20
 MAX_CANDIDATES_PER_REQUIREMENT = 5
 MAX_PACKAGES_PER_REQUIREMENT = 100
@@ -75,7 +75,7 @@ def _positive_fraction(value: Any) -> Fraction | None:
         decimal = Decimal(str(value))
     except InvalidOperation:
         return None
-    if not decimal.is_finite() or decimal <= 0:
+    if not decimal.is_finite() or decimal <= 0 or not -12 <= decimal.adjusted() <= 15:
         return None
     result = Fraction(decimal)
     if result.numerator > 10**15 or result.denominator > 10**12:
@@ -130,13 +130,30 @@ def _read_fraction(value: Any, *, positive: bool = False) -> Fraction:
     return Fraction(numerator, denominator)
 
 
-def menu_requirements(menu: Any, *, maximum: int | None = MAX_REQUIREMENTS) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def menu_requirements(menu: Any, *, maximum: int | None = MAX_REQUIREMENTS, ingredient_decisions: Any = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Aggregate only exact compatible recipe requirements."""
 
     if not isinstance(menu, Mapping):
         raise HouseholdError("product preparation needs one exact menu")
     aggregated: dict[tuple[str, str], dict[str, Any]] = {}
     unresolved = []
+    decisions = ingredient_decisions or []
+    if not isinstance(decisions, list) or len(decisions) > 512:
+        raise HouseholdError("ingredient_decisions must be a bounded list")
+    by_position = {}
+    for decision in decisions:
+        if not isinstance(decision, Mapping) or not set(decision).issubset({"source", "action", "quantity", "unit"}):
+            raise HouseholdError("ingredient decision fields are invalid")
+        position = decision.get("source")
+        if not isinstance(position, Mapping) or set(position) != {"collection", "recipe_index", "ingredient_index"} or position["collection"] not in {"dishes", "salads"} or any(type(position[k]) is not int or position[k] < 0 for k in ("recipe_index", "ingredient_index")):
+            raise HouseholdError("ingredient decision requires an exact returned source position")
+        key = canonical(position)
+        if key in by_position or decision.get("action") not in {"have_all", "have_quantity", "include", "omit"}:
+            raise HouseholdError("ingredient decisions must be unique explicit choices")
+        if decision["action"] != "have_quantity" and ("quantity" in decision or "unit" in decision):
+            raise HouseholdError("only have_quantity accepts a quantity and unit")
+        by_position[key] = decision
+    used = set()
     for collection in ("dishes", "salads"):
         recipes = menu.get(collection)
         if not isinstance(recipes, list):
@@ -161,10 +178,18 @@ def menu_requirements(menu: Any, *, maximum: int | None = MAX_REQUIREMENTS) -> t
                 scalable = raw.get("scalable") is True or _legacy_scalable(
                     recipe, ingredient_index, raw
                 )
+                decision = by_position.get(canonical(position))
+                action = decision.get("action") if decision else None
+                if decision:
+                    used.add(canonical(position))
+                if action == "omit" and raw.get("optional") is not True:
+                    raise HouseholdError("only an optional ingredient can be omitted")
+                if action == "omit" or (action == "have_all" and (quantity is None or conversion is None or identity is None or not scalable)):
+                    continue
                 reason = None
-                if raw.get("pantry") is True:
-                    reason = "pantry_state_out_of_scope"
-                elif raw.get("optional") is True:
+                if raw.get("pantry") is True and action is None:
+                    reason = "pantry_state_needs_input"
+                elif raw.get("optional") is True and action is None:
                     reason = "optional_requirement_needs_input"
                 elif not scalable:
                     reason = "non_scalable_quantity_unresolved"
@@ -180,18 +205,36 @@ def menu_requirements(menu: Any, *, maximum: int | None = MAX_REQUIREMENTS) -> t
                     continue
                 canonical_unit, factor = conversion
                 exact_quantity = quantity * factor
+                gross_quantity = exact_quantity
+                pantry_quantity = Fraction(0)
+                if action == "have_all":
+                    pantry_quantity = exact_quantity
+                    exact_quantity = Fraction(0)
+                if action == "have_quantity":
+                    available = _positive_fraction(decision.get("quantity"))
+                    available_unit = _UNITS.get(_normalized_unit(decision.get("unit")))
+                    if available is None or available_unit is None or available_unit[0] != canonical_unit:
+                        raise HouseholdError("pantry quantity must have an exact compatible unit")
+                    pantry_quantity = min(exact_quantity, available * available_unit[1])
+                    exact_quantity -= pantry_quantity
                 key = (identity, canonical_unit)
                 requirement = aggregated.setdefault(key, {
                     "identity": identity,
                     "item": " ".join(unicodedata.normalize("NFC", str(item)).split()),
                     "unit": canonical_unit,
                     "quantity_fraction": Fraction(0),
+                    "gross_fraction": Fraction(0),
+                    "pantry_fraction": Fraction(0),
                     "sources": [],
                 })
                 requirement["quantity_fraction"] += exact_quantity
+                requirement["gross_fraction"] += gross_quantity
+                requirement["pantry_fraction"] += pantry_quantity
                 requirement["sources"].append(position)
     requirements = []
     for (identity, unit), value in sorted(aggregated.items(), key=lambda pair: (pair[0][0].encode("utf-8"), pair[0][1])):
+        if value["quantity_fraction"] == 0:
+            continue
         requirement_id = "req:" + hashlib.sha256(canonical({"identity": identity, "unit": unit}).encode()).hexdigest()[:24]
         requirements.append({
             "requirement_id": requirement_id,
@@ -199,9 +242,13 @@ def menu_requirements(menu: Any, *, maximum: int | None = MAX_REQUIREMENTS) -> t
             "item": value["item"],
             "search": value["item"],
             "quantity": _fraction_json(value["quantity_fraction"]),
+            "gross_quantity": _fraction_json(value["gross_fraction"]),
+            "confirmed_pantry_quantity": _fraction_json(value["pantry_fraction"]),
             "unit": unit,
             "sources": value["sources"],
         })
+    if set(by_position) != used:
+        raise HouseholdError("ingredient decision does not name a source in this exact menu")
     if maximum is not None and len(requirements) + len(unresolved) > maximum:
         raise HouseholdError(f"product preparation supports at most {maximum} menu requirements")
     return requirements, unresolved
@@ -495,12 +542,51 @@ def product_plan_digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical(_without_presentation(value)).encode()).hexdigest()
 
 
+def _estimated_single_product(requirement, observation, approval):
+    """Quantity-ready explicit selection when only the deposit is unknown."""
+    refs = approval["candidate_refs"]
+    if len(refs) != 1:
+        return None
+    matches = [p for p in observation.get("products", []) if p.get("product_ref") == refs[0]]
+    if len(matches) != 1:
+        return None
+    product = matches[0]
+    package = product.get("package")
+    options = product.get("purchase_options", [])
+    if product.get("availability") != "available" or not isinstance(package, Mapping) or package.get("unit") != requirement["unit"] or len(options) != 1:
+        return None
+    option = options[0]
+    if option.get("price_kind") != "exact" or option.get("eligibility") != "confirmed" or option.get("offer_kind") != "regular" or option.get("package_count") != 1 or type(option.get("merchandise_ore")) is not int or option["merchandise_ore"] < 0:
+        return None
+    size = _read_fraction(package["quantity"], positive=True)
+    needed = _read_fraction(requirement["quantity"], positive=True)
+    count = math.ceil(needed / size)
+    if not 1 <= count <= MAX_PACKAGES_PER_REQUIREMENT:
+        return None
+    excess = (count * size - needed) / needed
+    if approval.get("max_excess") is not None and excess > _read_fraction(approval["max_excess"]):
+        return None
+    merchandise = count * option["merchandise_ore"]
+    return {"products": [{"product_ref": refs[0], "name": product["name"], "quantity": count,
+                          "merchandise_ore": merchandise, "mandatory_deposit_ore": None, "total_payable_ore": None}],
+            "coverage": _fraction_json(count * size), "required": _fraction_json(needed),
+            "unit": requirement["unit"], "excess_score": _fraction_json(excess), "package_count": count,
+            "merchandise_ore": merchandise, "mandatory_deposit_ore": None, "total_payable_ore": None}
+
+
 def build_product_plan(
     *, provider: str, binding: Mapping[str, Any], menu: Mapping[str, Any],
     observations: Mapping[str, Mapping[str, Any]], candidate_approvals: Any,
     hard_product_constraints: Any = None,
+    ingredient_decisions: Any = None,
+    budget_ore: int | None = None,
+    price_mode: str = "exact",
 ) -> dict[str, Any]:
-    requirements, structural_unresolved = menu_requirements(menu)
+    if price_mode not in {"exact", "estimate"}:
+        raise HouseholdError("price_mode must be exact or estimate")
+    if budget_ore is not None and (type(budget_ore) is not int or not 1 <= budget_ore <= 100_000_000):
+        raise HouseholdError("product budget_ore must be a positive integer")
+    requirements, structural_unresolved = menu_requirements(menu, ingredient_decisions=ingredient_decisions)
     approvals = normalize_approvals(candidate_approvals, {item["requirement_id"] for item in requirements})
     hard_constraints = _normalize_hard_product_constraints(hard_product_constraints)
     ref_owners: dict[str | int, set[str]] = {}
@@ -513,6 +599,7 @@ def build_product_plan(
     planned = []
     unresolved = deepcopy(structural_unresolved)
     merchandise = deposit = payable = packages = 0
+    payable_known = True
     excess = Fraction(0)
     for requirement in requirements:
         requirement_id = requirement["requirement_id"]
@@ -550,6 +637,10 @@ def build_product_plan(
             planned.append(item)
             continue
         selection, reason, eligible_count = _select_requirement(requirement, observation, approval)
+        if reason == "candidate_price_or_eligibility_unresolved" and price_mode == "estimate":
+            estimated = _estimated_single_product(requirement, observation, approval)
+            if estimated is not None:
+                selection, reason, eligible_count = estimated, None, 1
         item["eligible_candidate_count"] = eligible_count
         if reason is not None:
             unresolved.append({"requirement_id": requirement_id, "item": requirement["item"], "reason": reason})
@@ -557,18 +648,26 @@ def build_product_plan(
         else:
             item["status"] = "selected"
             item["selection"] = selection
+            selection["surplus_quantity"] = _fraction_json(_read_fraction(selection["coverage"]) - _read_fraction(selection["required"]))
             merchandise += selection["merchandise_ore"]
-            deposit += selection["mandatory_deposit_ore"]
-            payable += selection["total_payable_ore"]
+            if selection["total_payable_ore"] is None:
+                payable_known = False
+            else:
+                deposit += selection["mandatory_deposit_ore"]
+                payable += selection["total_payable_ore"]
             packages += selection["package_count"]
             excess += _read_fraction(selection["excess_score"])
         planned.append(item)
-    status = "prepared" if requirements and not unresolved else "needs_input"
+    status = "prepared" if (requirements or ingredient_decisions) and not unresolved else "needs_input"
     plan: dict[str, Any] = {
         "product_plan_version": PRODUCT_PLAN_VERSION,
         "provider": provider,
         "binding": deepcopy(dict(binding)),
         "hard_product_constraints": hard_constraints,
+        "ingredient_decisions": deepcopy(ingredient_decisions or []),
+        "budget_ore": budget_ore,
+        "price_mode": price_mode,
+        "cost_status": "exact_product_payable" if payable_known and status == "prepared" else "merchandise_estimate_only" if status == "prepared" else "unresolved",
         "status": status,
         "scope": {
             "search_semantics": "bounded_relevance_ranked",
@@ -581,18 +680,22 @@ def build_product_plan(
         "unresolved_requirements": unresolved,
         "comparison_claim": (
             f"lowest verified total payable amount among the approved, exactly priced candidates observed for {len(requirements)} bounded {provider.upper()} searches"
-            if status == "prepared" else None
+            if status == "prepared" and payable_known else None
         ),
         "excluded_costs": ["delivery", "cart_level_bags", "cart_level_fees", "checkout_price_drift"],
     }
     if status == "prepared":
         plan["totals"] = {
             "merchandise_ore": merchandise,
-            "mandatory_deposit_ore": deposit,
-            "total_payable_ore": payable,
+            "mandatory_deposit_ore": deposit if payable_known else None,
+            "total_payable_ore": payable if payable_known else None,
             "excess_score": _fraction_json(excess),
             "package_count": packages,
         }
+        plan["budget_status"] = "not_set" if budget_ore is None else "exceeded" if merchandise + deposit > budget_ore else "unverified" if not payable_known else "within_budget"
+        if plan["budget_status"] == "exceeded":
+            plan["status"] = "needs_input"
+            plan["unresolved_requirements"].append({"reason": "product_budget_exceeded", "budget_ore": budget_ore, "known_minimum_ore": merchandise + deposit, "total_payable_ore": payable if payable_known else None})
     plan["product_plan_digest"] = product_plan_digest(plan)
     return plan
 
