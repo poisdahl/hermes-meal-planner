@@ -92,7 +92,8 @@ def retire_planned_slots(state, menu):
         if slot_outcome(state, menu, slot) == "cooked":
             continue
         owner = menu.get("slot_owners", {}).get(slot["slot_id"], menu["menu_id"])
-        if state.get("recipe_usage", {}).get(owner, {}).get("status") != "planned":
+        record = state.get("recipe_usage", {}).get(owner, {})
+        if record.get("status") != "planned" or slot["recipe_key"] in record.get("cooldown_overrides", {}):
             continue
         retired = state["menu_planning"]["retired"]
         if owner not in retired and len(retired) >= MAX_PLANNING_MENUS:

@@ -149,9 +149,26 @@ class ReplanningTests(unittest.TestCase):
             state['menu'] = deepcopy(successor)
             state['menu_planning']['retired'] = {}
         self.app.handle({'operation':'menu','action':'save', 'menu':{'week':self.menu['week'],
-            'dishes':[{'recipe_ref':self.candidates[4]['recipe_ref']}]}})
-        self.assertTrue(self.app._usage_summary(self.store.read(), carried, self.menu['week'])['eligible'])
+            'dishes':[{'recipe_ref':self.menu['slots'][1]['reference']['recipe_ref']}]}})
+        summary = self.app._usage_summary(self.store.read(), carried, self.menu['week'])
+        self.assertEqual(len(summary['blocked_by']), 1)
+        self.assertEqual(summary['blocked_by'][0]['menu_id'], self.store.read()['menu']['menu_id'])
         self.assertEqual(predecessor, self.store.read()['recipe_usage'][self.menu['menu_id']])
+
+    def test_carried_order_history_survives_normal_snapshot_pruning(self):
+        prepared = self.prepare(remaining_dates=['2026-09-09'], planner_input={'candidates':self.candidates[3:]})
+        successor = self.apply(prepared)['menu']
+        carried = self.menu['slots'][1]['recipe_key']
+        with self.store.locked() as state:
+            self.app._record_order_snapshot(state, {'menu':successor}, '12345')
+        self.app.handle({'operation':'menu','action':'clear','menu_id':successor['menu_id'],'expected_revision':successor['revision']})
+        with self.store.locked() as state:
+            state['email_jobs'] = [{'provider':'oda','order_id':'12345','status':'sent'}]
+            self.app._prune_order_snapshots(state)
+        self.assertEqual(self.store.read()['order_snapshots'], {})
+        summary = self.app._usage_summary(self.store.read(), carried, self.menu['week'])
+        self.assertEqual(summary['last_ordered_week'], self.menu['week'])
+        self.assertFalse(summary['eligible'])
 
     def test_structural_comparison_has_no_provider_search_limit(self):
         rows = [{'item':f'item{i}','quantity':1,'unit':'g','scalable':True} for i in range(24)]

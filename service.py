@@ -1304,7 +1304,10 @@ class Application:
         identity_keys = library_recipe_key_aliases(key)
         last_planned = last_ordered = last_cooked = None
         blockers = []
-        for menu_id, record in (state.get("recipe_usage") or {}).items():
+        usage_records = state.get("recipe_usage") or {}
+        ordered_slots = {slot_id for record in usage_records.values() if record.get("status") == "ordered" for slot_id in record.get("ordered_slot_ids", [])}
+        historical_ordered_slots = {slot_id for record in usage_records.values() if record.get("status") == "ordered" or record.get("previous_status") == "ordered" for slot_id in record.get("ordered_slot_ids", [])}
+        for menu_id, record in usage_records.items():
             if menu_id == ignore_menu_id or not isinstance(record, Mapping) or not identity_keys.intersection(record.get("recipe_keys", [])):
                 continue
             record_week = record.get("week")
@@ -1327,8 +1330,9 @@ class Application:
                 if overlay is not None:
                     cooked = overlay["outcome"] == "cooked"
                     not_cooked = overlay["outcome"] == "not_cooked"
-                if any(slot["slot_id"] in {s["slot_id"] for s in snapshot.get("slots", []) if s["slot_id"] not in snapshot.get("historical_slot_ids", [])} for snapshot in state.get("order_snapshots", {}).values()):
+                if slot["slot_id"] in ordered_slots:
                     status = "ordered"
+                if slot["slot_id"] in historical_ordered_slots:
                     last_ordered = max(filter(None, (last_ordered, record_week)), default=record_week)
             retired = bool(identity_keys.intersection(state.get("menu_planning", {}).get("retired", {}).get(menu_id, [])))
             if retired and status == "planned" and not cooked:
@@ -4982,6 +4986,9 @@ class Application:
                     revision = 1
                 self._abandon_predispatch(state, reason="menu replaced")
                 blocked = []
+                cooldown_state = deepcopy(state)
+                if isinstance(current, Mapping):
+                    mp.retire_planned_slots(cooldown_state, current)
                 current_usage = state.setdefault("recipe_usage", {}).get(current.get("menu_id")) if isinstance(current, Mapping) else None
                 for key in keys:
                     ignored_menu_id = (
@@ -4994,7 +5001,7 @@ class Application:
                         )
                         else None
                     )
-                    summary = self._usage_summary(state, key, menu["week"], ignore_menu_id=ignored_menu_id)
+                    summary = self._usage_summary(cooldown_state, key, menu["week"], ignore_menu_id=ignored_menu_id)
                     if not summary["eligible"] and matched_override(key) is None:
                         blocked.append({"recipe_key": key, "usage": summary})
                 if blocked:
@@ -8046,6 +8053,7 @@ class Application:
         usage = state.setdefault("recipe_usage", {}).get(menu_id)
         if isinstance(usage, dict):
             usage["status"] = "ordered"
+            usage["ordered_slot_ids"] = [s["slot_id"] for s in snapshot.get("slots", []) if s["slot_id"] not in snapshot.get("historical_slot_ids", [])]
             usage["order_id"] = order_id
             usage["updated_at"] = now().isoformat()
         current = state.get("menu")
