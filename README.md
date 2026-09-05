@@ -302,5 +302,4 @@ repository root, run the test suite:
 python3 -m unittest discover -s tests
 ```
 
-Maintained by [Per Oskar Isdahl](https://github.com/poisdahl).
 Licensed under the [MIT License](LICENSE).
