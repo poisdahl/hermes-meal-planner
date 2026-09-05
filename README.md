@@ -3,22 +3,17 @@
 </p>
 
 <p align="center">
-  <a href="#agent-support"><img src="assets/icons/hermes.png" alt="Hermes Agent: available now" title="Hermes Agent: available now" width="88" height="88"></a>
-  <a href="#agent-support"><img src="assets/icons/openclaw.png" alt="OpenClaw: coming soon" title="OpenClaw: coming soon" width="88" height="88"></a>
-  <a href="#agent-support"><img src="assets/icons/nanoclaw.png" alt="NanoClaw: coming soon" title="NanoClaw: coming soon" width="88" height="88"></a>
-  <a href="#agent-support"><img src="assets/icons/codex.png" alt="Codex: coming soon" title="Codex: coming soon" width="88" height="88"></a>
-  <a href="#agent-support"><img src="assets/icons/claude-code.png" alt="Claude Code: coming soon" title="Claude Code: coming soon" width="88" height="88"></a>
-  <a href="#agent-support"><img src="assets/icons/grok-bot.png" alt="Grok Bot: coming soon" title="Grok Bot: coming soon" width="88" height="88"></a>
+  <a href="#agent-support"><img src="assets/icons/hermes.png" alt="Hermes Agent" title="Hermes Agent" width="48" height="48"></a>
+  <a href="#agent-support"><img src="assets/icons/openclaw.png" alt="OpenClaw" title="OpenClaw" width="48" height="48"></a>
+  <a href="#agent-support"><img src="assets/icons/nanoclaw.png" alt="NanoClaw" title="NanoClaw" width="48" height="48"></a>
+  <a href="#agent-support"><img src="assets/icons/codex.png" alt="Codex" title="Codex" width="48" height="48"></a>
+  <a href="#agent-support"><img src="assets/icons/claude-code.png" alt="Claude Code" title="Claude Code" width="48" height="48"></a>
+  <a href="#agent-support"><img src="assets/icons/grok-bot.png" alt="Grok Bot" title="Grok Bot" width="48" height="48"></a>
 </p>
 
 <p align="center">
-  <strong>Available now:</strong> <a href="#agent-support">Hermes Agent</a><br>
-  <strong>Coming soon:</strong> OpenClaw · NanoClaw · Codex · Claude Code · Grok Bot
-</p>
-
-<p align="center">
-  <a href="#supported-stores"><img src="assets/icons/oda.png" alt="Oda" title="Oda" width="72" height="72"></a>
-  <a href="#supported-stores"><img src="assets/icons/meny.png" alt="MENY" title="MENY" width="144" height="72"></a>
+  <a href="#supported-stores"><img src="assets/icons/oda.png" alt="Oda" title="Oda" width="40" height="40"></a>
+  <a href="#supported-stores"><img src="assets/icons/meny.png" alt="MENY" title="MENY" width="80" height="40"></a>
 </p>
 
 **Plan meals, save recipes and shop for groceries through Hermes Agent.**
