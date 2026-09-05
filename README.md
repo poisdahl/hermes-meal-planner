@@ -1,4 +1,21 @@
-# Meal Concierge
+<p align="center">
+  <img src="assets/meal-concierge-banner.png" alt="Meal Concierge — a retro cooking-pot mascot delivering groceries. Plan meals. Save recipes. Shop smarter." width="1000">
+</p>
+
+<p align="center">
+  <a href="#requirements"><img src="assets/badges/hermes.svg" alt="Hermes Agent: supported"></a>
+  <a href="#supported-stores"><img src="assets/badges/groceries.svg" alt="Grocery providers: Oda and MENY"></a>
+  <a href="LICENSE"><img src="assets/badges/mit.svg" alt="License: MIT"></a>
+</p>
+
+<p align="center">
+  <a href="#agent-support"><img src="assets/badges/openclaw.svg" alt="OpenClaw: coming soon"></a>
+  <a href="#agent-support"><img src="assets/badges/nanoclaw.svg" alt="NanoClaw: coming soon"></a>
+  <a href="#agent-support"><img src="assets/badges/codex.svg" alt="Codex: coming soon"></a>
+  <br>
+  <a href="#agent-support"><img src="assets/badges/claude-code.svg" alt="Claude Code: coming soon"></a>
+  <a href="#agent-support"><img src="assets/badges/grok-bot.svg" alt="Grok Bot: coming soon"></a>
+</p>
 
 **Plan meals, save recipes and shop for groceries through Hermes Agent.**
 
@@ -36,6 +53,14 @@ portions, preferences and enabled sources during first-use setup.
 Meal Concierge runs as a local background service with a skill and an MCP
 connection that gives Hermes its meal and grocery tools. You use it through
 your usual Hermes chat. No separate web app or database server is required.
+
+## Agent support
+
+**Available now:** Hermes Agent.
+
+**Coming soon:** OpenClaw, NanoClaw, Codex, Claude Code and Grok Bot integrations.
+These integrations are planned and are not available to install yet. The
+installation instructions below are for Hermes Agent.
 
 ## Supported stores
 
