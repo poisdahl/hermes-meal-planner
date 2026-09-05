@@ -85,7 +85,9 @@ def workflow_status(state):
     order_id = menu.get("order_id")
     jobs = [j for j in state.get("email_jobs", []) if j.get("order_id") == order_id and j.get("provider") == state["provider"]] if order_id else []
     next_action = {"operation": "menu", "action": "plan", "reason": "Prepare a menu."}
-    if pending:
+    if state.get("pending_cart_change"):
+        next_action = {"operation": "cart", "action": "reconcile_change", "reason": "Read back the pending grocery top-up before any further write; never repeat an uncertain delta."}
+    elif pending:
         action = "reconcile" if pending.get("status") in {"clicking", "uncertain", "awaiting_user_payment"} else "confirm"
         next_action = {"operation": "checkout", "action": action, "reason": "Approve the existing Vipps request on the phone, then reconcile." if pending.get("status") == "awaiting_user_payment" else "Continue the exact existing checkout attempt; confirmation policy still applies."}
     elif cancellation:

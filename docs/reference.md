@@ -1383,3 +1383,36 @@ Unix socket process. Concrete operation classes share that same instance:
 handles recipe email. `service_common.py` holds shared normalization/rendering
 helpers. Pure planner, product, feedback and batch logic remain separate modules.
 There are no additional services, registries or public-data stores.
+
+## Everyday replenishment before and after checkout
+
+`meal_concierge_cart(action="ensure", requirements=[{product_id, product_name, quantity}])`
+ensures a minimum package count without duplicate additions on repeated calls.
+Use `change` for explicit additional quantity deltas. Both actions accept an
+active menu; verified household extras are tracked as supplemental quantities
+and remain separate when menu requirements change. They do not rewrite recipes.
+
+For existing orders, read/select the exact order and call `orders change_begin`
+first. Oda's live modifiability status and MENY's enabled order-change controls
+decide whether editing is possible; no fixed local cutoff overrides the store.
+Oda ensure includes quantities on the original order as well as staged additions.
+An already satisfied request can close the empty edit with `change_abort`.
+
+A nonempty Oda cart returns `cart_confirmation_required` with `cart_digest`.
+The unchanged digest may be supplied to `change_begin` only when all those
+items are authorized for the selected order. Goods are never cleared to start
+an edit. Checkout binds and confirms the resulting addition to the same order;
+MENY reopens the full order and requires checkout/Vipps again. Actual provider
+permission is checked during editing and checkout rather than inferred from time.
+
+Provider explanations: [Oda additions](https://hjelp.oda.com/no/article/100639),
+[MENY order changes](https://meny.no/faq/bestilling-i-nettbutikken).
+
+Each supplemental cart write is journalled before dispatch; MENY uses bounded
+verified batches. An interrupted write blocks later writes and checkout across
+restart. `cart reconcile_change` only reads and closes the journal when the exact
+expected quantities are observed; it never sends the delta again. A native MENY
+stop proven to precede every click can close after reading the preserved cart;
+a partial batch still requires the exact result of its earlier clicks. Workflow status
+surfaces this recovery step. A changed Oda addition cart must be reviewed and
+rebound; `orders change_abort(retain_cart=true)` preserves its goods.

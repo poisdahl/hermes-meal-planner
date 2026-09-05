@@ -278,7 +278,7 @@ class Application(RecipeOperations, PlanningOperations, OrderOperations, EmailOp
             self.integration = {"status": status, "provider": self.provider, "message": str(exc)}
 
     @contextmanager
-    def _browser_operation(self, deadline: float | None = None):
+    def _browser_operation(self, deadline: float | None = None, *, allow_pending_cart: bool = False):
         if deadline is None:
             acquired = self.browser_lock.acquire()
         else:
@@ -287,6 +287,8 @@ class Application(RecipeOperations, PlanningOperations, OrderOperations, EmailOp
         if not acquired:
             raise HouseholdError("provider browser deadline reached")
         try:
+            if not allow_pending_cart and self.store.read().get("pending_cart_change"):
+                raise HouseholdError("reconcile_change before using the provider; a cart write is uncertain")
             yield
         finally:
             self.browser_lock.release()
@@ -321,7 +323,7 @@ class Application(RecipeOperations, PlanningOperations, OrderOperations, EmailOp
             elif operation == "products":
                 with self.product_plan_lock:
                     result = self._handle(request)
-            elif operation == "cart" and action in {"sync", "reconcile"}:
+            elif operation == "cart" and action != "get":
                 with self.product_plan_lock:
                     result = self._handle(request)
             elif (
@@ -372,16 +374,23 @@ class Application(RecipeOperations, PlanningOperations, OrderOperations, EmailOp
 
     def _handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         operation = request.get("operation")
+        if self.store.read().get("pending_cart_change") and (
+            (operation == "cart" and request.get("action", "get") not in {"get", "reconcile_change"})
+            or (operation == "products" and request.get("action") == "apply")
+            or operation == "checkout"
+            or (operation == "orders" and request.get("action") not in {None, "list", "get"})
+        ):
+            raise HouseholdError("reconcile_change before continuing; the previous cart write is uncertain")
         if operation == "health":
             return {"ok": True, "integration": self.integration}
         if operation == "status":
             state = self.store.read()
-            if self.provider == "meny" and self.integration.get("status") != "ready":
+            if self.provider == "meny" and self.integration.get("status") != "ready" and not state.get("pending_cart_change"):
                 deadline = time.monotonic() + MENY_READ_TIMEOUT
                 with self._browser_operation(deadline):
                     pending_status = (state.get("pending_checkout") or {}).get("status")
                     if pending_status not in UNRESOLVED_CHECKOUT_STATUSES:
-                        safe = not state.get("pending_checkout") and not state.get("pending_cancellation") and not state.get("order_change")
+                        safe = not state.get("pending_checkout") and not state.get("pending_cancellation") and not state.get("order_change") and not state.get("pending_cart_change")
                         self._refresh_integration(deadline, allow_recovery=safe)
             return {
                 **masked_status(self.store.read(), self.integration),
@@ -423,11 +432,11 @@ class Application(RecipeOperations, PlanningOperations, OrderOperations, EmailOp
         if meny_read:
             timeout = MENY_ORDER_TIMEOUT if operation in {"products", "delivery", "orders"} else MENY_READ_TIMEOUT
             deadline = time.monotonic() + timeout
-            with self._browser_operation(deadline):
+            with self._browser_operation(deadline, allow_pending_cart=operation == "cart" and action in {None, "get"}):
                 state = self.store.read()
                 if (state.get("pending_checkout") or {}).get("status") in UNRESOLVED_CHECKOUT_STATUSES:
                     raise HouseholdError("reconcile the pending MENY checkout before using another browser operation")
-                safe = not state.get("pending_checkout") and not state.get("pending_cancellation") and not state.get("order_change")
+                safe = not state.get("pending_checkout") and not state.get("pending_cancellation") and not state.get("order_change") and not state.get("pending_cart_change")
                 guarded = {**request, "_deadline": deadline, "_allow_browser_recovery": safe}
                 if operation == "catalog":
                     return self._catalog(guarded)
