@@ -3,18 +3,22 @@
 </p>
 
 <p align="center">
-  <a href="#requirements"><img src="assets/badges/hermes.svg" alt="Hermes Agent: supported"></a>
-  <a href="#supported-stores"><img src="assets/badges/groceries.svg" alt="Grocery providers: Oda and MENY"></a>
-  <a href="LICENSE"><img src="assets/badges/mit.svg" alt="License: MIT"></a>
+  <a href="#agent-support"><img src="assets/icons/hermes.png" alt="Hermes Agent: available now" title="Hermes Agent: available now" width="88" height="88"></a>
+  <a href="#agent-support"><img src="assets/icons/openclaw.png" alt="OpenClaw: coming soon" title="OpenClaw: coming soon" width="88" height="88"></a>
+  <a href="#agent-support"><img src="assets/icons/nanoclaw.png" alt="NanoClaw: coming soon" title="NanoClaw: coming soon" width="88" height="88"></a>
+  <a href="#agent-support"><img src="assets/icons/codex.png" alt="Codex: coming soon" title="Codex: coming soon" width="88" height="88"></a>
+  <a href="#agent-support"><img src="assets/icons/claude-code.png" alt="Claude Code: coming soon" title="Claude Code: coming soon" width="88" height="88"></a>
+  <a href="#agent-support"><img src="assets/icons/grok-bot.png" alt="Grok Bot: coming soon" title="Grok Bot: coming soon" width="88" height="88"></a>
 </p>
 
 <p align="center">
-  <a href="#agent-support"><img src="assets/badges/openclaw.svg" alt="OpenClaw: coming soon"></a>
-  <a href="#agent-support"><img src="assets/badges/nanoclaw.svg" alt="NanoClaw: coming soon"></a>
-  <a href="#agent-support"><img src="assets/badges/codex.svg" alt="Codex: coming soon"></a>
-  <br>
-  <a href="#agent-support"><img src="assets/badges/claude-code.svg" alt="Claude Code: coming soon"></a>
-  <a href="#agent-support"><img src="assets/badges/grok-bot.svg" alt="Grok Bot: coming soon"></a>
+  <strong>Available now:</strong> <a href="#agent-support">Hermes Agent</a><br>
+  <strong>Coming soon:</strong> OpenClaw · NanoClaw · Codex · Claude Code · Grok Bot
+</p>
+
+<p align="center">
+  <a href="#supported-stores"><img src="assets/icons/oda.png" alt="Oda" title="Oda" width="72" height="72"></a>
+  <a href="#supported-stores"><img src="assets/icons/meny.png" alt="MENY" title="MENY" width="144" height="72"></a>
 </p>
 
 **Plan meals, save recipes and shop for groceries through Hermes Agent.**
@@ -31,7 +35,8 @@ preferences, saved recipes and menus are stored locally.
 > “Show me the groceries we need and prepare checkout.”
 
 [Installation](#installation) · [First use](#first-use) ·
-[Troubleshooting](#troubleshooting) · [Technical reference](docs/reference.md)
+[Troubleshooting](#troubleshooting) · [Technical reference](docs/reference.md) ·
+[![MIT License](assets/badges/mit.svg)](LICENSE)
 
 ## What you can do
 
