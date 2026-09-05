@@ -157,7 +157,7 @@ class Application(RecipeOperations, PlanningOperations, OrderOperations, EmailOp
         return now()
 
     def __init__(
-        self, store: StateStore, provider_client: Any, browser: OdaBrowser,
+        self, store: StateStore, provider_client: Any, browser: OdaBrowser | None,
         *, email_provider_clients: Mapping[str, Any] | None = None,
         external_recipe_sources: Mapping[str, Any] | None = None,
         recipe_library_adapters: Mapping[str, RecipeLibraryAdapter] | None = None,
@@ -396,6 +396,7 @@ class Application(RecipeOperations, PlanningOperations, OrderOperations, EmailOp
                 **masked_status(self.store.read(), self.integration),
                 "confirmation_policy": self.confirmation_policy,
                 "workflow": workflow_status(self.store.read()),
+                **({"currency": "SEK", "checkout": "manual", "store_url": "https://www.mathem.se/se/"} if self.provider == "mathem" else {}),
             }
         if operation == "setup":
             return self._setup(request)
@@ -720,8 +721,8 @@ def config(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict) or not value.get("household"):
         raise SystemExit("invalid household config")
     provider = str(value.get("provider") or "oda").casefold()
-    if provider not in {"oda", "meny"}:
-        raise SystemExit("provider must be oda or meny")
+    if provider not in {"oda", "meny", "mathem"}:
+        raise SystemExit("provider must be oda, meny or mathem")
     value["provider"] = provider
     confirmation_policy = str(value.get("confirmation_policy") or "fresh").casefold()
     if confirmation_policy not in {"fresh", "standing"}:
@@ -788,10 +789,10 @@ def main() -> None:
         "uid": args.browser_uid,
         "gid": args.browser_gid,
     }
-    if settings["provider"] == "oda":
+    if settings["provider"] in {"oda", "mathem"}:
         if args.tokens is None:
-            raise SystemExit("--tokens is required for provider oda")
-        provider_client = OdaClient(args.tokens)
+            raise SystemExit(f"--tokens is required for provider {settings['provider']}")
+        provider_client = OdaClient(args.tokens, provider=settings["provider"])
     else:
         provider_client = MenyClient(
             **browser_arguments,
@@ -816,7 +817,7 @@ def main() -> None:
     app = Application(
         StateStore(args.state, settings),
         provider_client,
-        OdaBrowser(**browser_arguments),
+        None if settings["provider"] == "mathem" else OdaBrowser(**browser_arguments),
         email_provider_clients=email_provider_clients,
         recipe_library_adapters=recipe_library_adapters,
     )

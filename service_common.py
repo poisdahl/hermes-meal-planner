@@ -171,16 +171,16 @@ def require_provider_identity(value: Any, expected_order_id: str, *, tracking: b
 
 def email_job_provider(value: Mapping[str, Any]) -> str | None:
     provider = value.get("provider")
-    return provider if isinstance(provider, str) and provider in {"oda", "meny"} else None
+    return provider if isinstance(provider, str) and provider in {"oda", "meny", "mathem"} else None
 
 def email_automation_key(provider: str, order_id: str) -> str:
-    if provider not in {"oda", "meny"}:
+    if provider not in {"oda", "meny", "mathem"}:
         raise HouseholdError("email provider is invalid")
     order_id = safe_order_id(order_id)
     return f"meal-concierge-email-{hashlib.sha256(f'{provider}:{order_id}'.encode()).hexdigest()[:16]}"
 
 def email_automation_prompt(provider: str, order_id: str, delivery_date: str, automation_key: str) -> str:
-    if provider not in {"oda", "meny"}:
+    if provider not in {"oda", "meny", "mathem"}:
         raise HouseholdError("email provider is invalid")
     order_id = safe_order_id(order_id)
     try:
@@ -402,7 +402,7 @@ def validate_schedule(schedule: Mapping[str, Any], provider: str) -> float | Non
             raise HouseholdError(f"schedule delivery {key} is invalid")
     if schedule.get("auto_checkout"):
         if provider != "oda":
-            raise HouseholdError("MENY supports cart_ready scheduling; checkout continues manually in the browser")
+            raise HouseholdError(f"{provider.upper()} supports cart_ready scheduling; checkout continues manually in the browser")
         if maximum is None or not (delivery_weekday or delivery.get("latest_end")):
             raise HouseholdError("auto-checkout requires maximum total and a delivery weekday or latest end")
     return maximum_value

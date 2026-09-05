@@ -223,11 +223,11 @@ class OrderOperations:
         applicable = self._delivery_observation_applies(
             observation, state, cart=scope_cart, occurrence=occurrence,
         )
-        cart_delivery = cart_summary(scope_cart).get("delivery") if self.provider == "oda" else None
+        cart_delivery = cart_summary(scope_cart).get("delivery") if self.provider in {"oda", "mathem"} else None
         current_dates = None
         if applicable and isinstance(observation.get("slot"), Mapping):
             current_dates = [self._delivery_slot_date(observation["slot"])]
-        elif isinstance(cart_delivery, Mapping):
+        elif self.provider == "oda" and isinstance(cart_delivery, Mapping):
             oda_today = self._now().astimezone(ZoneInfo("Europe/Oslo")).date()
             current_dates = [oda_cart_delivery_window(cart_delivery, today=oda_today)["date"]]
         current_slots = self._normalized_provider_slots(current_dates, deadline=deadline)
@@ -235,11 +235,11 @@ class OrderOperations:
         if len(selected) > 1:
             raise HouseholdError("provider-selected delivery is ambiguous")
         selected_slot = selected[0] if selected else None
-        if self.provider == "oda":
+        if self.provider in {"oda", "mathem"}:
             if isinstance(cart_delivery, Mapping):
                 if (
                     selected_slot is None
-                    or not oda_cart_delivery_matches_slot(cart_delivery, selected_slot)
+                    or not oda_cart_delivery_matches_slot(cart_delivery, selected_slot, provider=self.provider)
                 ):
                     raise HouseholdError("Oda cart and selected delivery listing disagree")
             elif selected_slot is not None:
@@ -378,11 +378,11 @@ class OrderOperations:
             if self.provider == "meny"
             else self.oda.call("get_cart", {}, deadline=deadline)
         )
-        if self.provider == "oda":
+        if self.provider in {"oda", "mathem"}:
             cart_delivery = cart_summary(fresh_scope_cart).get("delivery")
             if (
                 not isinstance(cart_delivery, Mapping)
-                or not oda_cart_delivery_matches_slot(cart_delivery, verified)
+                or not oda_cart_delivery_matches_slot(cart_delivery, verified, provider=self.provider)
             ):
                 raise HouseholdError(
                     "automatic delivery selection is uncertain; provider cart and slots disagree"
@@ -428,9 +428,9 @@ class OrderOperations:
         target = expected_slot
         if target is None and applicable and isinstance(observation.get("slot"), Mapping):
             target = observation["slot"]
-        cart_delivery = cart_summary(scope_cart).get("delivery") if self.provider == "oda" else None
+        cart_delivery = cart_summary(scope_cart).get("delivery") if self.provider in {"oda", "mathem"} else None
         dates = [self._delivery_slot_date(target)] if isinstance(target, Mapping) else None
-        if dates is None and isinstance(cart_delivery, Mapping):
+        if dates is None and self.provider == "oda" and isinstance(cart_delivery, Mapping):
             oda_today = self._now().astimezone(ZoneInfo("Europe/Oslo")).date()
             dates = [oda_cart_delivery_window(cart_delivery, today=oda_today)["date"]]
         selected = [
@@ -439,11 +439,11 @@ class OrderOperations:
             )
             if slot["selected"]
         ]
-        if self.provider == "oda":
+        if self.provider in {"oda", "mathem"}:
             if isinstance(cart_delivery, Mapping):
                 if (
                     len(selected) != 1
-                    or not oda_cart_delivery_matches_slot(cart_delivery, selected[0])
+                    or not oda_cart_delivery_matches_slot(cart_delivery, selected[0], provider=self.provider)
                 ):
                     raise HouseholdError("Oda cart and selected delivery listing disagree")
             elif selected:
@@ -764,22 +764,22 @@ class OrderOperations:
                 change = deepcopy(state.get("order_change"))
                 if change and change.get("status") != "editing":
                     raise HouseholdError("the order change is still starting")
-                if self.provider == "oda":
+                if self.provider in {"oda", "mathem"}:
                     if change:
                         cart = cart_summary(self.oda.call("get_cart", {}, deadline=deadline))
                         if cart["items"]:
                             raise HouseholdError("an Oda delivery-window change must be prepared without staged item additions")
                     requested_dates = None
-                    if isinstance(slot_ref, str) and slot_ref.startswith("oda:"):
-                        requested_dates = [oda_delivery_slot_date(slot_ref)]
+                    if isinstance(slot_ref, str) and slot_ref.startswith(f"{self.provider}:"):
+                        requested_dates = [oda_delivery_slot_date(slot_ref, provider=self.provider)]
                     available = self._normalized_provider_slots(requested_dates, deadline=deadline)
                     candidates = [slot for slot in available if slot["slot_ref"] == slot_ref]
                     if len(candidates) != 1:
-                        raise HouseholdError("the requested Oda delivery slot is no longer available")
+                        raise HouseholdError("the requested provider delivery slot is no longer available")
                     candidate = candidates[0]
                     provider_slot_id = candidate["provider_slot_id"]
                     if provider_slot_id is None:
-                        raise HouseholdError("the requested Oda delivery slot has no provider id")
+                        raise HouseholdError("the requested provider delivery slot has no provider id")
                     arguments["delivery_slot_id"] = provider_slot_id
                     self.oda.call("select_delivery_slot", arguments, deadline=deadline)
                     selected_date = self._delivery_slot_date(candidate)
@@ -792,20 +792,20 @@ class OrderOperations:
                         or fresh[0]["slot_ref"] != slot_ref
                         or not self._same_delivery_identity(fresh[0], candidate)
                     ):
-                        raise HouseholdError("Oda delivery selection is uncertain; inspect the provider selection")
+                        raise HouseholdError(f"{self.provider.upper()} delivery selection is uncertain; inspect the provider selection")
                     normalized = fresh[0]
                     raw_cart = self.oda.call("get_cart", {}, deadline=deadline)
                     cart = cart_summary(raw_cart)
                     delivery = cart.get("delivery")
                     if (
                         not isinstance(delivery, Mapping)
-                        or not oda_cart_delivery_matches_slot(delivery, normalized)
+                        or not oda_cart_delivery_matches_slot(delivery, normalized, provider=self.provider)
                     ):
-                        raise HouseholdError("Oda delivery selection is uncertain; inspect the provider selection")
+                        raise HouseholdError(f"{self.provider.upper()} delivery selection is uncertain; inspect the provider selection")
                     if change:
                         display = delivery.get("display")
                         if not isinstance(display, str) or not display.strip() or len(display) > 500:
-                            raise HouseholdError("Oda delivery selection returned no verified display")
+                            raise HouseholdError(f"{self.provider.upper()} delivery selection returned no verified display")
                         requested = {
                             "slot_id": normalized["provider_slot_id"],
                             "display": display.strip(),
@@ -826,7 +826,7 @@ class OrderOperations:
                             occurrence=str(request.get("_occurrence") or "") or None,
                         )
                     response = {
-                        "provider": "oda",
+                        "provider": self.provider,
                         "selected": normalized,
                         "price_display": delivery_price_display(normalized),
                     }
@@ -872,6 +872,8 @@ class OrderOperations:
 
     def _orders(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "list")
+        if self.provider == "mathem" and action not in {"list", "get"}:
+            raise HouseholdError("Mathem order changes and cancellations must be completed at https://www.mathem.se/se/account/orders/")
         cancellation_deadline = time.monotonic() + CANCELLATION_OPERATION_TIMEOUT if action in {"cancel_prepare", "cancel_confirm", "cancel_reconcile", "cancel_submit"} else None
         if action == "list":
             limit = bounded_limit(request.get("limit"), default=10)
@@ -1322,6 +1324,8 @@ class OrderOperations:
 
     def _checkout(self, request: Mapping[str, Any]) -> dict[str, Any]:
         action = request.get("action", "prepare")
+        if self.provider == "mathem" and action not in {"prepare", "auto"}:
+            raise HouseholdError("Mathem checkout is manual; use prepare for the cart summary and finish at https://www.mathem.se/se/cart/")
         deadline = time.monotonic() + (MENY_CHECKOUT_OPERATION_TIMEOUT if self.provider == "meny" else 240)
         if action == "prepare":
             occurrence = str(request.get("occurrence") or "") or None
@@ -1551,6 +1555,22 @@ class OrderOperations:
         cart_ready_continuation: bool = False,
         automatic_checkout: bool = False,
     ) -> dict[str, Any]:
+        if self.provider == "mathem":
+            if automatic_checkout:
+                raise HouseholdError("Mathem supports manual checkout only")
+            with self._browser_operation(deadline):
+                state = self.store.read()
+                if state.get("pending_checkout") or state.get("pending_cancellation") or state.get("order_change"):
+                    raise HouseholdError("finish the pending provider operation before manual checkout")
+                summary = cart_summary(self.oda.call("get_cart", {}, deadline=deadline))
+                return {
+                    "provider": "mathem", "currency": "SEK", "confirmed": False,
+                    "manual_checkout_required": True,
+                    "checkout_url": "https://www.mathem.se/se/cart/",
+                    "summary": summary,
+                    "occurrence": occurrence,
+                    "message": "Review delivery, final total and payment in Mathem and complete the order there.",
+                }
         with self.store.locked() as state:
             if state.get("pending_cart_change"):
                 raise HouseholdError("reconcile_change before checkout")

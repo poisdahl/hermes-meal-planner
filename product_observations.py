@@ -135,6 +135,19 @@ def _meny_detail_price(value: Any) -> tuple[int | None, bool, bool]:
     )
 
 
+def _mathem_ore(value: Any) -> int | None:
+    """Accept exact Swedish kronor displays; estimates remain unavailable."""
+    if not isinstance(value, str) or len(value) > 100:
+        return None
+    match = re.fullmatch(r"(0|[1-9]\d{0,6})(?:[,.](\d{2}))?[ \u00a0](?:kr|SEK)", value)
+    if match is None:
+        match = re.fullmatch(r"(?:kr|SEK)[ \u00a0](0|[1-9]\d{0,6})(?:[,.](\d{2}))?", value)
+    if match is None:
+        return _oda_ore(value)
+    amount = int(match[1]) * 100 + int(match[2] or "0")
+    return amount if amount <= MAX_MONEY_ORE else None
+
+
 def _oda_ore(value: Any) -> int | None:
     if not isinstance(value, str) or len(value) > 64:
         return None
@@ -198,6 +211,8 @@ def parse_package(value: Any, *, provider: str | None = None) -> dict[str, Any] 
     text = _display_text(value, maximum=300)
     if text is None or _VARIABLE.search(text):
         return None
+    if provider == "mathem":
+        text = re.sub(r"\bst\b", "stk", text, flags=re.IGNORECASE)
     parsed = _strict_package(text)
     if provider == "meny" and parsed is None:
         candidate = text
@@ -208,7 +223,7 @@ def parse_package(value: Any, *, provider: str | None = None) -> dict[str, Any] 
                 candidate = candidate[:-len(suffix)]
                 break
         parsed = _strict_package(candidate)
-    elif provider == "oda" and parsed is None:
+    elif provider in {"oda", "mathem"} and parsed is None:
         segments = [segment.strip() for segment in text.split(", ")]
         if len(segments) == 2 and _ODA_PERCENT_PREFIX.fullmatch(segments[0]):
             parsed = _strict_package(segments[1])
@@ -434,7 +449,7 @@ def _oda_items(value: Mapping[str, Any]) -> tuple[str, list[Any], bool]:
     return query, products, has_more
 
 
-def _normalize_oda_product(raw: Any, observed_at: str) -> dict[str, Any]:
+def _normalize_oda_product(raw: Any, observed_at: str, *, provider: str = "oda") -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise HouseholdError("Oda product result is invalid")
     product_id = raw.get("id")
@@ -445,7 +460,7 @@ def _normalize_oda_product(raw: Any, observed_at: str) -> dict[str, Any]:
         raise HouseholdError("Oda product result id is invalid")
     name = _bounded_text(raw.get("name"), required=True, maximum=300)
     package_text = _display_text(raw.get("description"), maximum=300)
-    package = parse_package(package_text, provider="oda")
+    package = parse_package(package_text, provider=provider)
     availability_value = raw.get("availability")
     if isinstance(availability_value, Mapping):
         is_available = availability_value.get("isAvailable")
@@ -453,7 +468,7 @@ def _normalize_oda_product(raw: Any, observed_at: str) -> dict[str, Any]:
         is_available = availability_value
     availability = "available" if is_available is True else "unavailable" if is_available is False else "unknown"
     price_value = raw.get("price")
-    exact_ore = _oda_ore(price_value)
+    exact_ore = _mathem_ore(price_value) if provider == "mathem" else _oda_ore(price_value)
     variable_price = bool(package_text and _VARIABLE.search(package_text)) and not (
         package is not None and package["unit"] == "count"
     )
@@ -481,7 +496,7 @@ def _normalize_oda_product(raw: Any, observed_at: str) -> dict[str, Any]:
         }.items() if value is not None
     }
     result: dict[str, Any] = {
-        "provider": "oda", "product_ref": product_id, "product_id": product_id,
+        "provider": provider, "product_ref": product_id, "product_id": product_id,
         "name": name, "availability": availability, "observed_at": observed_at,
         "purchase_options": [option], "display": display,
     }
@@ -520,16 +535,16 @@ def normalize_meny_product_search(value: Any, *, observed_at: str | None = None)
     }
 
 
-def normalize_oda_product_search(value: Any, *, observed_at: str | None = None) -> dict[str, Any]:
+def normalize_oda_product_search(value: Any, *, observed_at: str | None = None, provider: str = "oda") -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise HouseholdError("Oda product search result changed")
     timestamp = _observed_at(observed_at)
     query, products, has_more = _oda_items(value)
     if len(products) > MAX_PRODUCTS:
         raise HouseholdError("Oda product search returned too many products")
-    normalized = _deduplicate([_normalize_oda_product(product, timestamp) for product in products])
+    normalized = _deduplicate([_normalize_oda_product(product, timestamp, provider=provider) for product in products])
     return {
-        "provider": "oda", "query": query, "observed_at": timestamp,
+        "provider": provider, "query": query, "observed_at": timestamp,
         "scope": {"kind": "provider_search", "page": 1, "requested_size": len(products), "returned": len(normalized), "has_more": has_more, "semantics": "bounded_relevance_ranked"},
         "products": normalized,
     }

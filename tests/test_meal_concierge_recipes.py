@@ -2723,7 +2723,7 @@ class RecipeFlowTests(unittest.TestCase):
         self.assertEqual(shown["current"]["people"], 2)
         self.assertEqual(shown["current"]["confirmation_policy"], "fresh")
         self.assertEqual(shown["current"]["recipe_sources"], {
-            "internal": True, "oda": True, "meny": True, "themealdb": True, "wikibooks": True,
+            "internal": True, "oda": True, "meny": True, "mathem": False, "themealdb": True, "wikibooks": True,
         })
         blocked = self.app.handle({
             "operation": "menu", "action": "save", "interactive": True,
@@ -2814,7 +2814,8 @@ class RecipeFlowTests(unittest.TestCase):
                 4,
             )
         self.assertEqual(discovered["balanced_limit_per_source"], 1)
-        self.assertTrue(all(source["count"] == 1 for source in discovered["sources"]))
+        self.assertTrue(all(source["count"] == 1 for source in discovered["sources"] if source["enabled"]))
+        self.assertEqual(next(source["status"] for source in discovered["sources"] if source["source"] == "mathem"), "disabled")
 
         duplicate = external_recipe("themealdb", "Duplicate soup", "duplicate-1")
         app.recipes.save(duplicate)

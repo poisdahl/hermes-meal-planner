@@ -17,11 +17,12 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from core import HouseholdError, cart_summary, validate_delivery_slot
-from product_observations import normalize_oda_product_search
+from product_observations import _mathem_ore, normalize_oda_product_search
 
 
 ODA_ENDPOINT = "https://oda.com/mcp"
 SERVER_NAME = "oda-weekly"
+MATHEM_ENDPOINT = "https://www.mathem.se/mcp"
 REQUIRED_TOOLS = frozenset({
     "product_search", "recipe_search", "likely_to_buy", "get_cart",
     "manipulate_cart", "get_delivery_addresses", "get_delivery_slots",
@@ -67,8 +68,9 @@ def _oda_price(value: Any) -> tuple[int | None, str]:
     return int(match[1]) * 100, "exact"
 
 
-def oda_delivery_slot_date(value: Any) -> str:
-    match = ODA_SLOT_REF.fullmatch(str(value or ""))
+def oda_delivery_slot_date(value: Any, *, provider: str = "oda") -> str:
+    pattern = ODA_SLOT_REF if provider == "oda" else re.compile(r"mathem:(\d{4}-\d{2}-\d{2}):(0|[1-9]\d*)")
+    match = pattern.fullmatch(str(value or ""))
     if match is None:
         raise HouseholdError("Oda delivery slot_ref is invalid")
     try:
@@ -112,10 +114,17 @@ def oda_cart_delivery_matches_slot(
     slot_value: Any,
     *,
     today: date | None = None,
+    provider: str = "oda",
 ) -> bool:
     """Bind Oda's selected cart display to the normalized selected slot."""
 
     slot = validate_delivery_slot(slot_value)
+    if provider == "mathem":
+        return (
+            isinstance(cart_delivery, Mapping)
+            and type(cart_delivery.get("slot_id")) is int
+            and cart_delivery["slot_id"] == slot["provider_slot_id"]
+        )
     start = datetime.fromisoformat(slot["start_at"].replace("Z", "+00:00")).astimezone(
         ZoneInfo("Europe/Oslo")
     )
@@ -131,7 +140,7 @@ def oda_cart_delivery_matches_slot(
     )
 
 
-def normalize_oda_delivery_slot(value: Any) -> dict[str, Any]:
+def normalize_oda_delivery_slot(value: Any, *, provider: str = "oda") -> dict[str, Any]:
     """Normalize one slot using only the sanitized, fixture-backed Oda fields."""
 
     required = {
@@ -150,9 +159,12 @@ def normalize_oda_delivery_slot(value: Any) -> dict[str, Any]:
     if end <= start:
         raise HouseholdError("Oda delivery slot must end after it starts")
     price_ore, price_kind = _oda_price(value.get("price"))
-    delivery_date = start.astimezone(ZoneInfo("Europe/Oslo")).date().isoformat()
+    if provider == "mathem":
+        price_ore = _mathem_ore(value.get("price"))
+        price_kind = "exact" if price_ore is not None else "unavailable"
+    delivery_date = start.astimezone(ZoneInfo("Europe/Stockholm" if provider == "mathem" else "Europe/Oslo")).date().isoformat()
     return validate_delivery_slot({
-        "slot_ref": f"oda:{delivery_date}:{provider_id}",
+        "slot_ref": f"{provider}:{delivery_date}:{provider_id}",
         "provider_slot_id": provider_id,
         "start_at": start_at,
         "end_at": end_at,
@@ -162,7 +174,7 @@ def normalize_oda_delivery_slot(value: Any) -> dict[str, Any]:
     })
 
 
-def normalize_oda_delivery_slots(value: Any) -> dict[str, Any]:
+def normalize_oda_delivery_slots(value: Any, *, provider: str = "oda") -> dict[str, Any]:
     """Return only selectable slots from one exact Oda delivery-date response."""
 
     if not isinstance(value, Mapping) or set(value) != {"deliveryDate", "slots"}:
@@ -182,9 +194,9 @@ def normalize_oda_delivery_slots(value: Any) -> dict[str, Any]:
             raise HouseholdError("Oda delivery slot availability changed")
         if raw["isFull"] or raw["isUnavailable"]:
             continue
-        slot = normalize_oda_delivery_slot(raw)
+        slot = normalize_oda_delivery_slot(raw, provider=provider)
         start = datetime.fromisoformat(slot["start_at"].replace("Z", "+00:00"))
-        if start.astimezone(ZoneInfo("Europe/Oslo")).date() != delivery_date:
+        if start.astimezone(ZoneInfo("Europe/Stockholm" if provider == "mathem" else "Europe/Oslo")).date() != delivery_date:
             raise HouseholdError("Oda delivery slot date changed")
         slots.append(slot)
     references: dict[str, dict[str, Any]] = {}
@@ -196,7 +208,7 @@ def normalize_oda_delivery_slots(value: Any) -> dict[str, Any]:
     if sum(slot["selected"] for slot in references.values()) > 1:
         raise HouseholdError("Oda selected delivery slot is ambiguous")
     return {
-        "provider": "oda",
+        "provider": provider,
         "delivery_date": delivery_date.isoformat(),
         "slots": list(references.values()),
     }
@@ -216,7 +228,13 @@ def _json_value(value: Any) -> Any:
 
 
 class OdaClient:
-    def __init__(self, token_directory: Path | str):
+    def __init__(self, token_directory: Path | str, *, provider: str = "oda"):
+        if provider not in {"oda", "mathem"}:
+            raise HouseholdError("MCP provider must be oda or mathem")
+        self.provider = provider
+        self.label = "Mathem" if provider == "mathem" else "Oda"
+        self.endpoint = MATHEM_ENDPOINT if provider == "mathem" else ODA_ENDPOINT
+        self.server_name = "mathem-weekly" if provider == "mathem" else SERVER_NAME
         self.token_directory = Path(token_directory)
 
     def probe(self) -> dict[str, Any]:
@@ -224,22 +242,22 @@ class OdaClient:
 
     def call(self, tool: str, arguments: Mapping[str, Any], *, deadline: float | None = None) -> dict[str, Any]:
         if not isinstance(tool, str) or not tool:
-            raise HouseholdError("Oda tool is missing")
+            raise HouseholdError(f"{self.label} tool is missing")
         timeout = 90.0 if deadline is None else deadline - time.monotonic()
         if timeout <= 0:
-            raise HouseholdError("Oda operation deadline reached")
+            raise HouseholdError(f"{self.label} operation deadline reached")
         return self._run(tool, dict(arguments), min(timeout, 90.0))
 
     def _run(self, tool: str | None, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
         if not self.token_directory.is_dir():
-            raise HouseholdError("Oda login is required")
+            raise HouseholdError(f"{self.label} login is required")
         with self._lock():
             try:
                 return asyncio.run(self._run_async(tool, arguments, timeout))
             except HouseholdError:
                 raise
             except Exception as exc:
-                raise HouseholdError("Oda MCP is unavailable") from exc
+                raise HouseholdError(f"{self.label} MCP is unavailable") from exc
 
     async def _run_async(self, tool: str | None, arguments: dict[str, Any], timeout: float) -> dict[str, Any]:
         try:
@@ -259,43 +277,44 @@ class OdaClient:
             raise HouseholdError("Hermes MCP runtime is unavailable") from exc
 
         token_directory = self.token_directory
+        server_name = self.server_name
 
         class ExactStorage(HermesTokenStorage):
             def __init__(self) -> None:
-                super().__init__(SERVER_NAME, hermes_home=token_directory.parent)
+                super().__init__(server_name, hermes_home=token_directory.parent)
 
             def _tokens_path(self) -> Path:
-                return token_directory / f"{SERVER_NAME}.json"
+                return token_directory / f"{server_name}.json"
 
             def _client_info_path(self) -> Path:
-                return token_directory / f"{SERVER_NAME}.client.json"
+                return token_directory / f"{server_name}.client.json"
 
             def _meta_path(self) -> Path:
-                return token_directory / f"{SERVER_NAME}.meta.json"
+                return token_directory / f"{server_name}.meta.json"
 
         storage = ExactStorage()
         if not storage.has_cached_tokens() or _HERMES_PROVIDER_CLS is None:
-            raise HouseholdError("Oda login is required")
+            raise HouseholdError(f"{self.label} login is required")
         oauth_config: dict[str, Any] = {}
         _configure_callback_port(oauth_config, storage)
         port = oauth_config.get("_resolved_port", 0)
         provider = _HERMES_PROVIDER_CLS(
-            server_name=SERVER_NAME,
+            server_name=self.server_name,
             preregistered=False,
-            server_url=ODA_ENDPOINT,
+            server_url=self.endpoint,
             client_metadata=_build_client_metadata(oauth_config),
             storage=storage,
             redirect_handler=_make_redirect_handler(port),
             callback_handler=_make_callback_waiter(port, timeout=min(30.0, timeout)),
         )
         provider._hermes_home = str(token_directory.parent.resolve())
-        original = httpx.URL(ODA_ENDPOINT)
+        original = httpx.URL(self.endpoint)
 
         async def same_origin(response: Any) -> None:
             if response.is_redirect and response.next_request is not None:
                 target = response.next_request.url
                 if (target.scheme, target.host, target.port) != (original.scheme, original.host, original.port):
-                    raise HouseholdError("Oda MCP redirected outside Oda")
+                    raise HouseholdError(f"{self.label} MCP redirected outside its store")
 
         async with httpx.AsyncClient(
             auth=provider,
@@ -304,7 +323,7 @@ class OdaClient:
             timeout=httpx.Timeout(timeout, read=min(60.0, timeout)),
             event_hooks={"response": [same_origin]},
         ) as client:
-            async with streamable_http_client(ODA_ENDPOINT, http_client=client, terminate_on_close=False) as streams:
+            async with streamable_http_client(self.endpoint, http_client=client, terminate_on_close=False) as streams:
                 async with ClientSession(streams[0], streams[1], read_timeout_seconds=timeout) as session:
                     async with asyncio.timeout(timeout):
                         initialized = await session.initialize()
@@ -319,7 +338,7 @@ class OdaClient:
                         names = {str(getattr(item, "name", "")) for item in tools}
                         missing = sorted(REQUIRED_TOOLS - names)
                         if missing:
-                            raise HouseholdError("Oda MCP lacks required operations: " + ", ".join(missing))
+                            raise HouseholdError(f"{self.label} MCP lacks required operations: " + ", ".join(missing))
                         server_info = _json_value(getattr(initialized, "server_info", None))
                         protocol = str(getattr(initialized, "protocol_version", ""))
                         status = {
@@ -332,18 +351,18 @@ class OdaClient:
                         if tool is None:
                             return status
                         if tool not in names:
-                            raise HouseholdError(f"Oda does not expose {tool}")
+                            raise HouseholdError(f"{self.label} does not expose {tool}")
                         result = await session.call_tool(tool, arguments)
         if bool(getattr(result, "is_error", getattr(result, "isError", False))):
-            raise HouseholdError("Oda rejected the operation")
+            raise HouseholdError(f"{self.label} rejected the operation")
         structured = getattr(result, "structured_content", getattr(result, "structuredContent", None))
         value = _json_value(structured)
         if not isinstance(value, dict):
-            raise HouseholdError("Oda returned no structured result")
+            raise HouseholdError(f"{self.label} returned no structured result")
         if tool == "get_delivery_slots":
-            return normalize_oda_delivery_slots(value)
+            return normalize_oda_delivery_slots(value, provider=self.provider)
         if tool == "product_search":
-            normalized = normalize_oda_product_search(value)
+            normalized = normalize_oda_product_search(value, provider=self.provider)
             requested_size = arguments.get("size")
             if isinstance(requested_size, int) and not isinstance(requested_size, bool):
                 normalized["scope"]["requested_size"] = requested_size
@@ -352,13 +371,13 @@ class OdaClient:
 
     @contextmanager
     def _lock(self):
-        path = self.token_directory / ".oda-household.lock"
+        path = self.token_directory / f".{self.provider}-household.lock"
         descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
-                raise HouseholdError("another Oda operation is active") from exc
+                raise HouseholdError(f"another {self.label} operation is active") from exc
             yield
         finally:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -366,11 +385,12 @@ class OdaClient:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Read-only Oda MCP startup/preflight check")
+    parser = argparse.ArgumentParser(description="Read-only Oda/Mathem MCP startup/preflight check")
+    parser.add_argument("--provider", choices=("oda", "mathem"), default="oda")
     parser.add_argument("--tokens", type=Path, required=True)
     parser.add_argument("--state", action="store_true", help="also read a secret-free cart/order baseline")
     args = parser.parse_args()
-    client = OdaClient(args.tokens)
+    client = OdaClient(args.tokens, provider=args.provider)
     probe = client.probe()
     output: dict[str, Any] = {
         "status": probe["status"],

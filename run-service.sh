@@ -80,9 +80,12 @@ find_chromium() {
 }
 
 python="$(find_hermes_python)"
-agent_browser="$(find_agent_browser)"
-chromium="$(find_chromium)"
 provider="$("$python" -c 'from pathlib import Path; from service import config; import sys; print(config(Path(sys.argv[1]))["provider"])' "$config_path")"
+
+if [[ "$provider" != "mathem" ]]; then
+  agent_browser="$(find_agent_browser)"
+  chromium="$(find_chromium)"
+fi
 
 umask 077
 mkdir -p "$private_root" "$state_path" "$browser_home" "$browser_profile" "$browser_socket_directory" "$(dirname -- "$socket_path")"
@@ -96,13 +99,15 @@ service_args=(
   --socket "$socket_path"
   --agent-uid "$(id -u)"
   --socket-group "$(id -g)"
-  --browser-binary "$agent_browser"
-  --browser-executable "$chromium"
   --browser-profile "$browser_profile"
   --browser-home "$browser_home"
   --browser-socket-directory "$browser_socket_directory"
   --browser-uid "$(id -u)"
   --browser-gid "$(id -g)"
 )
+
+if [[ "$provider" != "mathem" ]]; then
+  service_args+=(--browser-binary "$agent_browser" --browser-executable "$chromium")
+fi
 
 exec "${service_args[@]}"
