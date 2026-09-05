@@ -911,6 +911,8 @@ class OrderOperations:
             with self._browser_operation(deadline):
                 with self.store.locked() as state:
                     active = deepcopy(state.get("order_change"))
+                    if state.get("pending_cart_change"):
+                        raise HouseholdError("reconcile_change before changing the order")
                     if active:
                         raise HouseholdError("another order change is active; abort it before changing a different order")
                     if state.get("pending_checkout") or state.get("pending_cancellation"):
@@ -936,8 +938,15 @@ class OrderOperations:
                     if status != "paid_and_modifiable":
                         raise HouseholdError("Oda order is not currently modifiable")
                     cart = cart_summary(self.oda.call("get_cart", {}))
-                    if cart["items"]:
-                        raise HouseholdError("empty the Oda cart before starting an addition to an existing order")
+                    quantities, _names = self._cart_lines(cart)
+                    digest = self._cart_digest(quantities)
+                    if cart["items"] and request.get("cart_digest") != digest:
+                        with self.store.locked() as state:
+                            if canonical(state.get("order_change")) == canonical(reservation):
+                                state["order_change"] = None
+                        return {"editing": False, "cart_confirmation_required": True,
+                                "order_id": order_id, "cart": cart, "cart_digest": digest,
+                                "next": "Preserve these goods. Pass this cart_digest only when the user has authorized all shown staged goods for this exact order; otherwise clarify their destination."}
                     started = {"provider": "oda", "order_id": order_id, "editing": True}
                     code = ""
                 change = {
@@ -947,6 +956,7 @@ class OrderOperations:
                     "status": "editing",
                     "started_at": reservation["started_at"],
                     **({"code": code} if code else {}),
+                    **({"expected_cart_quantities": quantities, "starting_cart_quantities": quantities} if self.provider == "oda" else {}),
                 }
                 with self.store.locked() as state:
                     if canonical(state.get("order_change")) != canonical(reservation):
@@ -970,7 +980,7 @@ class OrderOperations:
                     if canonical(state.get("order_change")) == canonical(reservation):
                         state["order_change"] = None
                 raise
-            return {**started, **change, "next": "Change the cart or delivery, then prepare checkout for this exact order."}
+            return {**started, **change, "next": "Use cart ensure for minimum quantities (Oda includes goods already ordered), or change for explicit extra quantities. If no additions are needed, abort the empty edit. Otherwise prepare/submit checkout for this exact order; provider permission is rechecked, never infer a fixed cutoff."}
         if action == "change_abort":
             with self.store.locked() as state:
                 change = deepcopy(state.get("order_change"))
@@ -1027,8 +1037,10 @@ class OrderOperations:
                 else:
                     if change.get("status") == "starting":
                         result = {"provider": "oda", "order_id": change["order_id"], "aborted": True, "recovered": True}
-                    elif cart_summary(self.oda.call("get_cart", {}))["items"]:
-                        raise HouseholdError("remove the staged Oda additions before aborting the order change")
+                    elif request.get("retain_cart") is True:
+                        result = {"provider": "oda", "order_id": change["order_id"], "aborted": True, "cart_retained": True}
+                    elif self._cart_lines(cart_summary(self.oda.call("get_cart", {})))[0] != change.get("starting_cart_quantities", {}):
+                        raise HouseholdError("abort with retain_cart=true to preserve the staged Oda additions, or remove them before aborting")
                     else:
                         result = {"provider": "oda", "order_id": change["order_id"], "aborted": True}
                 with self.store.locked() as state:
@@ -1540,6 +1552,8 @@ class OrderOperations:
         automatic_checkout: bool = False,
     ) -> dict[str, Any]:
         with self.store.locked() as state:
+            if state.get("pending_cart_change"):
+                raise HouseholdError("reconcile_change before checkout")
             if cart_ready_continuation:
                 record = state.get("occurrences", {}).get(occurrence)
                 if not isinstance(record, Mapping) or record.get("status") != "cart_ready":
@@ -1590,6 +1604,8 @@ class OrderOperations:
                 raise HouseholdError("the target Oda order changed; begin the order change again")
         cart = self.oda.call("get_cart", {}, deadline=deadline, allow_recovery=allow_recovery) if self.provider == "meny" else self.oda.call("get_cart", {}, deadline=deadline)
         summary = cart_summary(cart)
+        if order_change and self.provider == "oda" and self._cart_lines(summary)[0] != order_change.get("expected_cart_quantities", {}):
+            raise HouseholdError("Oda addition cart changed outside this edit; abort with retain_cart=true and review the goods before checkout")
         cart_plan_baseline = None
         if not order_change and isinstance(menu_baseline, Mapping):
             cart_gate = self._cart_checkout_gate(summary, menu_baseline)
@@ -1826,6 +1842,8 @@ class OrderOperations:
             with self._browser_operation(deadline):
                 with self.store.locked() as state:
                     current_pending = state.get("pending_checkout")
+                    if state.get("pending_cart_change"):
+                        raise HouseholdError("reconcile_change before checkout")
                     if not current_pending or current_pending.get("status") != "awaiting_confirmation" or canonical(current_pending) != canonical(pending):
                         raise HouseholdError("no fresh checkout confirmation is pending")
                     if (state.get("pending_cancellation") or {}).get("status") in {"clicking", "uncertain"}:

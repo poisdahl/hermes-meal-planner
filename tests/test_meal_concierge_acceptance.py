@@ -332,3 +332,289 @@ class ReviewAcceptanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class GroceryTopupTests(unittest.TestCase):
+    def household(self, provider="oda"):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        return flow_fixture.CartPlanTests.app(temp.name, provider)
+
+    def quantities(self, app, provider):
+        return app._cart_lines(cart_summary(provider.cart))[0]
+
+    def ensure(self, app, product, minimum):
+        return app.handle({"operation": "cart", "action": "ensure", "requirements": [
+            {"product_id": product, "product_name": "Exact selected product", "quantity": minimum}]})
+
+    def approve(self, app, provider):
+        state = app.store.read()
+        question = app._cart_checkout_gate(cart_summary(provider.cart), state["menu"])
+        if question:
+            app.handle({"operation": "cart", "action": "reconcile", "menu_ref": app._cart_menu_ref(state["menu"]),
+                        "decision": "keep_current", "cart_digest": question["cart_plan"]["cart_digest"]})
+
+    def order(self, provider):
+        provider.orders = [{"orderNumber": "topup-order", "grossAmount": 100.0,
+            "deliveryDate": "2026-09-05", "deliverySlotDisplay": "Lør 5. sep 09:00 - 12:00",
+            "deliveryAddressId": 7,
+            "products": [{"product": {"id": 10, "name": "Cheese"}, "quantity": 2, "totalGrossAmount": "100.00"}]}]
+
+    def test_menu_topups_are_preserved_across_repeat_restart_and_new_requirements(self):
+        for name in ("oda", "meny"):
+            with self.subTest(provider=name):
+                store, provider, browser, app, product = self.household(name)
+                flow_fixture.CartPlanTests.sync(app, product, 2)
+                self.approve(app, provider)
+                original_menu = store.read()["menu"]
+                self.assertTrue(self.ensure(app, product, 3)["ensured"])
+                self.assertEqual(self.quantities(app, provider)[product], 3)
+                self.assertIsNone(app._cart_checkout_gate(cart_summary(provider.cart), original_menu))
+                reopened = Application(StateStore(store.directory, store.config), provider, browser)
+                writes = sum(tool == "manipulate_cart" for tool, _ in provider.calls)
+                self.assertTrue(self.ensure(reopened, product, 3)["idempotent"])
+                self.assertEqual(writes, sum(tool == "manipulate_cart" for tool, _ in provider.calls))
+                flow_fixture.CartPlanTests.sync(reopened, product, 4)
+                self.assertEqual(self.quantities(app, provider)[product], 5)
+                self.assertEqual(store.read()["menu"], original_menu)
+
+    def test_meny_large_topup_is_split_into_verified_batches(self):
+        store, provider, _browser, app, product = self.household("meny")
+        result = self.ensure(app, product, 6)
+        self.assertTrue(result["ensured"])
+        batches = [args["operations"] for tool, args in provider.calls if tool == "manipulate_cart"]
+        self.assertEqual([sum(abs(row["quantity"]) for row in batch) for batch in batches], [2, 2, 1])
+        self.assertEqual(self.quantities(app, provider)[product], 6)
+        self.assertFalse(store.read().get("pending_cart_change"))
+
+    def test_excluded_supplement_does_not_return_with_changed_menu_requirements(self):
+        store, provider, _browser, app, product = self.household()
+        flow_fixture.CartPlanTests.sync(app, product, 1)
+        self.approve(app, provider)
+        self.ensure(app, "20", 1)
+        provider._mutate_cart({"operations": [{"productId": 99, "quantity": 1}]})
+        question = app._cart_checkout_gate(cart_summary(provider.cart), store.read()["menu"])
+        digest = question["cart_plan"]["cart_digest"]
+        removed = app.handle({"operation": "cart", "action": "reconcile", "menu_ref": app._cart_menu_ref(store.read()["menu"]),
+                              "cart_digest": digest, "decision": "keep_current", "exclude_product_ids": ["20"]})
+        self.assertTrue(removed["reconciled"])
+        flow_fixture.CartPlanTests.sync(app, product, 2)
+        self.assertNotIn("20", self.quantities(app, provider))
+        self.assertNotIn("20", store.read()["cart_plan"]["supplemental_quantities"])
+
+    def test_late_provider_write_is_not_repeated_even_after_restart(self):
+        store, provider, browser, app, product = self.household()
+        original = provider.call
+        queued = []
+        def delayed(tool, args, **kwargs):
+            if tool == "manipulate_cart":
+                queued.append(deepcopy(args))
+                raise HouseholdError("transport timed out before delayed acknowledgement")
+            return original(tool, args, **kwargs)
+        provider.call = delayed
+        with self.assertRaisesRegex(HouseholdError, "timed out"):
+            self.ensure(app, product, 2)
+        reopened = Application(StateStore(store.directory, store.config), provider, browser)
+        with self.assertRaisesRegex(HouseholdError, "reconcile_change"):
+            self.ensure(reopened, product, 2)
+        with self.assertRaisesRegex(HouseholdError, "still uncertain"):
+            reopened.handle({"operation": "cart", "action": "reconcile_change"})
+        with self.assertRaisesRegex(HouseholdError, "reconcile_change"):
+            reopened.handle({"operation": "checkout", "action": "prepare"})
+        self.assertEqual(len(queued), 1)
+        provider._mutate_cart(queued[0])
+        provider.call = original
+        self.assertTrue(reopened.handle({"operation": "cart", "action": "reconcile_change"})["reconciled"])
+        self.assertTrue(self.ensure(reopened, product, 2)["idempotent"])
+        self.assertEqual(self.quantities(app, provider)[product], 2)
+        self.assertEqual(store.read()["cart_plan"]["supplemental_quantities"][product], 1)
+
+    def test_existing_oda_order_counts_ordered_goods_and_real_editability(self):
+        store, provider, _browser, app, _product = self.household()
+        self.order(provider)
+        provider.cart.update(items=[], count=0, subtotal=0.0)
+        # Provider still permits this specific order after a nominal 20:00 cutoff.
+        with mock.patch("service.now", return_value=datetime(2026, 9, 4, 23, 30, tzinfo=timezone.utc)):
+            self.assertTrue(app.handle({"operation": "orders", "action": "change_begin", "order_id": "topup-order"})["editing"])
+            self.assertTrue(self.ensure(app, "10", 2)["idempotent"])
+            self.ensure(app, "10", 3)
+            self.assertEqual(self.quantities(app, provider), {"10": 1})
+            self.assertTrue(self.ensure(app, "10", 3)["idempotent"])
+        provider.tracking = "paid_and_not_modifiable"
+        with self.assertRaisesRegex(HouseholdError, "no longer allows"):
+            self.ensure(app, "20", 1)
+        self.assertEqual(self.quantities(app, provider), {"10": 1})
+        self.assertTrue(app.handle({"operation": "orders", "action": "change_abort", "order_id": "topup-order", "retain_cart": True})["cart_retained"])
+        self.assertIsNone(store.read()["order_change"])
+        with self.assertRaisesRegex(HouseholdError, "not currently modifiable"):
+            app.handle({"operation": "orders", "action": "change_begin", "order_id": "topup-order"})
+
+    def test_existing_cart_is_preserved_and_requires_exact_destination_approval(self):
+        store, provider, _browser, app, _product = self.household()
+        self.order(provider)
+        baseline = deepcopy(provider.cart)
+        question = app.handle({"operation": "orders", "action": "change_begin", "order_id": "topup-order"})
+        self.assertTrue(question["cart_confirmation_required"])
+        self.assertEqual(provider.cart, baseline)
+        self.assertIsNone(store.read()["order_change"])
+        request = {"operation": "orders", "action": "change_begin", "order_id": "topup-order", "cart_digest": question["cart_digest"]}
+        self.assertTrue(app.handle(request)["editing"])
+        self.assertTrue(app.handle({"operation": "orders", "action": "change_abort", "order_id": "topup-order"})["aborted"])
+        self.assertEqual(provider.cart, baseline)
+        provider._mutate_cart({"operations": [{"productId": 99, "quantity": 1}]})
+        self.assertTrue(app.handle(request)["cart_confirmation_required"])
+        request["cart_digest"] = app._cart_digest(self.quantities(app, provider))
+        app.handle(request)
+        provider._mutate_cart({"operations": [{"productId": 100, "quantity": 1}]})
+        for operation in ({"operation": "checkout", "action": "prepare"},
+                          {"operation": "cart", "action": "ensure", "requirements": [{"product_id": "10", "product_name": "Cheese", "quantity": 1}]}):
+            with self.assertRaisesRegex(HouseholdError, "changed outside"):
+                app.handle(operation)
+        self.assertIn("100", self.quantities(app, provider))
+
+    def test_meny_disabled_order_edit_controls_do_not_dispatch(self):
+        client = flow_fixture.MenyClientTests().client()
+        client._get_order = mock.Mock(return_value={"orderNumber": "99990001", "code": "TEST-CODE"})
+        client._eval = mock.Mock(return_value={"ready": False})
+        client._invoke = mock.Mock()
+        with self.assertRaisesRegex(HouseholdError, "cannot be changed now"):
+            client.begin_order_change("99990001")
+        client._invoke.assert_not_called()
+
+    def test_parallel_minimum_requests_and_uncertain_second_meny_batch(self):
+        store, provider, browser, app, product = self.household("meny")
+        original = provider.call
+        writes = []
+        def interrupted(tool, args, **kwargs):
+            if tool == "manipulate_cart":
+                writes.append(deepcopy(args))
+                result = original(tool, args, **kwargs)
+                if len(writes) == 2:
+                    raise HouseholdError("second batch response lost")
+                return result
+            return original(tool, args, **kwargs)
+        provider.call = interrupted
+        with self.assertRaisesRegex(HouseholdError, "response lost"):
+            self.ensure(app, product, 6)
+        self.assertEqual(self.quantities(app, provider)[product], 5)
+        reopened = Application(StateStore(store.directory, store.config), provider, browser)
+        self.assertEqual(reopened.handle({"operation": "status"})["workflow"]["next_action"]["action"], "reconcile_change")
+        reopened.handle({"operation": "cart", "action": "reconcile_change"})
+        provider.call = original
+        results, errors = [], []
+        def ensure():
+            try:
+                results.append(self.ensure(reopened, product, 6))
+            except Exception as error:
+                errors.append(str(error))
+        threads = [threading.Thread(target=ensure) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(3)
+        self.assertFalse(errors)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(self.quantities(app, provider)[product], 6)
+        self.assertEqual(store.read()["cart_plan"]["supplemental_quantities"][product], 5)
+
+    def test_missing_supplement_needs_review_and_restore_survives_new_menu(self):
+        store, provider, _browser, app, product = self.household()
+        provider.cart.update(items=[], count=0, subtotal=0.0)
+        flow_fixture.CartPlanTests.sync(app, product, 1)
+        self.approve(app, provider)
+        self.ensure(app, product, 3)
+        provider._mutate_cart({"operations": [{"productId": 10, "quantity": -2}]})
+        question = app._cart_checkout_gate(cart_summary(provider.cart), store.read()["menu"])
+        self.assertEqual(question["cart_plan"]["items"][0]["missing_quantity"], 2)
+        restored = app.handle({"operation": "cart", "action": "reconcile", "decision": "restore_missing",
+                              "menu_ref": app._cart_menu_ref(store.read()["menu"]), "cart_digest": question["cart_plan"]["cart_digest"]})
+        self.assertTrue(restored["reconciled"])
+        plan = store.read()["cart_plan"]
+        self.assertEqual(plan["added_quantities"][product], 1)
+        self.assertEqual(plan["supplemental_quantities"][product], 2)
+        with store.locked() as state:
+            state["menu"] = flow_fixture.CartPlanTests.menu(revision=2, digest="b" * 64)
+        flow_fixture.CartPlanTests.sync(app, product, 2)
+        self.assertEqual(store.read()["cart_plan"]["supplemental_quantities"][product], 2)
+        self.assertEqual(app._cart_target(store.read()["cart_plan"])[product], 4)
+
+    def test_meny_proven_stop_recovers_partial_without_resending(self):
+        from meny import MenyCartStoppedError
+        for applied in (0, 1):
+            with self.subTest(applied=applied):
+                store, provider, _browser, app, product = self.household("meny")
+                original = provider.call
+                def stopped(tool, args, **kwargs):
+                    if tool == "manipulate_cart":
+                        acknowledged = [{"productId": product, "quantity": 1}] if applied else []
+                        if acknowledged:
+                            provider._mutate_cart({"operations": acknowledged})
+                        raise MenyCartStoppedError("product control is unavailable", acknowledged)
+                    return original(tool, args, **kwargs)
+                provider.call = stopped
+                result = self.ensure(app, product, 3)
+                self.assertTrue(result["stopped"])
+                self.assertFalse(result["ensured"])
+                self.assertFalse(store.read().get("pending_cart_change"))
+                self.assertEqual(self.quantities(app, provider)[product], 1 + applied)
+                provider.call = original
+                self.ensure(app, product, 3)
+                self.assertEqual(self.quantities(app, provider)[product], 3)
+
+    def test_actual_meny_adapter_distinguishes_unavailable_from_uncertain_click(self):
+        from meny import MenyCartStoppedError
+        client = flow_fixture.MenyClientTests().client()
+        client._open = mock.Mock()
+        client._assert_authenticated = mock.Mock()
+        client._sleep = mock.Mock()
+        client._product_control = mock.Mock(return_value={"authenticated": True, "ready": False})
+        client._click_cart_control = mock.Mock()
+        with self.assertRaises(MenyCartStoppedError) as caught:
+            client._change_cart({"operations": [{"productId": flow_fixture.MENY_PRODUCT, "quantity": 1}]})
+        self.assertEqual(caught.exception.applied_operations, [])
+        client._click_cart_control.assert_not_called()
+        client._product_control.return_value = {"authenticated": True, "ready": True, "quantity": 1, "label": "add"}
+        client._click_cart_control.side_effect = HouseholdError("transport response lost")
+        with self.assertRaises(HouseholdError) as caught:
+            client._change_cart({"operations": [{"productId": flow_fixture.MENY_PRODUCT, "quantity": 1}]})
+        self.assertNotIsInstance(caught.exception, MenyCartStoppedError)
+
+    def test_stopped_meny_batch_keeps_journal_until_earlier_click_is_read_back(self):
+        from meny import MenyCartStoppedError
+        store, provider, _browser, app, product = self.household("meny")
+        original = provider.call
+        def delayed_prefix(tool, args, **kwargs):
+            if tool == "manipulate_cart":
+                raise MenyCartStoppedError("stopped before second click", [{"productId": product, "quantity": 1}])
+            return original(tool, args, **kwargs)
+        provider.call = delayed_prefix
+        with self.assertRaisesRegex(HouseholdError, "still uncertain"):
+            self.ensure(app, product, 3)
+        self.assertTrue(store.read().get("pending_cart_change"))
+        with self.assertRaisesRegex(HouseholdError, "reconcile_change"):
+            self.ensure(app, product, 3)
+        provider._mutate_cart({"operations": [{"productId": product, "quantity": 1}]})
+        app.handle({"operation": "cart", "action": "reconcile_change"})
+        provider.call = original
+        self.ensure(app, product, 3)
+        self.assertEqual(self.quantities(app, provider)[product], 3)
+
+    def test_meny_cart_removal_preserves_the_dispatch_boundary(self):
+        from meny import MenyCartStoppedError
+        client = flow_fixture.MenyClientTests().client()
+        product = flow_fixture.MENY_PRODUCT
+        client._open = mock.Mock()
+        client._assert_authenticated = mock.Mock()
+        client._sleep = mock.Mock()
+        client._product_control = mock.Mock(return_value={"authenticated": True, "ready": False})
+        client._read_cart = mock.Mock(return_value={"items": [{"product_id": product, "quantity": 1}]})
+        client._click_cart_remove_control = mock.Mock(side_effect=HouseholdError("control unavailable"))
+        with self.assertRaises(MenyCartStoppedError) as caught:
+            client._change_cart({"operations": [{"productId": product, "quantity": -1}]})
+        self.assertEqual(caught.exception.applied_operations, [])
+        def lost_response(_product, _quantity, _code, before_dispatch):
+            before_dispatch()
+            raise HouseholdError("response lost")
+        client._click_cart_remove_control.side_effect = lost_response
+        with self.assertRaises(HouseholdError) as caught:
+            client._change_cart({"operations": [{"productId": product, "quantity": -1}]})
+        self.assertNotIsInstance(caught.exception, MenyCartStoppedError)

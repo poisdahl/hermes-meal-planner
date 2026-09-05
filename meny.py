@@ -712,6 +712,14 @@ def meny_checkout_reviews_match(expected: Any, observed: Any) -> bool:
     return expected_identity is not None and expected_identity == identity(observed)
 
 
+class MenyCartStoppedError(HouseholdError):
+    """Stopped before the next click; earlier clicks still need cart readback."""
+
+    def __init__(self, message: str, applied_operations: list[dict[str, Any]] | None = None):
+        super().__init__(message)
+        self.applied_operations = applied_operations or []
+
+
 class MenyClient:
     """Expose the small provider interface used by the household service."""
 
@@ -805,7 +813,12 @@ class MenyClient:
             raise HouseholdError("MENY operation is not supported")
         timeout = MENY_CART_TIMEOUT if tool == "manipulate_cart" else MENY_ORDER_TIMEOUT if tool in {"get_delivery_slots", "select_delivery_slot", "get_orders", "get_order", "order_tracking"} else MENY_READ_TIMEOUT
         with self._locked_operation(timeout, deadline, allow_recovery=allow_recovery):
-            self._require_login()
+            try:
+                self._require_login()
+            except HouseholdError as exc:
+                if tool == "manipulate_cart":
+                    raise MenyCartStoppedError(str(exc)) from exc
+                raise
             if tool == "product_search":
                 queries = arguments.get("queries")
                 if not isinstance(queries, list) or len(queries) != 1:
@@ -1166,13 +1179,20 @@ class MenyClient:
                 raise HouseholdError(f"one MENY cart request can change at most {MAX_CART_CLICKS} units")
             validated.append((product, quantity))
         applied = 0
+        acknowledged = []
         try:
             for product, quantity in validated:
                 for _ in range(abs(quantity)):
-                    self._require_time(8)
+                    try:
+                        self._require_time(8)
+                    except HouseholdError as exc:
+                        raise MenyCartStoppedError(str(exc)) from exc
                     self._change_one(product, 1 if quantity > 0 else -1, order_change_code=order_change_code)
                     applied += 1
+                    acknowledged.append({"productId": product, "quantity": 1 if quantity > 0 else -1})
             return self._read_settled_cart()
+        except MenyCartStoppedError as exc:
+            raise MenyCartStoppedError(str(exc), acknowledged + exc.applied_operations) from exc
         except HouseholdError as exc:
             if applied:
                 raise HouseholdError("MENY cart changed partially; read the cart and do not retry this request") from exc
@@ -1196,25 +1216,27 @@ class MenyClient:
         raise HouseholdError("MENY cart quantities did not settle")
 
     def _change_one(self, product: str, delta: int, *, order_change_code: str | None = None) -> None:
-        self._open(BASE_URL + product)
-        self._assert_authenticated()
-        before: dict[str, Any] = {}
-        for _ in range(20):
-            before = self._product_control("mark", delta, product)
-            if before.get("authenticated") is not True:
-                raise HouseholdError("MENY login is required in the configured browser profile")
-            if before.get("ready") is True:
-                break
-            self._sleep(0.25)
-        else:
+        try:
+            self._open(BASE_URL + product)
+            self._assert_authenticated()
+            before: dict[str, Any] = {}
+            for _ in range(20):
+                before = self._product_control("mark", delta, product)
+                if before.get("authenticated") is not True:
+                    raise HouseholdError("MENY login is required in the configured browser profile")
+                if before.get("ready") is True:
+                    break
+                self._sleep(0.25)
+            previous = before.get("quantity")
+            if before.get("ready") is True and (isinstance(previous, bool) or not isinstance(previous, int) or previous < 0):
+                raise HouseholdError("MENY product quantity is invalid")
+        except HouseholdError as exc:
+            raise MenyCartStoppedError(str(exc)) from exc
+        if before.get("ready") is not True:
             if delta < 0:
                 self._remove_one_from_cart(product, order_change_code)
                 return
-            reason = "product control is unavailable"
-            raise HouseholdError(f"MENY {reason}")
-        previous = before.get("quantity")
-        if isinstance(previous, bool) or not isinstance(previous, int) or previous < 0:
-            raise HouseholdError("MENY product quantity is invalid")
+            raise MenyCartStoppedError("MENY product control is unavailable")
         expected = previous + delta
         try:
             self._click_cart_control(product, str(before.get("label") or ""))
@@ -1265,13 +1287,6 @@ class MenyClient:
             raise HouseholdError("MENY order routing did not settle")
 
     def _remove_one_from_cart(self, product: str, order_change_code: str | None) -> None:
-        cart = self._read_cart()
-        matches = [item for item in cart.get("items", []) if item.get("product_id") == product]
-        if len(matches) != 1 or isinstance(matches[0].get("quantity"), bool) or not isinstance(matches[0].get("quantity"), int):
-            raise HouseholdError("MENY product is not in the cart")
-        current = matches[0]["quantity"]
-        if current < 1:
-            raise HouseholdError("MENY product is not in the cart")
         dispatched = False
 
         def before_dispatch() -> None:
@@ -1279,6 +1294,13 @@ class MenyClient:
             dispatched = True
 
         try:
+            cart = self._read_cart()
+            matches = [item for item in cart.get("items", []) if item.get("product_id") == product]
+            if len(matches) != 1 or isinstance(matches[0].get("quantity"), bool) or not isinstance(matches[0].get("quantity"), int):
+                raise HouseholdError("MENY product is not in the cart")
+            current = matches[0]["quantity"]
+            if current < 1:
+                raise HouseholdError("MENY product is not in the cart")
             self._click_cart_remove_control(product, current, order_change_code, before_dispatch)
             observed = self._wait_for_cart_quantity(product, current - 1, order_change_code)
             if observed != current - 1:
@@ -1287,7 +1309,7 @@ class MenyClient:
         except HouseholdError as exc:
             if dispatched:
                 raise HouseholdError("MENY cart change is uncertain; read the cart and do not retry this request") from exc
-            raise
+            raise MenyCartStoppedError(str(exc)) from exc
 
     def _click_cart_remove_control(self, product: str, quantity: int, order_change_code: str | None, before_dispatch: Any) -> None:
         selector = '[data-meal-concierge-action="cart-remove"]'

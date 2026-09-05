@@ -282,7 +282,7 @@ class FakeMeny(FakeOda):
                 "total": 40.0,
                 "delivery": {"slot_id": None, "display": "torsdag 3. september Kl. 09:00-12:00"},
                 "payment": "vipps",
-            "order_lines": [{"product_id": MENY_PRODUCT, "identity": "Brokkoli 400g", "quantity": 1}],
+            "order_lines": [{"product_id": MENY_PRODUCT, "identity": "Brokkoli 400g", "quantity": cart["items"][0]["quantity"]}],
             },
             "payment": "vipps",
             "submit_controls": 1,
@@ -2896,13 +2896,15 @@ class MenyClientTests(unittest.TestCase):
         client._change_one.assert_not_called()
 
     def test_cart_deadline_stops_later_clicks_and_marks_partial_result(self):
+        from meny import MenyCartStoppedError
         client = self.client()
         client._require_login = mock.Mock()
         client._change_one = mock.Mock()
         client._read_cart = mock.Mock()
         with mock.patch("meny.time.monotonic", side_effect=[0, 0, 0, 235]):
-            with self.assertRaisesRegex(HouseholdError, "changed partially.*do not retry"):
+            with self.assertRaises(MenyCartStoppedError) as caught:
                 client.call("manipulate_cart", {"operations": [{"productId": MENY_PRODUCT, "quantity": 2}]})
+        self.assertEqual(caught.exception.applied_operations, [{"productId": MENY_PRODUCT, "quantity": 1}])
         client._change_one.assert_called_once_with(MENY_PRODUCT, 1, order_change_code=None)
         client._read_cart.assert_not_called()
         self.assertIsNone(client.deadline)
@@ -5783,21 +5785,22 @@ class CartPlanTests(unittest.TestCase):
                 ["get_cart", "get_delivery_slots", "get_cart", "get_cart", "get_delivery_slots"],
             )
 
-    def test_active_menu_raw_delta_change_is_rejected_in_favor_of_requirement_sync(self):
+    def test_active_menu_accepts_household_topups_without_rewriting_menu(self):
         with tempfile.TemporaryDirectory() as directory:
-            _store, _provider, _browser, application, _product_id = self.app(directory, "oda")
-            with self.assertRaisesRegex(HouseholdError, "action=sync"):
-                application.handle({
-                    "operation": "cart", "action": "change",
-                    "operations": [{"product_id": "10", "quantity": 1}],
-                })
+            store, provider, _browser, application, product_id = self.app(directory, "oda")
+            original = store.read()["menu"]
+            application.handle({"operation": "cart", "action": "change",
+                                "operations": [{"product_id": product_id, "quantity": 1}]})
+            self.assertEqual(provider.cart["items"][0]["quantity"], 2)
+            self.assertEqual(store.read()["menu"], original)
+            self.assertEqual(store.read()["cart_plan"]["supplemental_quantities"][product_id], 1)
 
 
 class FlowTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = StateStore(Path(self.temp.name), CONFIG)
-        self.oda = FakeOda()
+        self.oda = MutableFakeOda()
         self.browser = FakeBrowser()
         self.browser.oda = self.oda
         self.app = Application(self.store, self.oda, self.browser)
@@ -5808,7 +5811,8 @@ class FlowTests(unittest.TestCase):
     def test_catalog_and_reversible_cart_use_mcp(self):
         self.app.handle({"operation": "catalog", "action": "products", "query": "fullkorn"})
         self.app.handle({"operation": "cart", "action": "change", "operations": [{"productId": 10, "quantity": 1}]})
-        self.assertEqual([call[0] for call in self.oda.calls[-2:]], ["product_search", "manipulate_cart"])
+        self.assertIn("product_search", [call[0] for call in self.oda.calls])
+        self.assertEqual(self.oda.cart["items"][0]["quantity"], 2)
 
     def test_status_exposes_the_fresh_confirmation_default(self):
         status = self.app.handle({"operation": "status"})
@@ -5913,18 +5917,18 @@ class FlowTests(unittest.TestCase):
     def test_cart_change_accepts_intuitive_action_and_snake_case_product_id(self):
         self.app.handle({"operation": "cart", "action": "update", "operations": [{"product_id": "10", "quantity": 1}]})
         self.assertEqual(
-            self.oda.calls[-1],
+            [call for call in self.oda.calls if call[0] == "manipulate_cart"][-1],
             ("manipulate_cart", {"operations": [{"productId": 10, "quantity": 1}]}),
         )
 
     def test_meny_keeps_opaque_product_path_and_waits_for_vipps(self):
         with tempfile.TemporaryDirectory() as temp:
             store = StateStore(Path(temp), {**CONFIG, "provider": "meny"})
-            provider = FakeMeny()
+            provider = MutableFakeMeny()
             app = Application(store, provider, self.browser)
             app.handle({"operation": "cart", "action": "update", "operations": [{"product_id": MENY_PRODUCT, "quantity": 1}]})
             self.assertEqual(
-                provider.calls[-1],
+                [call for call in provider.calls if call[0] == "manipulate_cart"][-1],
                 ("manipulate_cart", {"operations": [{"productId": MENY_PRODUCT, "quantity": 1}]}),
             )
             provider.call = mock.Mock(wraps=provider.call)
@@ -5955,8 +5959,8 @@ class FlowTests(unittest.TestCase):
                 "status": "confirmed",
                 "grossAmount": 40.0,
                 "deliverySlotDisplay": "torsdag 3. sep. kl. 09:00-12:00",
-                "productQuantityCount": 1,
-                "products": [{"identity": "Brokkoli 400g", "name": "Brokkoli 400g", "quantity": 1}],
+                "productQuantityCount": 2,
+                "products": [{"identity": "Brokkoli 400g", "name": "Brokkoli 400g", "quantity": 2}],
             })
             provider.checkout_confirmation_order_id = mock.Mock(wraps=provider.checkout_confirmation_order_id)
             reconcile_start = len(provider.call.call_args_list)
@@ -6383,7 +6387,7 @@ class FlowTests(unittest.TestCase):
             release = threading.Event()
 
             @contextmanager
-            def delayed_browser_operation(_deadline=None):
+            def delayed_browser_operation(_deadline=None, **_kwargs):
                 entered.set()
                 if not release.wait(2):
                     raise AssertionError("test browser release timed out")
@@ -6751,13 +6755,15 @@ class FlowTests(unittest.TestCase):
         started = self.app.handle({"operation": "orders", "action": "change_begin", "order_id": "test-oda-order"})
         self.assertEqual(started["order_id"], "test-oda-order")
         self.oda.cart = {
-            "items": [{"product_id": 20, "name": "Såpe", "quantity": 1, "price": 25.0}],
-            "count": 1,
-            "subtotal": 25.0,
+            "items": [],
+            "count": 0,
+            "subtotal": 0.0,
             "delivery": {"slot_id": 70, "display": "Hjemlevering mellom kl 09 og 12, 5. sep"},
             "deliveryAddress": "Eksempelveien 1",
         }
         self.app.handle({"operation": "cart", "action": "change", "operations": [{"productId": 20, "quantity": 1}]})
+        self.oda.cart["items"][0]["price"] = 25.0
+        self.oda.cart["subtotal"] = 25.0
         prepared = self.app.handle({"operation": "checkout", "action": "prepare"})
         self.assertEqual(prepared["order_change"], {"order_id": "test-oda-order", "kind": "addition"})
         result = self.app.handle({"operation": "checkout", "action": "confirm", "confirmation_id": prepared["confirmation_id"]})
