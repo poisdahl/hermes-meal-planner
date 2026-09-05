@@ -1713,15 +1713,15 @@ class RecipeStoreTests(unittest.TestCase):
         self.assertTrue(concurrent.with_name("recipes-v3.backup.sqlite3").is_file())
 
     def test_reference_docs_cover_selection_confirmation_and_three_ref_types(self):
-        readme = (CORE / "README.md").read_text(encoding="utf-8")
+        reference = (CORE / "docs" / "reference.md").read_text(encoding="utf-8")
         skill = (CORE / "skill" / "SKILL.md").read_text(encoding="utf-8")
         tool = (CORE / "mcp_server.py").read_text(encoding="utf-8")
-        for text in (readme, skill, tool):
+        for text in (reference, skill, tool):
             self.assertIn("discovery_ref", text)
             self.assertIn("recipe_ref", text)
             self.assertIn("library_recipe_ref", text)
-        self.assertIn("selection is", readme)
-        self.assertIn("ambiguous", readme)
+        self.assertIn("selection is", reference)
+        self.assertIn("ambiguous", reference)
         self.assertIn("confirm the returned recipe name, source", skill)
         self.assertIn("library_id=builtin", tool)
 
