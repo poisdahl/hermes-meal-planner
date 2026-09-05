@@ -13,6 +13,7 @@
 
 <p align="center">
   <a href="#supported-stores"><img src="assets/icons/oda.png" alt="Oda" title="Oda" width="40" height="40"></a>
+  <a href="https://www.mathem.se/"><img src="assets/icons/mathem.png" alt="Mathem" title="Mathem" width="40" height="40"></a>
   <a href="#supported-stores"><img src="assets/icons/meny.png" alt="MENY" title="MENY" width="80" height="40"></a>
 </p>
 
