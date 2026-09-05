@@ -367,12 +367,12 @@ class WikibooksSource:
 
 
 def provider_recipe_candidates(provider: str, value: Any, limit: int) -> list[dict[str, Any]]:
-    if provider not in {"oda", "meny"} or not isinstance(value, Mapping):
+    if provider not in {"oda", "meny", "mathem"} or not isinstance(value, Mapping):
         raise RecipeSourceError("provider recipe response is invalid")
     rows = value.get("recipes")
     if not isinstance(rows, list) or len(rows) > MAX_PROVIDER_RESULTS:
         raise RecipeSourceError("provider recipe response is invalid")
-    allowed_hosts = {"oda": {"oda.com", "www.oda.com"}, "meny": {"meny.no", "www.meny.no"}}[provider]
+    allowed_hosts = {"oda": {"oda.com", "www.oda.com"}, "meny": {"meny.no", "www.meny.no"}, "mathem": {"mathem.se", "www.mathem.se"}}[provider]
     results = []
     for row in rows:
         if not isinstance(row, Mapping):
@@ -387,7 +387,7 @@ def provider_recipe_candidates(provider: str, value: Any, limit: int) -> list[di
         if not name or not external_id or urlsplit(url or "").hostname not in allowed_hosts:
             continue
         results.append(normalize_recipe({
-            "name": name, "language": "nb-NO", "tags": [provider.upper()],
+            "name": name, "language": "sv-SE" if provider == "mathem" else "nb-NO", "tags": [provider.upper()],
             "source": {
                 "kind": provider, "publisher": provider.upper(), "title": name,
                 "author": None, "url": url, "external_id": external_id, "relationship": "original",
@@ -403,8 +403,10 @@ def provider_recipe_candidates(provider: str, value: Any, limit: int) -> list[di
 
 
 def validate_source_settings(value: Any) -> dict[str, bool]:
+    if isinstance(value, Mapping) and set(value) == set(SOURCE_IDS) - {"mathem"}:
+        value = {**value, "mathem": False}
     if not isinstance(value, Mapping) or set(value) != set(SOURCE_IDS):
-        raise RecipeSourceError("recipe sources must name exactly internal, oda, meny, themealdb and wikibooks")
+        raise RecipeSourceError("recipe sources must name exactly internal, oda, meny, mathem, themealdb and wikibooks")
     if any(not isinstance(value[source], bool) for source in SOURCE_IDS):
         raise RecipeSourceError("recipe source settings must be true or false")
     return {source: value[source] for source in SOURCE_IDS}

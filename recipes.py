@@ -50,7 +50,7 @@ LIBRARY_RECIPE_MUTATION_KINDS = {
 DISCOVERY_DESTINATION_PATTERN = re.compile(r"[a-z][a-z0-9-]{0,62}")
 VALID_RELATIONSHIPS = {"original", "adapted", "inspired_by", "generated", "user_supplied", "unknown"}
 VALID_STORAGE = {"full", "link_only"}
-RESTRICTED_FULL_HOSTS = {"meny.no", "www.meny.no", "oda.com", "www.oda.com"}
+RESTRICTED_FULL_HOSTS = {"meny.no", "www.meny.no", "oda.com", "www.oda.com", "mathem.se", "www.mathem.se"}
 SERVER_FIELDS = {
     "id", "revision", "status", "created_at", "updated_at", "created_via",
     "recipe_key", "content_fingerprint", "content_hash", "shopping_requirements",
@@ -354,14 +354,14 @@ def normalize_recipe(value: Any) -> dict[str, Any]:
         kind = _normalized_text(source.get("kind"))
         kind_domain = kind.removeprefix("www.").rstrip(".")
         restricted_source = (
-            any(normalized_host == domain or normalized_host.endswith(f".{domain}") for domain in ("meny.no", "oda.com"))
-            or re.match(r"^(meny|oda)(?:\b|[._-])", publisher) is not None
-            or publisher_domain in {"meny.no", "oda.com"}
-            or re.match(r"^(meny|oda)(?:\b|[._-])", kind) is not None
-            or kind_domain in {"meny.no", "oda.com"}
+            any(normalized_host == domain or normalized_host.endswith(f".{domain}") for domain in ("meny.no", "oda.com", "mathem.se"))
+            or re.match(r"^(meny|oda|mathem)(?:\b|[._-])", publisher) is not None
+            or publisher_domain in {"meny.no", "oda.com", "mathem.se"}
+            or re.match(r"^(meny|oda|mathem)(?:\b|[._-])", kind) is not None
+            or kind_domain in {"meny.no", "oda.com", "mathem.se"}
         )
         if restricted_source and source["relationship"] not in {"adapted", "inspired_by"}:
-            raise RecipeError("original Oda or MENY content is link_only; store only an adapted or inspired recipe as full")
+            raise RecipeError("original Oda, Mathem or MENY content is link_only; store only an adapted or inspired recipe as full")
         portions = None if cleaned.get("portions") is None else _finite_positive(cleaned.get("portions"), "portions")
         ingredients = cleaned.get("ingredients")
         steps = cleaned.get("steps")

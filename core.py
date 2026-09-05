@@ -31,8 +31,8 @@ class CancellationPreconditionError(HouseholdError):
 
 STATE_VERSION = 12
 
-RECIPE_SOURCE_IDS = ("internal", "oda", "meny", "themealdb", "wikibooks")
-DEFAULT_RECIPE_SOURCES = {source: True for source in RECIPE_SOURCE_IDS}
+RECIPE_SOURCE_IDS = ("internal", "oda", "meny", "mathem", "themealdb", "wikibooks")
+DEFAULT_RECIPE_SOURCES = {source: source != "mathem" for source in RECIPE_SOURCE_IDS}
 
 
 DEFAULT_PROFILE: dict[str, Any] = {
@@ -125,6 +125,10 @@ def valid_email_address(value: Any) -> bool:
 
 def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
     profile = deepcopy(DEFAULT_PROFILE)
+    schedule = deepcopy(DEFAULT_SCHEDULE)
+    if config.get("provider") == "mathem":
+        schedule["timezone"] = "Europe/Stockholm"
+        profile["recipes"]["sources"].update(oda=False, meny=False, mathem=True)
     _merge(profile, config.get("profile_overrides", {}))
     validate_profile(profile)
     return {
@@ -134,7 +138,7 @@ def initial_state(config: Mapping[str, Any]) -> dict[str, Any]:
         "profile": profile,
         "product_favorites": [],
         "recurring_items": [],
-        "schedule": deepcopy(DEFAULT_SCHEDULE),
+        "schedule": schedule,
         "email_recipient": None,
         "menu": None,
         "cart_plan": None,
@@ -495,7 +499,7 @@ def _validate_delivery_selection(value: Any) -> None:
     required = {"provider", "scope", "origin", "slot", "candidate_digest", "observed_at"}
     if not isinstance(value, Mapping) or set(value) != required:
         raise HouseholdError("household delivery selection observation is invalid")
-    if value.get("provider") not in {"oda", "meny"} or value.get("origin") not in {"explicit", "cheapest"}:
+    if value.get("provider") not in {"oda", "meny", "mathem"} or value.get("origin") not in {"explicit", "cheapest"}:
         raise HouseholdError("household delivery selection observation is invalid")
     scope = value.get("scope")
     if not isinstance(scope, Mapping) or set(scope) != {"cart_id", "order_id", "occurrence"}:
@@ -596,7 +600,7 @@ def _migrate_state(
                 if isinstance(job, dict)
                 and job.get("order_id") == order_id
                 and isinstance(job.get("provider"), str)
-                and job.get("provider") in {"oda", "meny"}
+                and job.get("provider") in {"oda", "meny", "mathem"}
                 and job.get("menu_snapshot") == snapshot
             }
             snapshot_providers.setdefault(
@@ -733,7 +737,7 @@ def _migrate_state(
         if not isinstance(job, dict):
             continue
         job_provider = job.get("provider")
-        if not isinstance(job_provider, str) or job_provider not in {"oda", "meny"}:
+        if not isinstance(job_provider, str) or job_provider not in {"oda", "meny", "mathem"}:
             job["status"] = "invalid"
         if not isinstance(job.get("order_id"), str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", job["order_id"]) is None:
             job["status"] = "invalid"
@@ -759,12 +763,14 @@ def _migrate_state(
     if isinstance(cooldown, bool) or not isinstance(cooldown, int) or not 0 <= cooldown <= 260:
         raise HouseholdError("repeat cooldown must be an integer from zero to 260 weeks")
     sources = recipe_profile.setdefault("sources", deepcopy(DEFAULT_RECIPE_SOURCES))
+    if isinstance(sources, dict) and set(sources) == set(RECIPE_SOURCE_IDS) - {"mathem"}:
+        sources["mathem"] = False
     if (
         not isinstance(sources, dict)
         or set(sources) != set(RECIPE_SOURCE_IDS)
         or any(not isinstance(sources[source], bool) for source in RECIPE_SOURCE_IDS)
     ):
-        raise HouseholdError("recipe sources must name the five supported sources as true or false")
+        raise HouseholdError("recipe sources must name the supported sources as true or false")
     setup = state.get("setup")
     if not isinstance(setup, dict) or setup.get("version") != 1 or setup.get("status") not in {"needs_review", "complete"}:
         raise HouseholdError("household first-run setup state is invalid")
@@ -774,7 +780,7 @@ def _migrate_state(
     if not isinstance(state["recipe_usage"], dict) or not isinstance(state["recipe_usage_requests"], dict) or not isinstance(state["order_snapshots"], dict) or not isinstance(state["order_snapshot_times"], dict) or not isinstance(state["order_snapshot_providers"], dict) or not isinstance(state["protected_results"], dict) or not isinstance(state["protected_requests"], dict):
         raise HouseholdError("household recipe lifecycle state is invalid")
     if any(
-        not isinstance(provider, str) or provider not in {"oda", "meny"}
+        not isinstance(provider, str) or provider not in {"oda", "meny", "mathem"}
         for provider in state["order_snapshot_providers"].values()
     ):
         raise HouseholdError("household order snapshot providers are invalid")
@@ -789,7 +795,7 @@ def _migrate_state(
     _validate_delivery_selection(state.get("delivery_selection"))
     cart_plan = state.get("cart_plan")
     if cart_plan is not None:
-        if not isinstance(cart_plan, dict) or cart_plan.get("provider") not in {"oda", "meny"}:
+        if not isinstance(cart_plan, dict) or cart_plan.get("provider") not in {"oda", "meny", "mathem"}:
             raise HouseholdError("household cart plan is invalid")
         if cart_plan.get("status") not in {"active", "needs_input", "ordered"}:
             raise HouseholdError("household cart plan status is invalid")
@@ -986,7 +992,7 @@ def item_key(item: Mapping[str, Any]) -> str:
         and "//" not in product_id
     )
     if not product_id.isdigit() and not is_meny_path:
-        raise HouseholdError("product_id must be an Oda number or MENY product path")
+        raise HouseholdError("product_id must be an Oda/Mathem number or MENY product path")
     return product_id
 
 

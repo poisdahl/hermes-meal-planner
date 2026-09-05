@@ -33,7 +33,7 @@ class EmailOperations:
         client = self.email_provider_clients.get(provider)
         if client is None:
             raise HouseholdError(f"provider {provider} is unavailable for the bound email job")
-        if provider == "oda":
+        if provider in {"oda", "mathem"}:
             # Cancellation tracking can remain available after order details are
             # removed. A generic provider/auth/not-found error is never proof.
             tracking = client.call("order_tracking", {"order_number": order_id})
@@ -55,9 +55,9 @@ class EmailOperations:
         action = request.get("action", "status")
         requested_provider = request.get("provider")
         if requested_provider is not None and (
-            not isinstance(requested_provider, str) or requested_provider not in {"oda", "meny"}
+            not isinstance(requested_provider, str) or requested_provider not in {"oda", "meny", "mathem"}
         ):
-            raise HouseholdError("email provider must be oda or meny")
+            raise HouseholdError("email provider must be oda, meny or mathem")
 
         def matching_jobs(state: Mapping[str, Any], order_id: str, statuses: set[str] | None = None) -> list[dict[str, Any]]:
             candidates = [

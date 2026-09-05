@@ -27,14 +27,42 @@ details. Run shell examples from the repository root.
 
 ## Provider support
 
-| Capability | Oda | MENY |
-|---|---:|---:|
-| Product and recipe search | MCP | Logged-in browser |
-| Read, change and active-menu sync cart | MCP | Logged-in browser |
-| Product favorites, recurring items and menus | Local | Local |
-| Delivery, orders and cancellation | Yes | Yes |
-| Add goods / move an existing order | Yes | Yes |
-| Protected checkout | Fresh or standing authorization, reconcile | Fresh or standing authorization, Vipps mobile approval, reconcile |
+| Capability | Oda | Mathem | MENY |
+|---|---|---|---|
+| Product and recipe search | MCP | MCP | Logged-in browser |
+| Read, change and active-menu sync cart | MCP | MCP | Logged-in browser |
+| Product favorites, recurring items and menus | Local | Local | Local |
+| Delivery selection / read and track orders | Yes | MCP | Yes |
+| Add goods / move or cancel an existing order | Yes | Manual on Mathem | Yes |
+| Protected checkout | Fresh or standing authorization, reconcile | Manual on Mathem | Fresh or standing authorization, Vipps approval, reconcile |
+
+Mathem uses `provider="mathem"`, `https://www.mathem.se/mcp` and the separate
+Hermes OAuth registration `mathem-weekly`. The Oda MCP transport is shared;
+endpoint, OAuth token/client/metadata files, operation lock, product identities,
+recipe sources and delivery references remain bound to the selected provider.
+No Oda token is reused and redirects outside the configured origin are rejected.
+The service checks the required tools through authenticated `initialize` and
+`tools/list` at startup. Missing tools or changed response shapes fail explicitly.
+
+Mathem prices are SEK; exact decimal prices and kronor displays are accepted,
+while estimated/from prices remain unavailable. Swedish `st` package counts
+normalize to the same package units used by the planner. Delivery references
+have the form `mathem:YYYY-MM-DD:ID`; selection sends the numeric provider ID,
+then verifies the selected slot from MCP and its ID in the cart. It does not
+parse Swedish delivery labels with Oda's Norwegian text parser.
+
+Mathem `checkout prepare` returns `manual_checkout_required`, `currency="SEK"`,
+the current cart summary and a Mathem cart URL. It creates no pending payment
+attempt. Finish payment and any existing-order change or cancellation on Mathem;
+standing authorization does not enable those unsupported operations. Weekly
+`draft` and `cart_ready` runs are supported; `auto_checkout` is rejected. Mathem
+requires no `agent-browser`, Node.js or private automated browser login.
+
+Unauthenticated endpoint/OAuth discovery has been checked against Mathem.
+Local transport, installer and household-flow tests use synthetic responses
+based on the shared Oda contract. An authenticated Mathem account is still
+required to validate the actual tool schemas, product/cart/delivery responses
+and completed customer flow. No Mathem purchase is part of local validation.
 
 MENY does not document a public customer API or MCP service. Its adapter uses
 the logged-in website's visible controls and exact `meny.no` product paths
@@ -90,21 +118,24 @@ only to recover that same lost response; use a new key for a later user intent.
 
 The first interactive menu or recipe-discovery request returns one setup
 question with the current household, provider, people, portions, diet,
-confirmation policy, weekly-menu fields and five recipe-source switches. Keep
+confirmation policy, weekly-menu fields and six recipe-source switches. Keep
 all values once, or send only the values to change. The operation is
 idempotent, and `setup rerun` makes the same review available later. It never
 asks for or returns provider credentials, API keys, Vipps details or recipient
 addresses. A non-interactive weekly run proceeds with the saved/default values
 and leaves an explicit `needs_review` status instead of blocking automation.
 
-All five recipe sources are enabled by default. Disable a source with the setup
+Oda/MENY installations retain their five enabled sources; Mathem is initially
+disabled there. Mathem installations enable the local bank, Mathem, TheMealDB
+and Wikibooks and disable Oda/MENY. Existing source preferences are retained
+when the new Mathem switch is added. Disable a source with the setup
 tool, the profile tool, or a private `profile_overrides.recipes.sources` value.
 Provider selection and confirmation policy remain config-bound and require a
 separate state/service change rather than an in-place setup edit.
 
 ## Product observations and bounded selection
 
-Product search normalizes Oda and MENY results into one bounded observation
+Product search normalizes Oda, Mathem and MENY results into one bounded observation
 shape while preserving the provider's exact `product_id`/`product_ref`. Each
 product carries availability, an observation timestamp, display-only provider
 text and, only when established exactly, package mass/volume/count and purchase
@@ -680,7 +711,7 @@ identity, ownership, rights, attribution, visibility or provider authorization,
 and label changes never alter frozen discovery or menu snapshots.
 
 Source URLs must be credential-free HTTPS. Query strings and fragments are
-discarded before persistence. Original Oda or MENY recipe text is stored only
+discarded before persistence. Original Oda, Mathem or MENY recipe text is stored only
 as a `link_only` record; a full stored version must be explicitly identified as
 `adapted` or `inspired_by`.
 
@@ -732,7 +763,7 @@ current household date for the initial plan. That exact date is frozen in the
 handoff; ranking and save do not compare it with a later wall clock.
 
 The planner resolves every exact candidate locally once per plan or save. It
-does not refetch recipe sources or call Oda/MENY. A candidate must be an active,
+does not refetch recipe sources or call Oda/Mathem/MENY. A candidate must be an active,
 full, materializable recipe that can be scaled to the exact requested portions.
 Original provider `link_only` candidates are reported as ineligible rather than
 being promoted from a title or summary. Candidate revisions, frozen discovery

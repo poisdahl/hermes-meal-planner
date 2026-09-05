@@ -239,7 +239,7 @@ class RecipeOperations:
                 continue
             future = next((candidate for candidate, name in futures.items() if name == source), None)
             if future is None:
-                reason = "provider operation is pending" if source in {"oda", "meny"} and busy else "source session is unavailable"
+                reason = "provider operation is pending" if source in {"oda", "meny", "mathem"} and busy else "source session is unavailable"
                 statuses.append({"source": source, "enabled": True, "status": "unavailable", "count": 0, "reason": reason})
                 continue
             if future not in done:

@@ -20,7 +20,8 @@
 **Plan meals, save recipes and shop for groceries through Hermes Agent.**
 
 Meal Concierge connects [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-to Oda or MENY in Norway. Tell Hermes what you want to cook, build a weekly menu,
+to Oda or MENY in Norway, or Mathem in Sweden. Tell Hermes what you want to cook,
+build a weekly menu,
 and turn it into a grocery cart you can review and order. Your household
 preferences, saved recipes and menus are stored locally.
 
@@ -48,7 +49,8 @@ preferences, saved recipes and menus are stored locally.
   emails additionally require a configured Hermes email account/tool.
 
 The default is **seven different dinners for two people**. Recipe discovery
-uses the local bank, Oda, MENY, TheMealDB and Wikibooks Cookbook; you can adjust
+supports the local bank, Oda, Mathem, MENY, TheMealDB and Wikibooks Cookbook;
+you can adjust
 portions, preferences and enabled sources during first-use setup.
 
 Meal Concierge runs as a local background service with a skill and an MCP
@@ -65,14 +67,20 @@ installation instructions below are for Hermes Agent.
 
 ## Supported stores
 
-Choose one store per installation. Both support product and recipe search,
-cart management, delivery selection and supported order changes.
+Choose one store per installation. All three support product and recipe search,
+cart management and delivery selection. Checkout and existing-order actions
+vary by store.
 
-| | Oda | MENY |
-|---|---|---|
-| Connection | Oda MCP service, plus a browser for protected order actions | Logged-in MENY website |
-| Sign-in | Hermes OAuth **and** a browser login to the same Oda account | Persistent browser login to your MENY account |
-| Checkout | A payment method already configured in Oda | Home delivery and Vipps approval on your phone |
+| | Oda | Mathem | MENY |
+|---|---|---|---|
+| Connection | Oda MCP, plus browser for protected order actions | Mathem MCP | Logged-in MENY website |
+| Sign-in | Hermes OAuth **and** browser login to the same Oda account | Separate Mathem OAuth through Hermes | Persistent browser login |
+| Checkout | Configured Oda payment method | Review the cart in chat, then pay on Mathem's website | Home delivery and Vipps approval on your phone |
+| Existing orders | Read, supported changes and cancellation | Read and track; change or cancel on Mathem's website | Read, supported changes and cancellation |
+
+Mathem uses Swedish kronor (SEK). Its `checkout prepare` returns a cart summary
+and a link to finish on Mathem. Automatic payment, order changes and cancellation
+are not supported for Mathem; weekly runs can prepare a draft or ready cart.
 
 By default, Hermes asks you to confirm the prepared summary before checkout or
 cancellation. An optional standing-authorization policy is described in the
@@ -87,13 +95,16 @@ any further action.
   [installation guide](https://github.com/NousResearch/hermes-agent#quick-install).
 - **Linux with a running user systemd manager**, or **Apple Silicon macOS**.
   These are the supported installation paths.
-- **Git, Node.js 24+ and npm.** The steps below use Hermes's bundled Node/npm
+- **Git. Oda and MENY also need Node.js 24+ and npm.** The steps below use
+  Hermes's bundled Node/npm
   when available, otherwise the versions on your `PATH`.
-- **Google Chrome or Chromium**, plus `agent-browser` (installed below).
-- **An Oda or MENY account** that supports delivery to your address. MENY also
+- **For Oda and MENY:** Google Chrome or Chromium, plus `agent-browser`
+  (installed below).
+- **An Oda, Mathem or MENY account** that supports delivery to your address.
+  MENY also
   needs your eight-digit Vipps mobile number.
 
-Both stores require a one-time login in a visible browser. A remote headless
+Oda and MENY require a one-time login in a visible browser. A remote headless
 server needs a private graphical session, such as X11 forwarding or a private
 remote desktop, to complete that step.
 
@@ -102,6 +113,9 @@ remote desktop, to complete that step.
 Run these steps as the same non-root user who runs Hermes.
 
 ### 1. Install the browser and browser adapter
+
+**Mathem:** install Git and skip to step 2. No local browser adapter or Node.js
+is needed. Hermes OAuth opens the Mathem sign-in flow separately.
 
 On **Linux**, install Git and a **non-snap** Chrome or Chromium package for your
 distribution. For example, on Debian:
@@ -160,6 +174,19 @@ hermes config set mcp_servers.oda-weekly.enabled false
 
 Meal Concierge continues to use and refresh those private OAuth token files.
 
+**For Mathem**, authenticate its separate account and install:
+
+```sh
+hermes mcp add mathem-weekly --url https://www.mathem.se/mcp --auth oauth
+hermes mcp login mathem-weekly
+hermes config set mcp_servers.mathem-weekly.enabled false
+./install.sh --provider mathem --household "My household"
+```
+
+Use the `www` address shown above. Mathem tokens are stored separately from Oda's;
+an existing Oda login is not reused. Keep a separate installation/state directory
+for each store. The installer refuses to change an existing household's provider.
+
 **For MENY**, run this in an interactive terminal. The installer privately
 prompts for your eight-digit Vipps mobile number:
 
@@ -173,6 +200,9 @@ Hermes skill and MCP connection, and installs the platform's background service.
 For a new installation, complete login and start the service next.
 
 ### 4. Log in to your store
+
+**Mathem:** OAuth login is complete from step 3; continue to step 5. Use your
+normal Mathem browser session when finishing payment or managing existing orders.
 
 Run the **exact browser login command printed by the installer**. This opens
 the dedicated profile Meal Concierge will use. Log in to your chosen store,
@@ -308,7 +338,7 @@ price. Current integrations cannot establish authoritative allergen safety;
 configured allergy or avoidance rules may require further input and block
 product selection.
 
-This project is not affiliated with Oda or MENY. Website changes can require
+This project is not affiliated with Oda, Mathem or MENY. Website changes can require
 adapter updates. Email sending needs an existing Hermes email integration;
 connecting an optional recipe library also requires your own account/server.
 

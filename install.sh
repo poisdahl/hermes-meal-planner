@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./install.sh --provider oda|meny --household NAME
+Usage: ./install.sh --provider oda|meny|mathem --household NAME
 
 Installs one household into the standard non-root Hermes home. Set HERMES_HOME,
 HERMES_PYTHON, MEAL_CONCIERGE_AGENT_BROWSER, or MEAL_CONCIERGE_BROWSER_EXECUTABLE
@@ -37,8 +37,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$provider" != "oda" && "$provider" != "meny" ]]; then
-  echo "--provider must be oda or meny" >&2
+if [[ "$provider" != "oda" && "$provider" != "meny" && "$provider" != "mathem" ]]; then
+  echo "--provider must be oda, meny or mathem" >&2
   exit 2
 fi
 if [[ -z "$household" || "$household" == *$'\n'* || "$household" == *$'\r'* ]]; then
@@ -103,90 +103,95 @@ if [[ -z "$python" ]] || ! "$python" -c 'import mcp; import tools.mcp_oauth' >/d
   exit 1
 fi
 
-if [[ -n "${MEAL_CONCIERGE_AGENT_BROWSER:-}" && -x "$MEAL_CONCIERGE_AGENT_BROWSER" ]]; then
-  agent_browser="$MEAL_CONCIERGE_AGENT_BROWSER"
-elif command -v agent-browser >/dev/null 2>&1; then
-  agent_browser="$(command -v agent-browser)"
-elif [[ -x "$HOME/.local/lib/meal-concierge/node_modules/.bin/agent-browser" ]]; then
-  agent_browser="$HOME/.local/lib/meal-concierge/node_modules/.bin/agent-browser"
-elif [[ -x "$hermes_home/node/bin/agent-browser" ]]; then
-  agent_browser="$hermes_home/node/bin/agent-browser"
-else
-  echo "agent-browser is missing. Install it under your home and set MEAL_CONCIERGE_AGENT_BROWSER." >&2
-  exit 1
-fi
 runtime_path="/usr/local/bin:/usr/bin:/bin"
-agent_browser_header=
-if [[ "$(LC_ALL=C head -c 2 -- "$agent_browser" 2>/dev/null || true)" == '#!' ]]; then
-  agent_browser_header="$(head -n 1 -- "$agent_browser" 2>/dev/null || true)"
-fi
-if [[ "$agent_browser_header" == *node* ]]; then
-  if [[ -n "${MEAL_CONCIERGE_NODE:-}" && -x "$MEAL_CONCIERGE_NODE" ]]; then
-    node="$MEAL_CONCIERGE_NODE"
-  elif [[ -x "$hermes_home/node/bin/node" ]]; then
-    node="$hermes_home/node/bin/node"
-  elif command -v node >/dev/null 2>&1; then
-    node="$(command -v node)"
+agent_browser=
+chromium=
+if [[ "$provider" != "mathem" ]]; then
+  if [[ -n "${MEAL_CONCIERGE_AGENT_BROWSER:-}" && -x "$MEAL_CONCIERGE_AGENT_BROWSER" ]]; then
+    agent_browser="$MEAL_CONCIERGE_AGENT_BROWSER"
+  elif command -v agent-browser >/dev/null 2>&1; then
+    agent_browser="$(command -v agent-browser)"
+  elif [[ -x "$HOME/.local/lib/meal-concierge/node_modules/.bin/agent-browser" ]]; then
+    agent_browser="$HOME/.local/lib/meal-concierge/node_modules/.bin/agent-browser"
+  elif [[ -x "$hermes_home/node/bin/agent-browser" ]]; then
+    agent_browser="$hermes_home/node/bin/agent-browser"
   else
-    echo "agent-browser requires Node.js 24 or newer; install it or set MEAL_CONCIERGE_NODE" >&2
+    echo "agent-browser is missing. Install it under your home and set MEAL_CONCIERGE_AGENT_BROWSER." >&2
     exit 1
   fi
-  node_major="$("$node" -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || true)"
-  if [[ ! "$node_major" =~ ^[0-9]+$ || "$node_major" -lt 24 ]]; then
-    echo "agent-browser requires Node.js 24 or newer" >&2
-    exit 1
+  agent_browser_header=
+  if [[ "$(LC_ALL=C head -c 2 -- "$agent_browser" 2>/dev/null || true)" == '#!' ]]; then
+    agent_browser_header="$(head -n 1 -- "$agent_browser" 2>/dev/null || true)"
   fi
-  runtime_path="$(dirname -- "$node"):$runtime_path"
-fi
-
-if [[ -n "${MEAL_CONCIERGE_BROWSER_EXECUTABLE:-}" && -x "$MEAL_CONCIERGE_BROWSER_EXECUTABLE" ]]; then
-  chromium="$MEAL_CONCIERGE_BROWSER_EXECUTABLE"
-else
-  chromium=
-  for candidate in chromium chromium-browser google-chrome-stable google-chrome; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-      chromium="$(command -v "$candidate")"
-      break
+  if [[ "$agent_browser_header" == *node* ]]; then
+    if [[ -n "${MEAL_CONCIERGE_NODE:-}" && -x "$MEAL_CONCIERGE_NODE" ]]; then
+      node="$MEAL_CONCIERGE_NODE"
+    elif [[ -x "$hermes_home/node/bin/node" ]]; then
+      node="$hermes_home/node/bin/node"
+    elif command -v node >/dev/null 2>&1; then
+      node="$(command -v node)"
+    else
+      echo "agent-browser requires Node.js 24 or newer; install it or set MEAL_CONCIERGE_NODE" >&2
+      exit 1
     fi
-  done
-  if [[ -z "$chromium" && "$(uname -s)" == "Darwin" ]]; then
-    for candidate in \
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-      "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-      "/Applications/Chromium.app/Contents/MacOS/Chromium" \
-      "$HOME/Applications/Chromium.app/Contents/MacOS/Chromium"; do
-      if [[ -x "$candidate" ]]; then
-        chromium="$candidate"
+    node_major="$("$node" -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || true)"
+    if [[ ! "$node_major" =~ ^[0-9]+$ || "$node_major" -lt 24 ]]; then
+      echo "agent-browser requires Node.js 24 or newer" >&2
+      exit 1
+    fi
+    runtime_path="$(dirname -- "$node"):$runtime_path"
+  fi
+
+  if [[ -n "${MEAL_CONCIERGE_BROWSER_EXECUTABLE:-}" && -x "$MEAL_CONCIERGE_BROWSER_EXECUTABLE" ]]; then
+    chromium="$MEAL_CONCIERGE_BROWSER_EXECUTABLE"
+  else
+    chromium=
+    for candidate in chromium chromium-browser google-chrome-stable google-chrome; do
+      if command -v "$candidate" >/dev/null 2>&1; then
+        chromium="$(command -v "$candidate")"
         break
       fi
     done
+    if [[ -z "$chromium" && "$(uname -s)" == "Darwin" ]]; then
+      for candidate in \
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+        "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+        "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+        "$HOME/Applications/Chromium.app/Contents/MacOS/Chromium"; do
+        if [[ -x "$candidate" ]]; then
+          chromium="$candidate"
+          break
+        fi
+      done
+    fi
+  fi
+  if [[ -z "$chromium" ]]; then
+    echo "Chromium is missing. Install it or set MEAL_CONCIERGE_BROWSER_EXECUTABLE" >&2
+    exit 1
+  fi
+  resolved_chromium="$(readlink -f -- "$chromium" 2>/dev/null || printf '%s' "$chromium")"
+  if [[ "$chromium" == /snap/* || "$resolved_chromium" == /snap/* ]] \
+    || { [[ -r "$chromium" ]] && grep -Eq '/snap/bin/chromium|snap run chromium' "$chromium"; }; then
+    echo "Snap Chromium cannot use the private Hermes profile. Install a non-snap Chromium/Chrome and set MEAL_CONCIERGE_BROWSER_EXECUTABLE." >&2
+    exit 1
   fi
 fi
-if [[ -z "$chromium" ]]; then
-  echo "Chromium is missing. Install it or set MEAL_CONCIERGE_BROWSER_EXECUTABLE" >&2
+mcp_server_name="$provider-weekly"
+if [[ "$provider" != "meny" && ! -f "$hermes_home/mcp-tokens/$mcp_server_name.json" ]]; then
+  echo "$provider OAuth is not ready. Authenticate $mcp_server_name with Hermes first, then rerun this installer." >&2
   exit 1
 fi
-resolved_chromium="$(readlink -f -- "$chromium" 2>/dev/null || printf '%s' "$chromium")"
-if [[ "$chromium" == /snap/* || "$resolved_chromium" == /snap/* ]] \
-  || { [[ -r "$chromium" ]] && grep -Eq '/snap/bin/chromium|snap run chromium' "$chromium"; }; then
-  echo "Snap Chromium cannot use the private Hermes profile. Install a non-snap Chromium/Chrome and set MEAL_CONCIERGE_BROWSER_EXECUTABLE." >&2
-  exit 1
-fi
-if [[ "$provider" == "oda" && ! -f "$hermes_home/mcp-tokens/oda-weekly.json" ]]; then
-  echo "Oda OAuth is not ready. Authenticate Oda with Hermes first, then rerun this installer." >&2
-  exit 1
-fi
-if [[ "$provider" == "oda" ]]; then
-  "$python" - "$hermes_home/config.yaml" <<'PY'
+if [[ "$provider" != "meny" ]]; then
+  "$python" - "$hermes_home/config.yaml" "$mcp_server_name" <<'PY'
 from pathlib import Path
 import sys
 import yaml
 
 path = Path(sys.argv[1])
 value = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
-server = ((value or {}).get("mcp_servers") or {}).get("oda-weekly")
+server = ((value or {}).get("mcp_servers") or {}).get(sys.argv[2])
 if not isinstance(server, dict) or server.get("enabled") is not False:
-    raise SystemExit("disable the raw oda-weekly MCP server before installing the guarded meal concierge")
+    raise SystemExit(f"disable the raw {sys.argv[2]} MCP server before installing the guarded meal concierge")
 PY
 fi
 case "$(uname -s)" in
@@ -490,7 +495,11 @@ Resolved runtime:
   Chromium: $chromium
 EOF
 fi
-printf '  Login command: %q --user-data-dir=%q %q\n' \
-  "$chromium" \
-  "$private_root/browser/profile" \
-  "$([[ "$provider" == "oda" ]] && printf '%s' 'https://oda.com/no/' || printf '%s' 'https://meny.no/')"
+if [[ "$provider" == "mathem" ]]; then
+  echo "  Complete checkout and manage existing orders at https://www.mathem.se/se/cart/"
+else
+  printf '  Login command: %q --user-data-dir=%q %q\n' \
+    "$chromium" \
+    "$private_root/browser/profile" \
+    "$([[ "$provider" == "oda" ]] && printf '%s' 'https://oda.com/no/' || printf '%s' 'https://meny.no/')"
+fi

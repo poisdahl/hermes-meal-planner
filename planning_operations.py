@@ -1856,7 +1856,7 @@ class PlanningOperations:
             missing = target[product_id] - first_live.get(product_id, 0)
             if missing > 0:
                 operations.append({
-                    "productId": int(product_id) if self.provider == "oda" else product_id,
+                    "productId": int(product_id) if self.provider in {"oda", "mathem"} else product_id,
                     "quantity": missing,
                 })
         mutation_error = None
@@ -2008,7 +2008,7 @@ class PlanningOperations:
         for product_id in sorted(set(first_live) | set(target)):
             delta = target.get(product_id, 0) - first_live.get(product_id, 0)
             if delta:
-                operations.append({"productId": int(product_id) if self.provider == "oda" else product_id, "quantity": delta})
+                operations.append({"productId": int(product_id) if self.provider in {"oda", "mathem"} else product_id, "quantity": delta})
         mutation_error = None
         acknowledged_live = dict(first_live)
         if operations:
@@ -2279,7 +2279,7 @@ class PlanningOperations:
                 quantity = item.get("quantity")
                 if isinstance(quantity, bool) or not isinstance(quantity, int) or not quantity or abs(quantity) > 1_000_000:
                     raise HouseholdError("cart changes require bounded nonzero integer quantity deltas")
-                normalized.append({"productId": int(key) if self.provider == "oda" else key, "quantity": quantity})
+                normalized.append({"productId": int(key) if self.provider in {"oda", "mathem"} else key, "quantity": quantity})
             # All deltas are journalled before dispatch, including each small MENY batch.
             batches = self._meny_cart_batches(normalized) if self.provider == "meny" else ([normalized] if normalized else [])
             for batch in batches:
